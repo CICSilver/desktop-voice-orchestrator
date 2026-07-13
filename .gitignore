@@ -1,0 +1,32 @@
+# Build outputs
+build/
+dist/
+out/
+*.obj
+*.pdb
+
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Models and recordings are local assets by default
+models/
+recordings/
+*.wav
+*.onnx
+
+# Editors and OS files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local configuration and logs
+.env
+.env.*
+!.env.example
+config/local.*
+logs/
