@@ -6,7 +6,19 @@
 
 USB 音箱由电脑直接输出，因此可以用对应 render endpoint 的 WASAPI Loopback 得到参考信号。这个条件适合先做软件 AEC，不要求一开始增加 XVF3800 一类硬件音频前端。
 
-## 2. 进程与线程
+## 2. 唤醒词模型与录音边界
+
+主检测器采用 sherpa-onnx 开放词表 KWS。用户提供唤醒短语的文字、拼音或音素表示，配置层生成关键词 token，并为每个短语保存 `boosting score` 和触发阈值。MVP 优先验证当前中英 Zipformer KWS 模型；模型命中结果中的 token 时间戳用于判断唤醒词位于话段开头还是结尾。
+
+配置流程仍提供录音步骤，但录音只承担以下职责：
+
+- 验证短语在 0.5 米、1 米、2 米以及音乐播放条件下是否容易检出
+- 调整关键词分数和触发阈值
+- 建立与校准集分离的回归测试数据
+
+录音不用于生成声纹或限制身份，运行链路不包含说话人验证。任何说话人正确说出配置短语并达到阈值，都可以唤醒系统。Query-by-Example 只作为无法用文字、拼音或音素稳定描述特殊发音时的后续候选。
+
+## 3. 进程与线程
 
 ```text
 Audio service (native, real-time priority where appropriate)
@@ -33,7 +45,7 @@ Desktop shell
 
 音频实时线程不执行模型加载、磁盘写入、网络请求或桌面操作。它只负责稳定地产生带单调时间戳的 PCM 帧，并通过有界队列把事件交给非实时线程。
 
-## 3. 音频时序
+## 4. 音频时序
 
 - 内部处理帧建议固定为 10 ms
 - AEC 输入保持相同采样率、帧长和单调时间基准
@@ -44,7 +56,7 @@ Desktop shell
 
 建议环形缓冲区保存 20 秒音频，触发后向前搜索最近一次满足静音阈值的 VAD 边界。若没有可靠边界，则按最大命令窗口截取，避免无限向前扩展。
 
-## 4. 双位置唤醒算法
+## 5. 双位置唤醒算法
 
 KWS 命中时产生 `{start_ms, end_ms, score}`。协调器同时查看命中前后的 VAD 状态：
 
@@ -64,9 +76,9 @@ KWS 命中时产生 `{start_ms, end_ms, score}`。协调器同时查看命中前
 
 若唤醒词位于话段中间，MVP 默认把两侧有效语音合并为一个命令序列，但记录 `wake_position=embedded`。若 KWS 分数过低、语音窗口超长或边界不可靠，则拒绝执行并给出短提示，不凭猜测补全命令。
 
-KWS 用于授权和定位，ASR 不负责判断是否唤醒。唤醒词对应的时间段必须在送入命令解析前剔除，防止被识别成应用名或普通命令。
+KWS 用于触发判断和定位，ASR 不负责判断是否唤醒。唤醒词对应的时间段必须在送入命令解析前剔除，防止被识别成应用名或普通命令。
 
-## 5. 命令规划与执行
+## 6. 命令规划与执行
 
 文本处理分为四层：
 
@@ -77,7 +89,7 @@ KWS 用于授权和定位，ASR 不负责判断是否唤醒。唤醒词对应的
 
 解析器输出完整计划后才开始执行。执行器使用单消费者队列，按照 `sequence` 串行调用适配器。每一步产生 `queued/running/succeeded/failed/skipped` 状态和持续时间。任何适配器都不能自行插入未出现在计划中的动作。
 
-## 6. Windows 适配优先级
+## 7. Windows 适配优先级
 
 1. 媒体控制优先使用 Global System Media Transport Controls
 2. 打开程序和路径优先使用 ShellExecute 或明确配置的可执行文件
@@ -85,7 +97,7 @@ KWS 用于授权和定位，ASR 不负责判断是否唤醒。唤醒词对应的
 4. UI Automation 只用于没有稳定 API 的受控场景
 5. 键鼠模拟作为最后手段，并默认关闭
 
-## 7. 隐私与安全
+## 8. 隐私与安全
 
 - 未触发 PCM 只存在于固定容量内存中，不写入磁盘
 - 诊断录音必须由用户显式开启，并显示正在录音的状态
@@ -94,7 +106,7 @@ KWS 用于授权和定位，ASR 不负责判断是否唤醒。唤醒词对应的
 - 日志默认记录文本、动作和结果，不记录原始音频
 - 触发时播放短提示音或显示可见状态，避免无感执行
 
-## 8. 可观测性
+## 9. 可观测性
 
 每次触发至少记录：
 
@@ -107,11 +119,12 @@ KWS 用于授权和定位，ASR 不负责判断是否唤醒。唤醒词对应的
 
 日志使用同一个 `utterance_id` 串联，但不得包含访问令牌、完整环境变量或未经允许的原始音频。
 
-## 9. 参考资料
+## 10. 参考资料
 
 - [WASAPI Loopback Recording](https://learn.microsoft.com/windows/win32/coreaudio/loopback-recording)
 - [IAcousticEchoCancellationControl](https://learn.microsoft.com/windows/win32/api/audioclient/nn-audioclient-iacousticechocancellationcontrol)
 - [WebRTC AudioProcessing API](https://webrtc.googlesource.com/src/+/refs/heads/main/api/audio/audio_processing.h)
 - [sherpa-onnx Keyword Spotting](https://k2-fsa.github.io/sherpa/onnx/kws/index.html)
+- [sherpa-onnx 中英 KWS 模型](https://k2-fsa.github.io/sherpa/onnx/kws/pretrained_models/index.html)
 - [FunASR](https://github.com/modelscope/FunASR)
 - [GlobalSystemMediaTransportControlsSessionManager](https://learn.microsoft.com/uwp/api/windows.media.control.globalsystemmediatransportcontrolssessionmanager)
