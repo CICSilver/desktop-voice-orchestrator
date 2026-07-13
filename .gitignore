@@ -13,8 +13,10 @@ __pycache__/
 .ruff_cache/
 
 # Models and recordings are local assets by default
-models/
+models/*
+!models/manifest.toml
 recordings/
+data/
 *.wav
 *.onnx
 

@@ -1,0 +1,43 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "windows-x64",
+      "displayName": "Windows x64 (MSVC + vcpkg)",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64",
+      "binaryDir": "${sourceDir}/build/windows-x64",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
+        "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "BUILD_TESTING": "ON"
+      }
+    },
+    {
+      "name": "windows-x64-no-sherpa",
+      "inherits": "windows-x64",
+      "displayName": "Windows x64 core tests (without sherpa)",
+      "binaryDir": "${sourceDir}/build/windows-x64-no-sherpa",
+      "cacheVariables": { "DVO_ENABLE_SHERPA": "OFF" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "windows-x64", "configuration": "Release" },
+    { "name": "core-release", "configurePreset": "windows-x64-no-sherpa", "configuration": "Release" }
+  ],
+  "testPresets": [
+    {
+      "name": "core",
+      "configurePreset": "windows-x64-no-sherpa",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "all",
+      "configurePreset": "windows-x64",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    }
+  ]
+}

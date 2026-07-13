@@ -15,7 +15,11 @@
 
 ## 当前状态
 
-项目处于方案和验证阶段。首个版本优先解决三个高风险问题：
+第一部分的 C++20 音频前端已经实现，当前可以在 Windows 上构建并运行双路采集、
+sherpa-onnx KWS、Silero VAD、20 秒环形缓冲、三类候选话段提取、诊断录制/回放和本地 Web 调试台。
+AEC 只保留了可替换接口，当前实现为旁路；完整桌面动作编排仍属于后续阶段。
+
+项目后续仍需解决三个高风险问题：
 
 1. USB 音箱播放期间，软件 AEC 能否在目标房间和麦克风条件下稳定保留 2 米内的人声
 2. 开放词表唤醒词在前置和后置两种位置能否低误触发地检出
@@ -25,19 +29,56 @@
 
 ```text
 USB 音箱 WASAPI Loopback ─┐
-                          ├─> WebRTC AEC3 ─> 16 kHz 单声道环形缓冲区
-麦克风 WASAPI Capture ────┘                         │
-                                                   ├─> KWS / VAD
-                                                   └─> 按需 ASR
-                                                        │
-                                           唤醒词定位与命令切分
-                                                        │
-                                               有序动作计划
-                                                        │
-                                      媒体 / 软件 / 文件 / UI 适配器
+                          ├─> IAudioPreprocessor（当前 Bypass）
+麦克风 WASAPI Capture ────┘                │
+                                           └─> 16 kHz / 10 ms 帧
+                                                   │
+                                     ┌─────────────┼─────────────┐
+                                     │             │             │
+                                  20 s Ring   sherpa KWS    Silero VAD
+                                     │             │             │
+                                     └──────> 话段状态机 <────────┘
+                                                   │
+                                     prefix / suffix / embedded
+                                     （输出 PCM 已剔除唤醒区间）
 ```
 
 后置唤醒词要求系统在听到唤醒词之前就保留最近一段经过回声消除的音频，因此音频前端会持续维护内存环形缓冲区，但不会持续保存录音到磁盘，也不会持续运行完整语音识别。
+
+## 构建与运行第一部分
+
+要求 Windows 10/11、Visual Studio 2022（MSVC）、CMake 3.28+ 和 vcpkg。模型和 sherpa-onnx
+二进制均固定版本并校验 SHA-256；模型不会提交到 Git。
+
+```powershell
+git clone https://github.com/microsoft/vcpkg.git C:\tools\vcpkg
+C:\tools\vcpkg\bootstrap-vcpkg.bat
+$env:VCPKG_ROOT = 'C:\tools\vcpkg'
+
+cmake --preset windows-x64
+cmake --build --preset release --target fetch_models
+cmake --build --preset release --parallel
+ctest --preset all
+```
+
+可执行程序位于 `build/windows-x64/Release/voice_frontend.exe`：
+
+```powershell
+./build/windows-x64/Release/voice_frontend.exe list-devices
+./build/windows-x64/Release/voice_frontend.exe live
+./build/windows-x64/Release/voice_frontend.exe replay data/sessions/<session>
+./build/windows-x64/Release/voice_frontend.exe benchmark data/sessions/<session>
+```
+
+`live` 会打印带临时访问令牌的本机地址并打开调试台。服务只绑定 `127.0.0.1:8765`。
+未点击“开始录制”时，原始 PCM 只存在于定长内存缓冲中。默认参数及合法范围见
+[`config/default.toml`](config/default.toml)，界面保存的覆盖项写入已忽略版本控制的
+`config/local.toml`。自定义关键词的原始文本保存在 `config/keywords_raw.txt`，运行时读取的
+token 文件为 `config/keywords.txt`；两者需使用固定模型对应的 `tokens.txt`/`en.phone` 和
+sherpa-onnx `text2token` 流程同步生成。
+
+实现边界、线程隔离、会话格式和现场验收命令详见
+[`docs/PART1_FRONTEND.md`](docs/PART1_FRONTEND.md)。
 
 ## 初步技术选型
 

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Voice Frontend Lab</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <p class="eyebrow">DESKTOP VOICE ORCHESTRATOR</p>
+      <h1>Voice Frontend Lab</h1>
+    </div>
+    <div class="status-cluster">
+      <span id="connection" class="pill offline">离线</span>
+      <span id="source" class="pill">LIVE</span>
+      <span id="recording" class="record-indicator"><i></i> 未录制</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="toolbar panel">
+      <div class="control-group">
+        <label>波形</label>
+        <select id="wave-source">
+          <option value="processed">处理后</option>
+          <option value="microphone">麦克风</option>
+          <option value="loopback">Loopback</option>
+        </select>
+      </div>
+      <button id="record-start" class="primary">开始录制</button>
+      <button id="record-stop">停止录制</button>
+      <div class="divider"></div>
+      <select id="sessions"><option value="">选择回放会话</option></select>
+      <button id="replay-open">载入</button>
+      <button id="replay-play">播放</button>
+      <button id="replay-pause">暂停</button>
+      <select id="replay-speed">
+        <option value="0.5">0.5×</option><option value="1" selected>1×</option>
+        <option value="2">2×</option><option value="0">不限速</option>
+      </select>
+      <input id="replay-seek" type="range" min="0" max="100" value="0" aria-label="回放位置">
+    </section>
+
+    <section class="timeline panel">
+      <div class="panel-heading">
+        <div><p class="section-label">SIGNAL</p><h2>实时音频时间轴</h2></div>
+        <div class="metric-row"><span>RMS <b id="rms">—</b></span><span>队列 <b id="queue-depth">0</b></span><span>丢弃 <b id="drops">0</b></span></div>
+      </div>
+      <div class="canvas-wrap waveform-wrap"><canvas id="waveform"></canvas><span class="axis-label">WAVE</span></div>
+      <div class="canvas-wrap vad-wrap"><canvas id="vad"></canvas><span class="axis-label">VAD</span></div>
+      <div class="canvas-wrap kws-wrap"><canvas id="kws"></canvas><span class="axis-label">KWS</span></div>
+      <div class="legend"><span class="vad-key">语音</span><span class="wake-key">唤醒词剔除区</span><span class="candidate-key">候选话段</span><span>窗口：最近 20 秒</span></div>
+    </section>
+
+    <section class="grid">
+      <article class="panel events-panel">
+        <div class="panel-heading"><div><p class="section-label">TRACE</p><h2>事件流水</h2></div><button id="clear-events">清空</button></div>
+        <div class="event-table-wrap">
+          <table><thead><tr><th>#</th><th>时间</th><th>级别</th><th>类型</th><th>详情</th></tr></thead><tbody id="events"></tbody></table>
+        </div>
+      </article>
+
+      <article class="panel config-panel">
+        <div class="panel-heading"><div><p class="section-label">TUNING</p><h2>热参数</h2></div><span id="config-revision" class="pill">rev —</span></div>
+        <form id="config-form">
+          <fieldset><legend>KWS</legend>
+            <label>触发阈值 <input name="kws.threshold" type="number" min="0" max="1" step="0.01"></label>
+            <label>Boosting score <input name="kws.boosting_score" type="number" min="0" max="20" step="0.1"></label>
+          </fieldset>
+          <fieldset><legend>VAD</legend>
+            <label>阈值 <input name="vad.threshold" type="number" min="0" max="1" step="0.01"></label>
+            <label>最短语音 ms <input name="vad.min_speech_ms" type="number" min="0" step="10"></label>
+            <label>最短静音 ms <input name="vad.min_silence_ms" type="number" min="0" step="10"></label>
+          </fieldset>
+          <fieldset><legend>切割</legend>
+            <label>唤醒防护 ms <input name="segmentation.wake_guard_ms" type="number" min="0" step="10"></label>
+            <label>结束静音 ms <input name="segmentation.endpoint_silence_ms" type="number" min="0" step="10"></label>
+            <label>最短命令 ms <input name="segmentation.min_command_speech_ms" type="number" min="0" step="10"></label>
+          </fieldset>
+          <details class="cold-settings">
+            <summary>冷参数 · 保存后重启生效</summary>
+            <fieldset><legend>设备</legend>
+              <label>麦克风 endpoint ID <input name="audio.microphone_device" type="text"></label>
+              <label>Loopback endpoint ID <input name="audio.loopback_device" type="text"></label>
+            </fieldset>
+            <fieldset><legend>KWS 模型与执行器</legend>
+              <label>Provider <input name="kws.provider" type="text"></label>
+              <label>推理线程 <input name="kws.num_threads" type="number" min="1" max="16" step="1"></label>
+              <label>Encoder <input name="kws.encoder" type="text"></label>
+              <label>Decoder <input name="kws.decoder" type="text"></label>
+              <label>Joiner <input name="kws.joiner" type="text"></label>
+              <label>Tokens <input name="kws.tokens" type="text"></label>
+              <label>Keywords <input name="kws.keywords" type="text"></label>
+            </fieldset>
+            <fieldset><legend>VAD 模型与执行器</legend>
+              <label>Provider <input name="vad.provider" type="text"></label>
+              <label>推理线程 <input name="vad.num_threads" type="number" min="1" max="16" step="1"></label>
+              <label>Model <input name="vad.model" type="text"></label>
+            </fieldset>
+          </details>
+          <p id="restart-required" class="restart-note" hidden></p>
+          <div class="form-actions"><button type="button" id="config-reset">恢复加载值</button><button type="button" id="config-save">应用并保存</button><button type="submit" class="primary">应用</button></div>
+        </form>
+        <p class="note">模型路径、设备和推理线程是冷参数，写入配置后需重启。KWS 面板展示命中脉冲与 token 时间，不伪造连续置信度。</p>
+      </article>
+    </section>
+  </main>
+
+  <script src="/app.js" defer></script>
+</body>
+</html>

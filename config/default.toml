@@ -1,0 +1,87 @@
+# Desktop Voice Orchestrator 第一部分默认配置
+#
+# 单位统一使用 Hz、ms、样本数。标记“热”的参数可由调试界面应用；
+# 标记“冷”的参数会保存到覆盖配置，但必须重启进程才能生效。
+
+[audio]
+# 冷：WASAPI endpoint ID；default 表示系统默认控制台设备。
+microphone_device = "default"
+loopback_device = "default"
+# 冷：默认设备变化时是否跟随新设备。
+follow_default_device = true
+# 固定：KWS/VAD/环形缓冲的内部格式。
+target_sample_rate = 16000
+frame_ms = 10
+# 固定容量采集队列，范围 500..10000 ms；满时重置推理状态而不阻塞采集。
+queue_capacity_ms = 2000
+
+[preprocess]
+# 冷：第一部分只允许 bypass；该接口以后由 WebRTC AEC3 实现替换。
+implementation = "bypass"
+aec_enabled = false
+
+[ring]
+# 冷：内存音频保留时长，范围 1000..120000 ms；默认正好 20 秒。
+duration_ms = 20000
+
+[kws]
+enabled = true
+# 冷：固定使用 sherpa-onnx v1.13.2 的中英 Zipformer KWS chunk-16 模型。
+encoder = "models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx"
+decoder = "models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/decoder-epoch-13-avg-2-chunk-16-left-64.onnx"
+joiner = "models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx"
+tokens = "models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/tokens.txt"
+lexicon = "models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/en.phone"
+keywords = "config/keywords.txt"
+provider = "cpu"
+num_threads = 1
+max_active_paths = 4
+num_trailing_blanks = 1
+# 热：分数越大越容易保留关键词路径，建议范围 0..20。
+boosting_score = 1.0
+# 热：声学触发阈值，范围 0..1；越低越容易触发。
+threshold = 0.25
+
+[vad]
+enabled = true
+model = "models/silero_vad.int8.onnx"
+provider = "cpu"
+num_threads = 1
+# 热：语音概率阈值，范围 0..1。
+threshold = 0.25
+# 固定：16 kHz 模型每次输入 512 样本（32 ms）。
+window_size = 512
+# 热：保留话段的最短语音、关闭话段的最短静音和单段最大长度。
+min_speech_ms = 150
+min_silence_ms = 600
+max_speech_ms = 18000
+
+[segmentation]
+# 热：KWS token 区间两侧额外剔除范围，避免唤醒词尾音进入 ASR。
+wake_guard_ms = 100
+# 热：候选命令首尾上下文；不会跨过唤醒词防护区。
+pre_roll_ms = 150
+post_roll_ms = 150
+# 热：等待该时长静音后结束整段多命令口述，必须 >= VAD min_silence_ms。
+endpoint_silence_ms = 900
+# 热：最大候选长度，不能超过 ring.duration_ms。
+max_candidate_ms = 18000
+# 热：唤醒词一侧至少有这么多有效语音才被当作命令。
+min_command_speech_ms = 250
+# 热：embedded 左右 PCM 拼接时插入的静音。
+embedded_join_silence_ms = 150
+
+[web]
+enabled = true
+# 冷：只允许本机回环地址。
+bind = "127.0.0.1"
+port = 8765
+# 热：JSON 遥测刷新率，范围 1..60 Hz。
+telemetry_hz = 20
+static_root = "web"
+
+[recording]
+# 冷：只有用户显式点击录制后才会创建文件；目录已在 .gitignore 中排除。
+session_root = "data/sessions"
+# 固定容量异步写盘队列；溢出会将会话标记 incomplete，但不会阻塞音频处理。
+queue_capacity_ms = 5000

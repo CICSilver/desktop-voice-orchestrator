@@ -1,0 +1,314 @@
+#include "dvo/debug_server.h"
+
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+
+#include <Windows.h>
+#include <bcrypt.h>
+
+#include <algorithm>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <fstream>
+#include <mutex>
+#include <sstream>
+#include <stdexcept>
+#include <vector>
+
+namespace dvo {
+namespace asio = boost::asio;
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace websocket = beast::websocket;
+using tcp = asio::ip::tcp;
+
+namespace {
+
+struct Subscriber {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<std::string> queue;
+  bool stopped{};
+  std::uint64_t dropped{};
+};
+
+std::string random_token() {
+  std::array<unsigned char, 24> bytes{};
+  if (BCryptGenRandom(nullptr, bytes.data(), static_cast<ULONG>(bytes.size()),
+                      BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+    throw std::runtime_error("BCryptGenRandom failed");
+  }
+  constexpr char hex[] = "0123456789abcdef";
+  std::string result;
+  result.reserve(bytes.size() * 2);
+  for (const auto byte : bytes) {
+    result.push_back(hex[byte >> 4]);
+    result.push_back(hex[byte & 0x0f]);
+  }
+  return result;
+}
+
+std::string query_value(beast::string_view target, beast::string_view key) {
+  const auto question = target.find('?');
+  if (question == beast::string_view::npos) return {};
+  auto query = target.substr(question + 1);
+  while (!query.empty()) {
+    const auto amp = query.find('&');
+    const auto part = query.substr(0, amp);
+    const auto equals = part.find('=');
+    if (equals != beast::string_view::npos && part.substr(0, equals) == key) {
+      return std::string(part.substr(equals + 1));
+    }
+    if (amp == beast::string_view::npos) break;
+    query.remove_prefix(amp + 1);
+  }
+  return {};
+}
+
+std::string path_only(beast::string_view target) {
+  const auto question = target.find('?');
+  return std::string(target.substr(0, question));
+}
+
+std::string mime_type(const std::filesystem::path& path) {
+  const auto extension = path.extension().string();
+  if (extension == ".html") return "text/html; charset=utf-8";
+  if (extension == ".js") return "text/javascript; charset=utf-8";
+  if (extension == ".css") return "text/css; charset=utf-8";
+  if (extension == ".svg") return "image/svg+xml";
+  if (extension == ".json") return "application/json";
+  return "application/octet-stream";
+}
+
+std::string read_file(const std::filesystem::path& path) {
+  std::ifstream input(path, std::ios::binary);
+  if (!input) throw std::runtime_error("file not found");
+  return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+}
+
+template <typename Body>
+void add_security_headers(http::response<Body>& response) {
+  response.set(http::field::cache_control, "no-store");
+  response.set("X-Content-Type-Options", "nosniff");
+  response.set("Content-Security-Policy",
+               "default-src 'self'; connect-src 'self' ws://127.0.0.1:*; "
+               "style-src 'self'; script-src 'self'; img-src 'self' data:");
+}
+
+}  // namespace
+
+struct DebugServer::SharedState {
+  WebConfig config;
+  CommandHandler commands;
+  std::string token;
+  std::atomic<bool> stopping{};
+  std::mutex subscribers_mutex;
+  std::vector<std::weak_ptr<Subscriber>> subscribers;
+  std::deque<std::string> history;
+  std::uint64_t sequence{};
+};
+
+DebugServer::DebugServer(std::size_t capacity) : outbound_(capacity) {}
+
+DebugServer::~DebugServer() { stop(); }
+
+void DebugServer::start(const WebConfig& config, CommandHandler commands) {
+  stop();
+  state_ = std::make_shared<SharedState>();
+  state_->config = config;
+  state_->commands = std::move(commands);
+  state_->token = random_token();
+  broker_ = std::jthread([this](std::stop_token stop) { broker_loop(stop); });
+  acceptor_ = std::jthread([this](std::stop_token stop) { accept_loop(stop); });
+}
+
+void DebugServer::stop() {
+  if (state_) {
+    state_->stopping.store(true, std::memory_order_release);
+    std::scoped_lock lock(state_->subscribers_mutex);
+    for (auto& weak : state_->subscribers) {
+      if (auto subscriber = weak.lock()) {
+        std::scoped_lock subscriber_lock(subscriber->mutex);
+        subscriber->stopped = true;
+        subscriber->cv.notify_all();
+      }
+    }
+  }
+  if (acceptor_.joinable()) { acceptor_.request_stop(); acceptor_.join(); }
+  if (broker_.joinable()) { broker_.request_stop(); broker_.join(); }
+  state_.reset();
+}
+
+bool DebugServer::publish(std::string type, nlohmann::json payload,
+                          std::uint64_t timestamp_sample, std::string source) {
+  if (!state_) return false;
+  std::unique_lock lock(publish_mutex_, std::try_to_lock);
+  if (!lock.owns_lock()) {
+    dropped_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  if (!outbound_.try_push({std::move(type), std::move(payload), timestamp_sample, std::move(source)})) {
+    dropped_.fetch_add(1, std::memory_order_relaxed);
+    return false;
+  }
+  return true;
+}
+
+std::string DebugServer::token() const { return state_ ? state_->token : std::string{}; }
+
+std::string DebugServer::url() const {
+  if (!state_) return {};
+  return "http://" + state_->config.bind + ':' + std::to_string(state_->config.port) +
+         "/?token=" + state_->token;
+}
+
+void DebugServer::broker_loop(std::stop_token stop) {
+  while (!stop.stop_requested()) {
+    Outbound outbound;
+    if (!outbound_.try_pop(outbound)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
+    auto state = state_;
+    if (!state) break;
+    std::string_view level = "info";
+    if (outbound.type == "capture_error" || outbound.type == "config_rejected") level = "error";
+    else if (outbound.type == "candidate_rejected" || outbound.type == "candidate_cancelled" ||
+             outbound.type == "telemetry_dropped") level = "warn";
+    const auto envelope = nlohmann::json{{"schema_version", 1},
+                                         {"seq", ++state->sequence},
+                                         {"session_id", "runtime"},
+                                         {"source", outbound.source},
+                                         {"level", level},
+                                         {"type", outbound.type},
+                                         {"timestamp_sample", outbound.timestamp_sample},
+                                         {"payload", std::move(outbound.payload)}}.dump();
+    std::scoped_lock lock(state->subscribers_mutex);
+    state->history.push_back(envelope);
+    while (state->history.size() > 400) state->history.pop_front();
+    state->subscribers.erase(
+        std::remove_if(state->subscribers.begin(), state->subscribers.end(),
+                       [](const auto& weak) { return weak.expired(); }),
+        state->subscribers.end());
+    for (auto& weak : state->subscribers) {
+      if (auto subscriber = weak.lock()) {
+        std::scoped_lock subscriber_lock(subscriber->mutex);
+        if (subscriber->queue.size() >= 512) {
+          subscriber->queue.pop_front();
+          ++subscriber->dropped;
+          dropped_.fetch_add(1, std::memory_order_relaxed);
+        }
+        subscriber->queue.push_back(envelope);
+        subscriber->cv.notify_one();
+      }
+    }
+  }
+}
+
+void DebugServer::accept_loop(std::stop_token stop) {
+  auto state = state_;
+  try {
+    asio::io_context io;
+    tcp::acceptor acceptor(io, {asio::ip::make_address(state->config.bind), state->config.port});
+    acceptor.non_blocking(true);
+    while (!stop.stop_requested() && !state->stopping.load()) {
+      beast::error_code error;
+      tcp::socket socket(io);
+      acceptor.accept(socket, error);
+      if (error == asio::error::would_block || error == asio::error::try_again) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        continue;
+      }
+      if (error) throw beast::system_error(error);
+      std::thread([state, socket = std::move(socket)]() mutable {
+        try {
+          beast::flat_buffer buffer;
+          http::request<http::string_body> request;
+          http::read(socket, buffer, request);
+          const auto request_path = path_only(request.target());
+          const bool protected_resource = request_path == "/ws" || request_path.starts_with("/api/");
+          const bool authorized = query_value(request.target(), "token") == state->token;
+          if (protected_resource && !authorized) {
+            http::response<http::string_body> response{http::status::unauthorized, request.version()};
+            response.body() = "Unauthorized";
+            response.prepare_payload();
+            add_security_headers(response);
+            http::write(socket, response);
+            return;
+          }
+
+          if (websocket::is_upgrade(request) && request_path == "/ws") {
+            if (const auto origin = request.find(http::field::origin); origin != request.end()) {
+              const auto expected = "http://" + state->config.bind + ':' + std::to_string(state->config.port);
+              if (origin->value() != expected) throw std::runtime_error("WebSocket origin rejected");
+            }
+            websocket::stream<tcp::socket> ws(std::move(socket));
+            ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
+            ws.accept(request);
+            auto subscriber = std::make_shared<Subscriber>();
+            {
+              std::scoped_lock lock(state->subscribers_mutex);
+              subscriber->queue.insert(subscriber->queue.end(), state->history.begin(), state->history.end());
+              state->subscribers.push_back(subscriber);
+            }
+            while (!state->stopping.load()) {
+              std::string message;
+              {
+                std::unique_lock lock(subscriber->mutex);
+                subscriber->cv.wait_for(lock, std::chrono::milliseconds(250), [&] {
+                  return subscriber->stopped || !subscriber->queue.empty();
+                });
+                if (subscriber->stopped) break;
+                if (subscriber->queue.empty()) continue;
+                message = std::move(subscriber->queue.front());
+                subscriber->queue.pop_front();
+              }
+              ws.write(asio::buffer(message));
+            }
+            beast::error_code ignored;
+            ws.close(websocket::close_code::normal, ignored);
+            return;
+          }
+
+          if (request.method() == http::verb::post && request_path == "/api/command") {
+            nlohmann::json output;
+            try {
+              output = state->commands ? state->commands(nlohmann::json::parse(request.body()))
+                                       : nlohmann::json{{"ok", false}, {"error", "no command handler"}};
+            } catch (const std::exception& e) {
+              output = {{"ok", false}, {"error", e.what()}};
+            }
+            http::response<http::string_body> response{http::status::ok, request.version()};
+            response.set(http::field::content_type, "application/json");
+            response.body() = output.dump();
+            response.prepare_payload();
+            add_security_headers(response);
+            http::write(socket, response);
+            return;
+          }
+
+          auto path = request_path;
+          if (path == "/") path = "/index.html";
+          if (path.find("..") != std::string::npos || path.find('\\') != std::string::npos) {
+            throw std::runtime_error("invalid static path");
+          }
+          const auto file = state->config.static_root / path.substr(1);
+          http::response<http::string_body> response{http::status::ok, request.version()};
+          response.set(http::field::content_type, mime_type(file));
+          response.body() = read_file(file);
+          response.prepare_payload();
+          add_security_headers(response);
+          http::write(socket, response);
+        } catch (...) {
+          beast::error_code ignored;
+          socket.shutdown(tcp::socket::shutdown_both, ignored);
+        }
+      }).detach();
+    }
+  } catch (const std::exception& e) {
+    (void)e;
+  }
+}
+
+}  // namespace dvo
