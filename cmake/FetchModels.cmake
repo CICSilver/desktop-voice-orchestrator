@@ -8,9 +8,24 @@ file(MAKE_DIRECTORY "${DVO_MODEL_DIR}")
 set(DOWNLOAD_DIR "${DVO_MODEL_DIR}/_downloads")
 file(MAKE_DIRECTORY "${DOWNLOAD_DIR}")
 
+function(dvo_verify_model_file path sha256 label)
+  if(NOT EXISTS "${path}")
+    message(FATAL_ERROR "Pinned model file is missing: ${label} (${path})")
+  endif()
+  file(SHA256 "${path}" actual_sha256)
+  if(NOT "${actual_sha256}" STREQUAL "${sha256}")
+    message(FATAL_ERROR
+      "Pinned model hash mismatch: ${label}; expected ${sha256}, got ${actual_sha256}")
+  endif()
+endfunction()
+
 set(KWS_ARCHIVE "${DOWNLOAD_DIR}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2")
 set(KWS_DIR "${DVO_MODEL_DIR}/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20")
-if(NOT EXISTS "${KWS_DIR}/encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx")
+if(NOT EXISTS "${KWS_DIR}/encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx" OR
+   NOT EXISTS "${KWS_DIR}/decoder-epoch-13-avg-2-chunk-16-left-64.onnx" OR
+   NOT EXISTS "${KWS_DIR}/joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx" OR
+   NOT EXISTS "${KWS_DIR}/tokens.txt" OR
+   NOT EXISTS "${KWS_DIR}/en.phone")
   file(DOWNLOAD
     "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2"
     "${KWS_ARCHIVE}"
@@ -23,6 +38,26 @@ if(NOT EXISTS "${KWS_DIR}/encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx")
     COMMAND_ERROR_IS_FATAL ANY
   )
 endif()
+dvo_verify_model_file(
+  "${KWS_DIR}/encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx"
+  "408bbd740838c42d5bf6d1c5b80b3c88b616c7860b92d980328b5b068c76ae48"
+  "KWS encoder")
+dvo_verify_model_file(
+  "${KWS_DIR}/decoder-epoch-13-avg-2-chunk-16-left-64.onnx"
+  "63a22dd60f40fff082ac3e09afa507f6787da36df76ded2fbe145fa233e22c21"
+  "KWS decoder")
+dvo_verify_model_file(
+  "${KWS_DIR}/joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx"
+  "190d4067b4cc20b72a42a1916e69d92052000fb7051a427ebb1bc72a69207dc1"
+  "KWS joiner")
+dvo_verify_model_file(
+  "${KWS_DIR}/tokens.txt"
+  "2d3f32311f9b692b964da3c90e830258d3e78e013cb0c992dbfb15cd5a1a71b0"
+  "KWS tokens")
+dvo_verify_model_file(
+  "${KWS_DIR}/en.phone"
+  "f7000ec3a90544c0c7c16090d8951779c2b322e14dad5006290f498567d439ea"
+  "KWS lexicon")
 
 set(VAD_MODEL "${DVO_MODEL_DIR}/silero_vad.int8.onnx")
 if(NOT EXISTS "${VAD_MODEL}")
@@ -33,5 +68,38 @@ if(NOT EXISTS "${VAD_MODEL}")
     SHOW_PROGRESS TLS_VERIFY ON
   )
 endif()
+dvo_verify_model_file(
+  "${VAD_MODEL}"
+  "c36d490aff5ab924ca6c7aeec4d8f6bd3d22db6fa17611b9c5b17eae58ac3a20"
+  "Silero VAD")
+
+# The generic FunASR ONNX export in csukuangfj/streaming-paraformer-zh does
+# not carry the metadata required by sherpa-onnx's OnlineParaformer loader.
+# Keep the compatible re-export in a distinct directory so the two encoders
+# cannot be selected accidentally.
+set(ASR_DIR "${DVO_MODEL_DIR}/sherpa-onnx-streaming-paraformer-zh")
+file(MAKE_DIRECTORY "${ASR_DIR}")
+set(ASR_BASE_URL
+  "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-paraformer-zh/resolve/2a7f71bb58885c1b522ed4e683abd397355d9fc4")
+
+function(dvo_fetch_asr_file filename sha256)
+  if(NOT EXISTS "${ASR_DIR}/${filename}")
+    file(DOWNLOAD
+      "${ASR_BASE_URL}/${filename}"
+      "${ASR_DIR}/${filename}"
+      EXPECTED_HASH "SHA256=${sha256}"
+      SHOW_PROGRESS TLS_VERIFY ON
+    )
+  else()
+    dvo_verify_model_file("${ASR_DIR}/${filename}" "${sha256}" "ASR ${filename}")
+  endif()
+endfunction()
+
+dvo_fetch_asr_file("encoder.int8.onnx"
+  "81a70226a8934e6ed92aa1d4fc486b428b5398e2f2619ed4897b7294cab90e9a")
+dvo_fetch_asr_file("decoder.int8.onnx"
+  "f3cca9f77bb9d93c8fcbfb63ae617b6b1ee96818df3aa3b151c40658fe38594f")
+dvo_fetch_asr_file("tokens.txt"
+  "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6")
 
 message(STATUS "Pinned models are ready in ${DVO_MODEL_DIR}")

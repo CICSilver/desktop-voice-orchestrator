@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 namespace dvo {
 
@@ -59,6 +60,51 @@ RingSlice TimedRingBuffer::slice(SampleSpan span) const {
   result.samples.reserve(static_cast<std::size_t>(result.actual.size()));
   for (auto index = result.actual.start; index < result.actual.end; ++index) {
     result.samples.push_back(data_[static_cast<std::size_t>(index % data_.size())]);
+  }
+  return result;
+}
+
+RingSlice TimedRingBuffer::slice_cooperative(SampleSpan span,
+                                             std::size_t chunk_samples) const {
+  if (chunk_samples == 0) {
+    throw std::invalid_argument("cooperative ring slice chunk must be positive");
+  }
+
+  RingSlice result;
+  result.requested = span;
+  {
+    std::shared_lock lock(mutex_);
+    if (!initialized_ || span.empty()) return result;
+    result.actual.start = std::max(span.start, head_);
+    result.actual.end = std::min(span.end, tail_);
+    result.truncated_left = result.actual.start != span.start;
+    result.truncated_right = result.actual.end != span.end;
+  }
+  if (result.actual.empty()) return result;
+
+  result.samples.reserve(static_cast<std::size_t>(result.actual.size()));
+  auto cursor = result.actual.start;
+  while (cursor < result.actual.end) {
+    const auto remaining = result.actual.end - cursor;
+    const auto chunk_size = std::min<std::uint64_t>(
+        remaining, static_cast<std::uint64_t>(chunk_samples));
+    const auto chunk_end = cursor + chunk_size;
+    {
+      std::shared_lock lock(mutex_);
+      if (!initialized_ || head_ > cursor || tail_ < chunk_end) {
+        result.samples.clear();
+        result.actual.end = result.actual.start;
+        result.truncated_left = true;
+        result.truncated_right = true;
+        return result;
+      }
+      for (auto index = cursor; index < chunk_end; ++index) {
+        result.samples.push_back(
+            data_[static_cast<std::size_t>(index % data_.size())]);
+      }
+    }
+    cursor = chunk_end;
+    if (cursor < result.actual.end) std::this_thread::yield();
   }
   return result;
 }

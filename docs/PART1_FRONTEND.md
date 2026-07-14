@@ -1,5 +1,8 @@
 # 第一部分实现与验证手册
 
+> 本文保留第一阶段的实现与验收基线。AEC、在线 Paraformer 和媒体命令已在第二阶段接入；
+> 当前状态及新增边界见 [PART2_AEC_ASR_COMMANDS.md](PART2_AEC_ASR_COMMANDS.md)。
+
 ## 已实现范围
 
 - 两个独立的 WASAPI shared-mode、event-driven 采集线程：麦克风与 render endpoint loopback。

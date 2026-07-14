@@ -102,7 +102,11 @@ struct DebugServer::SharedState {
   WebConfig config;
   CommandHandler commands;
   std::string token;
+  std::string session_id;
   std::atomic<bool> stopping{};
+  std::mutex commands_mutex;
+  std::condition_variable commands_cv;
+  std::size_t active_commands{};
   std::mutex subscribers_mutex;
   std::vector<std::weak_ptr<Subscriber>> subscribers;
   std::deque<std::string> history;
@@ -114,20 +118,45 @@ DebugServer::DebugServer(std::size_t capacity) : outbound_(capacity) {}
 DebugServer::~DebugServer() { stop(); }
 
 void DebugServer::start(const WebConfig& config, CommandHandler commands) {
+  std::scoped_lock lifecycle_lock(lifecycle_mutex_);
   stop();
-  state_ = std::make_shared<SharedState>();
-  state_->config = config;
-  state_->commands = std::move(commands);
-  state_->token = random_token();
+  {
+    // Events from a previous server instance must never acquire the new
+    // instance's session id.
+    std::scoped_lock publish_lock(publish_mutex_);
+    Outbound stale;
+    while (outbound_.try_pop(stale)) {}
+    dropped_.store(0, std::memory_order_release);
+  }
+  auto state = std::make_shared<SharedState>();
+  state->config = config;
+  state->commands = std::move(commands);
+  state->token = random_token();
+  state->session_id = random_token();
+  {
+    std::scoped_lock state_lock(state_mutex_);
+    state_ = std::move(state);
+  }
   broker_ = std::jthread([this](std::stop_token stop) { broker_loop(stop); });
   acceptor_ = std::jthread([this](std::stop_token stop) { accept_loop(stop); });
 }
 
 void DebugServer::stop() {
-  if (state_) {
-    state_->stopping.store(true, std::memory_order_release);
-    std::scoped_lock lock(state_->subscribers_mutex);
-    for (auto& weak : state_->subscribers) {
+  std::scoped_lock lifecycle_lock(lifecycle_mutex_);
+  std::shared_ptr<SharedState> state;
+  {
+    std::scoped_lock state_lock(state_mutex_);
+    state = state_;
+  }
+  if (state) {
+    {
+      // Pair the stopping transition with producer serialization so publish()
+      // cannot enqueue after the broker has been joined.
+      std::scoped_lock publish_lock(publish_mutex_);
+      state->stopping.store(true, std::memory_order_release);
+    }
+    std::scoped_lock lock(state->subscribers_mutex);
+    for (auto& weak : state->subscribers) {
       if (auto subscriber = weak.lock()) {
         std::scoped_lock subscriber_lock(subscriber->mutex);
         subscriber->stopped = true;
@@ -137,12 +166,28 @@ void DebugServer::stop() {
   }
   if (acceptor_.joinable()) { acceptor_.request_stop(); acceptor_.join(); }
   if (broker_.joinable()) { broker_.request_stop(); broker_.join(); }
-  state_.reset();
+  if (state) {
+    // A detached HTTP connection captures only SharedState, except while it is
+    // inside the command callback. Waiting for those callbacks is what makes a
+    // handler that captures VoiceFrontendRuntime safe to tear down.
+    std::unique_lock commands_lock(state->commands_mutex);
+    state->commands_cv.wait(commands_lock,
+                            [&] { return state->active_commands == 0; });
+  }
+  {
+    std::scoped_lock state_lock(state_mutex_);
+    if (state_ == state) state_.reset();
+  }
 }
 
 bool DebugServer::publish(std::string type, nlohmann::json payload,
                           std::uint64_t timestamp_sample, std::string source) {
-  if (!state_) return false;
+  std::shared_ptr<SharedState> state;
+  {
+    std::scoped_lock state_lock(state_mutex_);
+    state = state_;
+  }
+  if (!state || state->stopping.load(std::memory_order_acquire)) return false;
   std::unique_lock lock(publish_mutex_, std::try_to_lock);
   if (!lock.owns_lock()) {
     dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -155,9 +200,13 @@ bool DebugServer::publish(std::string type, nlohmann::json payload,
   return true;
 }
 
-std::string DebugServer::token() const { return state_ ? state_->token : std::string{}; }
+std::string DebugServer::token() const {
+  std::scoped_lock state_lock(state_mutex_);
+  return state_ ? state_->token : std::string{};
+}
 
 std::string DebugServer::url() const {
+  std::scoped_lock state_lock(state_mutex_);
   if (!state_) return {};
   return "http://" + state_->config.bind + ':' + std::to_string(state_->config.port) +
          "/?token=" + state_->token;
@@ -170,15 +219,21 @@ void DebugServer::broker_loop(std::stop_token stop) {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
       continue;
     }
-    auto state = state_;
+    std::shared_ptr<SharedState> state;
+    {
+      std::scoped_lock state_lock(state_mutex_);
+      state = state_;
+    }
     if (!state) break;
     std::string_view level = "info";
-    if (outbound.type == "capture_error" || outbound.type == "config_rejected") level = "error";
+    if (outbound.type == "capture_error" || outbound.type == "config_rejected" ||
+        outbound.type == "asr_error" || outbound.type == "action_failed") level = "error";
     else if (outbound.type == "candidate_rejected" || outbound.type == "candidate_cancelled" ||
-             outbound.type == "telemetry_dropped") level = "warn";
+             outbound.type == "telemetry_dropped" || outbound.type == "asr_overloaded" ||
+             outbound.type == "command_rejected") level = "warn";
     const auto envelope = nlohmann::json{{"schema_version", 1},
                                          {"seq", ++state->sequence},
-                                         {"session_id", "runtime"},
+                                         {"session_id", state->session_id},
                                          {"source", outbound.source},
                                          {"level", level},
                                          {"type", outbound.type},
@@ -207,7 +262,12 @@ void DebugServer::broker_loop(std::stop_token stop) {
 }
 
 void DebugServer::accept_loop(std::stop_token stop) {
-  auto state = state_;
+  std::shared_ptr<SharedState> state;
+  {
+    std::scoped_lock state_lock(state_mutex_);
+    state = state_;
+  }
+  if (!state) return;
   try {
     asio::io_context io;
     tcp::acceptor acceptor(io, {asio::ip::make_address(state->config.bind), state->config.port});
@@ -239,9 +299,11 @@ void DebugServer::accept_loop(std::stop_token stop) {
           }
 
           if (websocket::is_upgrade(request) && request_path == "/ws") {
-            if (const auto origin = request.find(http::field::origin); origin != request.end()) {
-              const auto expected = "http://" + state->config.bind + ':' + std::to_string(state->config.port);
-              if (origin->value() != expected) throw std::runtime_error("WebSocket origin rejected");
+            const auto origin = request.find(http::field::origin);
+            const auto expected = "http://" + state->config.bind + ':' +
+                                  std::to_string(state->config.port);
+            if (origin == request.end() || origin->value() != expected) {
+              throw std::runtime_error("WebSocket origin rejected");
             }
             websocket::stream<tcp::socket> ws(std::move(socket));
             ws.set_option(websocket::stream_base::timeout::suggested(beast::role_type::server));
@@ -273,11 +335,30 @@ void DebugServer::accept_loop(std::stop_token stop) {
 
           if (request.method() == http::verb::post && request_path == "/api/command") {
             nlohmann::json output;
-            try {
-              output = state->commands ? state->commands(nlohmann::json::parse(request.body()))
-                                       : nlohmann::json{{"ok", false}, {"error", "no command handler"}};
-            } catch (const std::exception& e) {
-              output = {{"ok", false}, {"error", e.what()}};
+            bool admitted{};
+            {
+              std::scoped_lock commands_lock(state->commands_mutex);
+              if (!state->stopping.load(std::memory_order_acquire)) {
+                ++state->active_commands;
+                admitted = true;
+              }
+            }
+            if (!admitted) {
+              output = {{"ok", false}, {"error", "debug server is stopping"}};
+            } else {
+              try {
+                output = state->commands ? state->commands(nlohmann::json::parse(request.body()))
+                                         : nlohmann::json{{"ok", false}, {"error", "no command handler"}};
+              } catch (const std::exception& e) {
+                output = {{"ok", false}, {"error", e.what()}};
+              } catch (...) {
+                output = {{"ok", false}, {"error", "command handler failed"}};
+              }
+              {
+                std::scoped_lock commands_lock(state->commands_mutex);
+                --state->active_commands;
+                state->commands_cv.notify_all();
+              }
             }
             http::response<http::string_body> response{http::status::ok, request.version()};
             response.set(http::field::content_type, "application/json");

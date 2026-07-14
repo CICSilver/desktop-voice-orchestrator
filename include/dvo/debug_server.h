@@ -46,6 +46,11 @@ class DebugServer {
   void accept_loop(std::stop_token stop);
 
   SpscQueue<Outbound> outbound_;
+  // start()/stop() own the worker threads and may call one another. A recursive
+  // mutex keeps that lifecycle atomic without holding state_mutex_ while a
+  // worker is being joined.
+  std::recursive_mutex lifecycle_mutex_;
+  mutable std::mutex state_mutex_;
   std::shared_ptr<SharedState> state_;
   std::jthread broker_;
   std::jthread acceptor_;

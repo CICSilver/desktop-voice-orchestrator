@@ -41,19 +41,42 @@ void UtteranceSegmenter::set_vad_state(bool speech, std::uint64_t at_sample) {
   }
 }
 
-void UtteranceSegmenter::add_kws_hit(KwsHit hit) {
+std::optional<UtteranceStart> UtteranceSegmenter::add_kws_hit(KwsHit hit) {
   if (!pending_hits_.empty()) {
     const auto debounce = samples(500);
-    if (hit.detected_at_sample < pending_hits_.back().detected_at_sample + debounce &&
-        hit.keyword == pending_hits_.back().keyword) return;
+    if (hit.detected_at_sample < pending_hits_.back().hit.detected_at_sample + debounce &&
+        hit.keyword == pending_hits_.back().hit.keyword) return std::nullopt;
   }
-  pending_hits_.push_back(std::move(hit));
+  UtteranceStart start;
+  start.utterance_id = make_id();
+  start.wake_span = hit.wake_span;
+  start.provisional_left_spans = provisional_left_spans(hit);
+  pending_hits_.push_back(PendingHit{std::move(hit), start.utterance_id});
+  return start;
 }
 
 SegmenterResult UtteranceSegmenter::advance(std::uint64_t current_sample) {
+  auto planned = advance_for_assembly(current_sample);
   SegmenterResult result;
+  result.rejections = std::move(planned.rejections);
+  for (auto& request : planned.assemblies) {
+    auto assembled = assemble_candidate(ring_, std::move(request));
+    if (assembled.candidate) {
+      result.candidates.push_back(std::move(*assembled.candidate));
+    } else {
+      result.rejections.push_back(
+          {std::move(assembled.utterance_id), std::move(assembled.rejection)});
+    }
+  }
+  return result;
+}
+
+SegmenterPlanResult UtteranceSegmenter::advance_for_assembly(
+    std::uint64_t current_sample) {
+  SegmenterPlanResult result;
   while (!pending_hits_.empty()) {
-    const auto& hit = pending_hits_.front();
+    const auto& pending = pending_hits_.front();
+    const auto& hit = pending.hit;
     const auto waited = current_sample > hit.detected_at_sample ? current_sample - hit.detected_at_sample : 0;
     const bool timed_out = waited >= samples(config_.max_candidate_ms);
     const auto speech_reference = std::max(last_speech_end_, hit.wake_span.end);
@@ -61,17 +84,17 @@ SegmenterResult UtteranceSegmenter::advance(std::uint64_t current_sample) {
     if (!timed_out && !endpoint) break;
 
     std::string rejection;
-    auto candidate = finalize(hit, timed_out, rejection);
-    if (candidate) result.candidates.push_back(std::move(*candidate));
-    else result.rejections.push_back(std::move(rejection));
+    auto request = plan(pending, timed_out, rejection);
+    if (request) result.assemblies.push_back(std::move(*request));
+    else result.rejections.push_back({pending.utterance_id, std::move(rejection)});
     pending_hits_.pop_front();
   }
   return result;
 }
 
-std::optional<UtteranceCandidate> UtteranceSegmenter::finalize(const KwsHit& hit,
-                                                               bool timed_out,
-                                                               std::string& rejection) {
+std::optional<CandidateAssemblyRequest> UtteranceSegmenter::plan(
+    const PendingHit& pending, bool timed_out, std::string& rejection) {
+  const auto& hit = pending.hit;
   const auto max_window = samples(config_.max_candidate_ms);
   const auto connection_gap = samples(config_.endpoint_silence_ms);
   const auto search_start = saturating_sub(hit.wake_span.start, max_window);
@@ -117,7 +140,7 @@ std::optional<UtteranceCandidate> UtteranceSegmenter::finalize(const KwsHit& hit
   }
 
   UtteranceCandidate candidate;
-  candidate.utterance_id = make_id();
+  candidate.utterance_id = pending.utterance_id;
   candidate.keyword = hit.keyword;
   candidate.tokens = hit.tokens;
   candidate.wake_span = hit.wake_span;
@@ -135,25 +158,46 @@ std::optional<UtteranceCandidate> UtteranceSegmenter::finalize(const KwsHit& hit
                                       envelope_end + samples(config_.post_roll_ms)});
   }
 
-  for (std::size_t i = 0; i < candidate.source_spans.size(); ++i) {
-    auto& span = candidate.source_spans[i];
+  for (const auto span : candidate.source_spans) {
     if (span.overlaps(candidate.wake_span)) {
       rejection = "internal error: source span overlaps wake span";
       return std::nullopt;
     }
-    auto slice = ring_.slice(span);
-    candidate.truncated = candidate.truncated || slice.truncated_left || slice.truncated_right;
-    span = slice.actual;
-    candidate.pcm.insert(candidate.pcm.end(), slice.samples.begin(), slice.samples.end());
-    if (i + 1 < candidate.source_spans.size()) {
-      candidate.pcm.insert(candidate.pcm.end(), samples(config_.embedded_join_silence_ms), 0.0F);
-    }
   }
-  if (candidate.pcm.empty()) {
-    rejection = "candidate audio is no longer available in the ring buffer";
-    return std::nullopt;
+  CandidateAssemblyRequest request;
+  request.candidate = std::move(candidate);
+  request.join_silence_samples = static_cast<std::size_t>(
+      samples(config_.embedded_join_silence_ms));
+  return request;
+}
+
+std::vector<SampleSpan> UtteranceSegmenter::provisional_left_spans(const KwsHit& hit) const {
+  const auto max_window = samples(config_.max_candidate_ms);
+  const auto connection_gap = samples(config_.endpoint_silence_ms);
+  const auto search_start = saturating_sub(hit.wake_span.start, max_window);
+  auto envelope_start = hit.wake_span.start;
+
+  // A KWS hit commonly arrives while VAD is still inside the same speech
+  // interval. That active interval has not yet appeared in vad_intervals_, but
+  // its left side is valid command backfill and must be available to streaming
+  // ASR immediately.
+  if (vad_speech_ && current_speech_start_ < hit.wake_span.start) {
+    envelope_start = std::max(search_start, current_speech_start_);
   }
-  return candidate;
+
+  for (auto it = vad_intervals_.rbegin(); it != vad_intervals_.rend(); ++it) {
+    const auto span = it->span;
+    if (span.end > hit.wake_span.start) continue;
+    if (span.end < search_start) break;
+    if (span.end + connection_gap < envelope_start) break;
+    envelope_start = std::max(search_start, std::min(envelope_start, span.start));
+  }
+  if (hit.wake_span.start <= envelope_start ||
+      hit.wake_span.start - envelope_start < samples(config_.min_command_speech_ms)) {
+    return {};
+  }
+  return {{saturating_sub(envelope_start, samples(config_.pre_roll_ms)),
+           hit.wake_span.start}};
 }
 
 void UtteranceSegmenter::reset(bool discontinuity) {
@@ -162,7 +206,11 @@ void UtteranceSegmenter::reset(bool discontinuity) {
   vad_speech_ = false;
   current_speech_start_ = 0;
   last_speech_end_ = 0;
-  discontinuity_ = discontinuity;
+  // Every pending hit and VAD interval was discarded above, so a future hit
+  // starts in a new trusted window. Carrying this flag forward would make all
+  // candidates after one device gap permanently non-executable.
+  static_cast<void>(discontinuity);
+  discontinuity_ = false;
 }
 
 void UtteranceSegmenter::reconfigure(SegmentationConfig config) {

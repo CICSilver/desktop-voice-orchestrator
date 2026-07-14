@@ -21,7 +21,7 @@
 namespace dvo {
 
 struct RecordEvent { nlohmann::json value; };
-struct RecordCandidate { UtteranceCandidate value; };
+struct RecordCandidate { std::shared_ptr<const UtteranceCandidate> value; };
 using RecordItem = std::variant<AudioPacket, NormalizedFrame, RecordEvent, RecordCandidate>;
 
 class SessionRecorder {
@@ -44,6 +44,9 @@ class SessionRecorder {
     std::uint64_t first_qpc_100ns{};
     std::uint64_t last_qpc_100ns{};
     std::uint64_t synthetic_packets{};
+    std::uint64_t timestamp_errors{};
+    std::uint64_t discontinuities{};
+    std::uint64_t last_stream_epoch{};
   };
 
   void run();
@@ -65,6 +68,8 @@ class SessionRecorder {
   std::condition_variable state_cv_;
   std::filesystem::path session_path_;
   nlohmann::json manifest_;
+  nlohmann::json action_results_{nlohmann::json::array()};
+  nlohmann::json capture_events_{nlohmann::json::array()};
   std::unique_ptr<FloatWavWriter> mic_;
   std::unique_ptr<FloatWavWriter> loopback_;
   std::unique_ptr<FloatWavWriter> processed_;

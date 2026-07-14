@@ -19,6 +19,7 @@ ReplayController::~ReplayController() { stop(); }
 void ReplayController::open(const std::filesystem::path& session) {
   std::scoped_lock lock(mutex_);
   playing_ = false;
+  dispatching_ = false;
   session_ = session;
   cursor_ = 0;
   seek_target_.reset();
@@ -50,12 +51,42 @@ void ReplayController::seek_seconds(double seconds) {
   cv_.notify_all();
 }
 
+void ReplayController::seek_seconds(double seconds, bool resume_after_seek) {
+  std::scoped_lock lock(mutex_);
+  if (entries_.empty()) return;
+  const auto target = entries_.front().qpc_100ns +
+                      static_cast<std::uint64_t>(std::max(0.0, seconds) * 10000000.0);
+  const auto target_cursor = static_cast<std::size_t>(
+      std::lower_bound(entries_.begin(), entries_.end(), target,
+                       [](const TimelineEntry& entry, std::uint64_t value) {
+                         return entry.qpc_100ns < value;
+                       }) -
+      entries_.begin());
+  resume_after_seek_ = resume_after_seek;
+  cursor_ = 0;
+  seek_target_ = target_cursor;
+  playing_ = true;
+  cv_.notify_all();
+}
+
 void ReplayController::set_speed(double speed) {
   if (speed != 0.0 && speed != 0.5 && speed != 1.0 && speed != 2.0) {
     throw std::invalid_argument("replay speed must be 0, 0.5, 1 or 2");
   }
   std::scoped_lock lock(mutex_);
   speed_ = speed;
+}
+
+bool ReplayController::wait_until_finished(std::chrono::milliseconds timeout) {
+  std::unique_lock lock(mutex_);
+  return cv_.wait_for(lock, timeout, [this] {
+    return !playing_ && !dispatching_ && cursor_ >= entries_.size();
+  });
+}
+
+bool ReplayController::wait_until_quiescent(std::chrono::milliseconds timeout) {
+  std::unique_lock lock(mutex_);
+  return cv_.wait_for(lock, timeout, [this] { return !dispatching_; });
 }
 
 void ReplayController::stop() {
@@ -77,7 +108,8 @@ nlohmann::json ReplayController::state() const {
     position_seconds = static_cast<double>(entries_[index].qpc_100ns - entries_.front().qpc_100ns) /
                        10000000.0;
   }
-  return {{"session", session_.string()}, {"playing", playing_}, {"speed", speed_},
+  return {{"session", session_.string()}, {"playing", playing_},
+          {"dispatching", dispatching_}, {"speed", speed_},
           {"cursor", cursor_}, {"entries", entries_.size()}, {"seeking", seek_target_.has_value()},
           {"duration_seconds", duration_seconds}, {"position_seconds", position_seconds}};
 }
@@ -96,8 +128,11 @@ void ReplayController::load_timeline() {
                         value.at("offset_frames").get<std::uint64_t>(),
                         value.at("frame_count").get<std::uint64_t>(),
                         value.at("qpc_100ns").get<std::uint64_t>(),
-                        value.value("device_position", 0ULL), value.value("silent", false),
-                        value.value("discontinuity", false), value.value("synthetic", false)});
+                        value.value("arrival_qpc_100ns", value.at("qpc_100ns").get<std::uint64_t>()),
+                        value.value("device_position", 0ULL), value.value("stream_epoch", 0ULL),
+                        value.value("sequence", 0ULL), value.value("silent", false),
+                        value.value("discontinuity", false), value.value("timestamp_error", false),
+                        value.value("synthetic", false)});
   }
   std::stable_sort(entries_.begin(), entries_.end(),
                    [](const auto& a, const auto& b) { return a.qpc_100ns < b.qpc_100ns; });
@@ -119,6 +154,7 @@ void ReplayController::run(std::stop_token stop) {
       });
       if (stop.stop_requested()) break;
       if (!playing_ || cursor_ >= entries_.size()) continue;
+      dispatching_ = true;
       entry = entries_[cursor_++];
       session = session_;
       speed = seek_target_ ? 0.0 : speed_;
@@ -148,14 +184,25 @@ void ReplayController::run(std::stop_token stop) {
       packet.format = reader->format();
       packet.samples = reader->read_frames(entry.offset_frames, entry.frame_count);
       packet.qpc_100ns = entry.qpc_100ns;
+      packet.arrival_qpc_100ns = entry.arrival_qpc_100ns;
       packet.device_position = entry.device_position;
+      packet.stream_epoch = entry.stream_epoch;
+      packet.sequence = entry.sequence;
       packet.silent = entry.silent;
       packet.discontinuity = entry.discontinuity;
+      packet.timestamp_error = entry.timestamp_error;
       packet.synthetic = entry.synthetic;
       callback_(std::move(packet));
+      {
+        std::scoped_lock lock(mutex_);
+        dispatching_ = false;
+        cv_.notify_all();
+      }
     } catch (...) {
       std::scoped_lock lock(mutex_);
       playing_ = false;
+      dispatching_ = false;
+      cv_.notify_all();
     }
   }
 }

@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -70,4 +71,26 @@ TEST_CASE("timed ring buffer handles oversized writes and discontinuities") {
   REQUIRE(ring.head() == 500);
   REQUIRE(ring.tail() == 502);
   REQUIRE(ring.slice({500, 502}).samples == std::vector<float>{1, 2});
+}
+
+TEST_CASE("cooperative ring slices match an atomic slice across small chunks") {
+  dvo::TimedRingBuffer ring(2048);
+  std::vector<float> samples(1500);
+  for (std::size_t i = 0; i < samples.size(); ++i) {
+    samples[i] = static_cast<float>(i);
+  }
+  ring.push(100, samples);
+
+  const auto atomic = ring.slice({123, 1477});
+  const auto cooperative = ring.slice_cooperative({123, 1477}, 17);
+  CHECK(cooperative.requested.start == atomic.requested.start);
+  CHECK(cooperative.requested.end == atomic.requested.end);
+  CHECK(cooperative.actual.start == atomic.actual.start);
+  CHECK(cooperative.actual.end == atomic.actual.end);
+  CHECK(cooperative.truncated_left == atomic.truncated_left);
+  CHECK(cooperative.truncated_right == atomic.truncated_right);
+  CHECK(cooperative.samples == atomic.samples);
+
+  CHECK_THROWS_AS(ring.slice_cooperative({123, 1477}, 0),
+                  std::invalid_argument);
 }

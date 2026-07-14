@@ -9,5 +9,14 @@
     "nlohmann-json",
     "tomlplusplus",
     "catch2"
-  ]
+  ],
+  "features": {
+    "webrtc-aec": {
+      "description": "WebRTC Audio Processing Module (AEC3) and SpeexDSP drift resampling",
+      "dependencies": [
+        "webrtc",
+        "speexdsp"
+      ]
+    }
+  }
 }

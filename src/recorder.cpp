@@ -59,7 +59,9 @@ std::filesystem::path SessionRecorder::start(const RecordingConfig& config,
   manifest_ = manifest;
   manifest_["session_id"] = session_path_.filename().string();
   manifest_["complete"] = false;
-  manifest_["format"] = "dvo-session-v1";
+  manifest_["format"] = "dvo-session-v2";
+  action_results_ = nlohmann::json::array();
+  capture_events_ = nlohmann::json::array();
   mic_stats_ = {};
   loopback_stats_ = {};
   processed_stats_ = {};
@@ -130,10 +132,19 @@ void SessionRecorder::write_item(const AudioPacket& packet) {
   stats.last_qpc_100ns = packet.qpc_100ns;
   ++stats.packets;
   if (packet.synthetic) ++stats.synthetic_packets;
+  if (packet.timestamp_error) ++stats.timestamp_errors;
+  if (packet.discontinuity) ++stats.discontinuities;
+  if (packet.timestamp_error || packet.discontinuity) {
+    incomplete_.store(true, std::memory_order_release);
+  }
+  stats.last_stream_epoch = packet.stream_epoch;
   timeline_ << nlohmann::json{{"kind", to_string(packet.stream)}, {"offset_frames", offset},
                               {"frame_count", packet.samples.size() / packet.format.channels},
                               {"qpc_100ns", packet.qpc_100ns}, {"device_position", packet.device_position},
+                              {"arrival_qpc_100ns", packet.arrival_qpc_100ns},
+                              {"stream_epoch", packet.stream_epoch}, {"sequence", packet.sequence},
                               {"silent", packet.silent}, {"discontinuity", packet.discontinuity},
+                              {"timestamp_error", packet.timestamp_error},
                               {"synthetic", packet.synthetic}}.dump() << '\n';
 }
 
@@ -150,6 +161,7 @@ void SessionRecorder::write_item(const NormalizedFrame& frame) {
   if (processed_stats_.packets == 0) processed_stats_.first_qpc_100ns = frame.qpc_100ns;
   processed_stats_.last_qpc_100ns = frame.qpc_100ns;
   ++processed_stats_.packets;
+  if (frame.discontinuity) incomplete_.store(true, std::memory_order_release);
   timeline_ << nlohmann::json{{"kind", "processed"}, {"offset_frames", offset},
                               {"frame_count", frame.samples.size()}, {"first_sample", frame.first_sample},
                               {"qpc_100ns", frame.qpc_100ns}, {"discontinuity", frame.discontinuity}}.dump() << '\n';
@@ -158,16 +170,26 @@ void SessionRecorder::write_item(const NormalizedFrame& frame) {
 void SessionRecorder::write_item(const RecordEvent& event) {
   std::scoped_lock lock(state_mutex_);
   events_ << event.value.dump() << '\n';
+  if (!event.value.is_object()) return;
+  const auto type = event.value.value("type", "");
+  const auto payload = event.value.find("payload");
+  if (type.starts_with("capture_")) capture_events_.push_back(event.value);
+  if (type.starts_with("action_") && type != "action_started" &&
+      payload != event.value.end() && payload->is_object() &&
+      payload->contains("action_id") && payload->contains("status")) {
+    action_results_.push_back(event.value);
+  }
 }
 
 void SessionRecorder::write_item(const RecordCandidate& item) {
   std::scoped_lock lock(state_mutex_);
+  if (!item.value) return;
   FloatWavWriter writer;
-  writer.open(session_path_ / "candidates" / (item.value.utterance_id + ".wav"),
-              {item.value.sample_rate, 1});
-  writer.write(item.value.pcm);
+  writer.open(session_path_ / "candidates" / (item.value->utterance_id + ".wav"),
+              {item.value->sample_rate, 1});
+  writer.write(item.value->pcm);
   writer.close();
-  events_ << nlohmann::json{{"type", "candidate"}, {"payload", candidate_json(item.value)}}.dump() << '\n';
+  events_ << nlohmann::json{{"type", "candidate"}, {"payload", candidate_json(*item.value)}}.dump() << '\n';
 }
 
 void SessionRecorder::close_files() {
@@ -187,12 +209,17 @@ void SessionRecorder::close_files() {
                             {"frames", stats.frames}, {"packets", stats.packets},
                             {"first_qpc_100ns", stats.first_qpc_100ns},
                             {"last_qpc_100ns", stats.last_qpc_100ns},
-                            {"synthetic_packets", stats.synthetic_packets}};
+                            {"synthetic_packets", stats.synthetic_packets},
+                            {"timestamp_errors", stats.timestamp_errors},
+                            {"discontinuities", stats.discontinuities},
+                            {"last_stream_epoch", stats.last_stream_epoch}};
     };
     manifest_["streams"] = {{"microphone", stream_json(mic_stats_)},
                              {"loopback", stream_json(loopback_stats_)},
                              {"processed", stream_json(processed_stats_)}};
     manifest_["recording_queue_drops"] = dropped_items_.load(std::memory_order_acquire);
+    manifest_["action_results"] = action_results_;
+    manifest_["capture_events"] = capture_events_;
     manifest_["complete"] = !incomplete();
     std::ofstream manifest(session_path_ / "manifest.json", std::ios::binary | std::ios::trunc);
     manifest << manifest_.dump(2);

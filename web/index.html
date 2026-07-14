@@ -8,10 +8,7 @@
 </head>
 <body>
   <header class="topbar">
-    <div>
-      <p class="eyebrow">DESKTOP VOICE ORCHESTRATOR</p>
-      <h1>Voice Frontend Lab</h1>
-    </div>
+    <div><p class="eyebrow">DESKTOP VOICE ORCHESTRATOR</p><h1>Voice Frontend Lab</h1></div>
     <div class="status-cluster">
       <span id="connection" class="pill offline">离线</span>
       <span id="source" class="pill">LIVE</span>
@@ -21,25 +18,14 @@
 
   <main>
     <section class="toolbar panel">
-      <div class="control-group">
-        <label>波形</label>
-        <select id="wave-source">
-          <option value="processed">处理后</option>
-          <option value="microphone">麦克风</option>
-          <option value="loopback">Loopback</option>
-        </select>
-      </div>
-      <button id="record-start" class="primary">开始录制</button>
-      <button id="record-stop">停止录制</button>
+      <div class="control-group"><label>波形</label><select id="wave-source">
+        <option value="compare">原始麦克风 + AEC对比</option><option value="processed" selected>AEC处理后</option><option value="microphone">原始麦克风</option><option value="loopback">Loopback</option>
+      </select></div>
+      <button id="record-start" class="primary">开始录制</button><button id="record-stop">停止录制</button>
       <div class="divider"></div>
       <select id="sessions"><option value="">选择回放会话</option></select>
-      <button id="replay-open">载入</button>
-      <button id="replay-play">播放</button>
-      <button id="replay-pause">暂停</button>
-      <select id="replay-speed">
-        <option value="0.5">0.5×</option><option value="1" selected>1×</option>
-        <option value="2">2×</option><option value="0">不限速</option>
-      </select>
+      <button id="replay-open">载入</button><button id="replay-play">播放</button><button id="replay-pause">暂停</button>
+      <select id="replay-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="0">不限速</option></select>
       <input id="replay-seek" type="range" min="0" max="100" value="0" aria-label="回放位置">
     </section>
 
@@ -52,32 +38,47 @@
         <span id="view-mode" class="pill view-live" data-mode="live">实时跟随</span>
         <button id="view-live" type="button" disabled>回到实时</button>
         <label for="view-duration">显示窗口</label>
-        <select id="view-duration">
-          <option value="2">2 秒</option>
-          <option value="5">5 秒</option>
-          <option value="10">10 秒</option>
-          <option value="20" selected>20 秒</option>
-        </select>
+        <select id="view-duration"><option value="2">2 秒</option><option value="5">5 秒</option><option value="10">10 秒</option><option value="20" selected>20 秒</option></select>
         <input id="view-scrubber" type="range" min="0" max="1" value="1" step="0.05" aria-label="波形时间位置">
         <output id="view-range">等待音频…</output>
       </div>
-      <p class="drag-hint">拖动任意波形轨道可左右查看；移动鼠标可检查触发时间。停止录制后视图会自动冻结。</p>
+      <p class="drag-hint">拖动任意波形轨道可左右查看；停止录制时视图会冻结。载入会话后展示正在播放的音频，点击“回到实时”恢复当前采集。</p>
       <div class="canvas-wrap waveform-wrap"><canvas id="waveform"></canvas><span class="axis-label">WAVE</span></div>
+      <div class="canvas-wrap aec-wrap"><canvas id="aec-band"></canvas><span class="axis-label">AEC</span></div>
       <div class="canvas-wrap vad-wrap"><canvas id="vad"></canvas><span class="axis-label">VAD</span></div>
       <div class="canvas-wrap kws-wrap"><canvas id="kws"></canvas><span class="axis-label">KWS</span></div>
-      <div class="legend"><span class="vad-key">语音</span><span class="wake-key">唤醒词剔除区</span><span class="candidate-key">候选话段</span><span id="window-label">窗口：最近 20 秒</span></div>
+      <div class="legend"><span class="raw-key">原始mic</span><span class="aec-key">AEC输出</span><span class="aec-state-key">AEC降级</span><span class="vad-key">语音</span><span class="wake-key">唤醒词剔除区</span><span class="candidate-key">候选话段</span><span id="window-label">窗口：最近20秒</span></div>
+    </section>
+
+    <section class="runtime-cards" aria-label="AEC、识别和动作状态">
+      <article class="panel status-card">
+        <div class="panel-heading"><div><p class="section-label">AEC3</p><h2>回声消除</h2></div><span id="aec-state" class="pill">初始化</span></div>
+        <dl class="status-grid">
+          <div><dt>外部延迟</dt><dd id="aec-delay">—</dd></div><div><dt>时钟漂移</dt><dd id="aec-drift">—</dd></div>
+          <div><dt>ERLE</dt><dd id="aec-erle">—</dd></div><div><dt>Render FIFO</dt><dd id="aec-fifo">—</dd></div>
+          <div><dt>处理峰值</dt><dd id="aec-p95">—</dd></div><div><dt>重置次数</dt><dd id="aec-resets">0</dd></div>
+        </dl>
+      </article>
+      <article class="panel status-card transcript-card">
+        <div class="panel-heading"><div><p class="section-label">PARAFORMER</p><h2>流式识别</h2></div><span id="asr-state" class="pill">未就绪</span></div>
+        <p id="asr-partial" class="transcript partial">等待唤醒……</p><p id="asr-final" class="transcript final">—</p>
+        <div class="metric-row"><span>话段 <b id="asr-utterance">—</b></span><span>延迟 <b id="asr-latency">—</b></span><span>RTF <b id="asr-rtf">—</b></span><span>revision <b id="asr-revision">—</b></span></div>
+      </article>
+      <article class="panel status-card action-card">
+        <div class="panel-heading"><div><p class="section-label">COMMAND</p><h2>命令执行</h2></div><span id="action-state" class="pill">空闲</span></div>
+        <p id="command-plan" class="transcript final">尚无命令计划</p>
+        <p id="action-result" class="action-result">live模式实际执行；回放与基准强制dry-run。</p>
+      </article>
     </section>
 
     <section class="grid">
       <article class="panel events-panel">
         <div class="panel-heading"><div><p class="section-label">TRACE</p><h2>事件流水</h2></div><button id="clear-events">清空</button></div>
-        <div class="event-table-wrap">
-          <table><thead><tr><th>#</th><th>时间</th><th>级别</th><th>类型</th><th>详情</th></tr></thead><tbody id="events"></tbody></table>
-        </div>
+        <div class="event-table-wrap"><table><thead><tr><th>#</th><th>时间</th><th>级别</th><th>类型</th><th>详情</th></tr></thead><tbody id="events"></tbody></table></div>
       </article>
 
       <article class="panel config-panel">
-        <div class="panel-heading"><div><p class="section-label">TUNING</p><h2>热参数</h2></div><span id="config-revision" class="pill">rev —</span></div>
+        <div class="panel-heading"><div><p class="section-label">TUNING</p><h2>参数</h2></div><span id="config-revision" class="pill">rev —</span></div>
         <form id="config-form">
           <fieldset><legend>KWS</legend>
             <label>触发阈值 <input name="kws.threshold" type="number" min="0" max="1" step="0.01"></label>
@@ -88,40 +89,55 @@
             <label>最短语音 ms <input name="vad.min_speech_ms" type="number" min="0" step="10"></label>
             <label>最短静音 ms <input name="vad.min_silence_ms" type="number" min="0" step="10"></label>
           </fieldset>
-          <fieldset><legend>切割</legend>
+          <fieldset><legend>话段切割</legend>
             <label>唤醒防护 ms <input name="segmentation.wake_guard_ms" type="number" min="0" step="10"></label>
             <label>结束静音 ms <input name="segmentation.endpoint_silence_ms" type="number" min="0" step="10"></label>
             <label>最短命令 ms <input name="segmentation.min_command_speech_ms" type="number" min="0" step="10"></label>
           </fieldset>
-          <details class="cold-settings">
-            <summary>冷参数 · 保存后重启生效</summary>
+          <fieldset><legend>AEC</legend>
+            <label>对齐等待 ms <input name="aec.alignment_wait_ms" type="number" min="0" max="100" step="10"></label>
+            <label>Render目标 ms <input name="aec.target_render_buffer_ms" type="number" min="10" max="2000" step="10"></label>
+            <label>最大漂移 ppm <input name="aec.max_drift_ppm" type="number" min="0" max="5000" step="10"></label>
+            <label>硬重同步 ms <input name="aec.hard_resync_error_ms" type="number" min="10" max="1000" step="10"></label>
+          </fieldset>
+          <fieldset><legend>ASR与命令</legend>
+            <label>显示部分结果 <input name="asr.emit_partials" type="checkbox"></label>
+            <label>ASR输入块 ms <input name="asr.feed_chunk_ms" type="number" min="10" max="1000" step="10"></label>
+            <label>默认音量步长 % <input name="commands.default_volume_step_percent" type="number" min="1" max="20" step="1"></label>
+            <label>口述幅度上限 % <input name="commands.max_spoken_volume_step_percent" type="number" min="1" max="20" step="1"></label>
+            <label>遥测频率 Hz <input name="web.telemetry_hz" type="number" min="1" max="60" step="1"></label>
+            <label>单句最多动作 <input name="commands.max_actions_per_utterance" type="number" min="1" max="8" step="1"></label>
+            <label class="wide">播放短语 <input name="commands.play_phrases" type="text" data-list placeholder="多个短语用逗号分隔"></label>
+            <label class="wide">暂停短语 <input name="commands.pause_phrases" type="text" data-list placeholder="多个短语用逗号分隔"></label>
+            <label class="wide">增加音量短语 <input name="commands.volume_up_phrases" type="text" data-list placeholder="多个短语用逗号分隔"></label>
+            <label class="wide">降低音量短语 <input name="commands.volume_down_phrases" type="text" data-list placeholder="多个短语用逗号分隔"></label>
+            <label class="wide">连接词 <input name="commands.connectors" type="text" data-list placeholder="然后，再，接着，并且"></label>
+          </fieldset>
+          <details class="cold-settings"><summary>冷参数 · 保存后重启生效</summary>
             <fieldset><legend>设备</legend>
-              <label>麦克风 endpoint ID <input name="audio.microphone_device" type="text"></label>
+              <label>麦克风endpoint ID <input name="audio.microphone_device" type="text"></label>
               <label>Loopback endpoint ID <input name="audio.loopback_device" type="text"></label>
             </fieldset>
-            <fieldset><legend>KWS 模型与执行器</legend>
-              <label>Provider <input name="kws.provider" type="text"></label>
-              <label>推理线程 <input name="kws.num_threads" type="number" min="1" max="16" step="1"></label>
-              <label>Encoder <input name="kws.encoder" type="text"></label>
-              <label>Decoder <input name="kws.decoder" type="text"></label>
-              <label>Joiner <input name="kws.joiner" type="text"></label>
-              <label>Tokens <input name="kws.tokens" type="text"></label>
-              <label>Keywords <input name="kws.keywords" type="text"></label>
+            <fieldset><legend>KWS模型</legend>
+              <label>Provider <input name="kws.provider" type="text"></label><label>推理线程 <input name="kws.num_threads" type="number" min="1" max="16"></label>
+              <label>Encoder <input name="kws.encoder" type="text"></label><label>Decoder <input name="kws.decoder" type="text"></label>
+              <label>Joiner <input name="kws.joiner" type="text"></label><label>Tokens <input name="kws.tokens" type="text"></label><label>Keywords <input name="kws.keywords" type="text"></label>
             </fieldset>
-            <fieldset><legend>VAD 模型与执行器</legend>
-              <label>Provider <input name="vad.provider" type="text"></label>
-              <label>推理线程 <input name="vad.num_threads" type="number" min="1" max="16" step="1"></label>
-              <label>Model <input name="vad.model" type="text"></label>
+            <fieldset><legend>VAD模型</legend>
+              <label>Provider <input name="vad.provider" type="text"></label><label>推理线程 <input name="vad.num_threads" type="number" min="1" max="16"></label><label>Model <input name="vad.model" type="text"></label>
+            </fieldset>
+            <fieldset><legend>Paraformer模型</legend>
+              <label>Provider <input name="asr.provider" type="text"></label><label>推理线程 <input name="asr.num_threads" type="number" min="1" max="16"></label>
+              <label>Encoder <input name="asr.encoder" type="text"></label><label>Decoder <input name="asr.decoder" type="text"></label><label>Tokens <input name="asr.tokens" type="text"></label>
             </fieldset>
           </details>
           <p id="restart-required" class="restart-note" hidden></p>
           <div class="form-actions"><button type="button" id="config-reset">恢复加载值</button><button type="button" id="config-save">应用并保存</button><button type="submit" class="primary">应用</button></div>
         </form>
-        <p class="note">模型路径、设备和推理线程是冷参数，写入配置后需重启。KWS 面板展示命中脉冲与 token 时间，不伪造连续置信度。</p>
+        <p class="note">部分ASR结果只展示；仅精确最终重解码可进入规则解析。模型路径、设备、provider和推理线程是冷参数。</p>
       </article>
     </section>
   </main>
-
   <script src="/app.js" defer></script>
 </body>
 </html>

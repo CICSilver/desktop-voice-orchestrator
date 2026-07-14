@@ -9,15 +9,20 @@
 
 例如：
 
-> 小助手，暂停音乐，打开微信，然后打开项目目录
+> 小助手，暂停音乐，然后降低音量百分之十
 
-> 暂停音乐，打开微信，然后打开项目目录，小助手
+> 播放音乐，再增加音量 5%，小助手
 
 ## 当前状态
 
-第一部分的 C++20 音频前端已经实现，当前可以在 Windows 上构建并运行双路采集、
-sherpa-onnx KWS、Silero VAD、20 秒环形缓冲、三类候选话段提取、诊断录制/回放和本地 Web 调试台。
-AEC 只保留了可替换接口，当前实现为旁路；完整桌面动作编排仍属于后续阶段。
+第一、二部分的 C++20 主链路已经接通：双路 WASAPI 采集、双设备时钟对齐、WebRTC
+AEC3、sherpa-onnx KWS、Silero VAD、20 秒环形缓冲、三类候选话段提取、按唤醒创建的
+在线 Paraformer 会话、严格命令解析、Windows 媒体/音量控制，以及诊断录制、确定性回放
+和本地 Web 调试台。未编译 AEC3、模型缺失或参考流失效时会显式降级，KWS/VAD 仍可工作，
+但不可信候选不会执行系统动作。
+
+当前可执行命令限定为播放、暂停、相对增加音量和相对降低音量；更广泛的桌面动作编排仍属
+后续阶段。回放与基准模式始终为 dry-run，不会改变系统媒体状态或音量。
 
 项目后续仍需解决三个高风险问题：
 
@@ -29,7 +34,7 @@ AEC 只保留了可替换接口，当前实现为旁路；完整桌面动作编�
 
 ```text
 USB 音箱 WASAPI Loopback ─┐
-                          ├─> IAudioPreprocessor（当前 Bypass）
+                          ├─> IAudioPreprocessor（AEC3 / Bypass）
 麦克风 WASAPI Capture ────┘                │
                                            └─> 16 kHz / 10 ms 帧
                                                    │
@@ -41,17 +46,22 @@ USB 音箱 WASAPI Loopback ─┐
                                                    │
                                      prefix / suffix / embedded
                                      （输出 PCM 已剔除唤醒区间）
+                                                   │
+                                        Online Paraformer worker
+                                                   │
+                                   严格规则解析 → 保序 Windows 执行器
 ```
 
 后置唤醒词要求系统在听到唤醒词之前就保留最近一段经过回声消除的音频，因此音频前端会持续维护内存环形缓冲区，但不会持续保存录音到磁盘，也不会持续运行完整语音识别。
 
-## 构建与运行第一部分
+## 构建与运行
 
 要求 Windows 10/11、Visual Studio 2022（MSVC）、CMake 3.28+ 和 vcpkg。模型和 sherpa-onnx
 二进制均固定版本并校验 SHA-256；模型不会提交到 Git。
 
 ```powershell
 git clone https://github.com/microsoft/vcpkg.git C:\tools\vcpkg
+git -C C:\tools\vcpkg checkout f87344cac03158cbf1467264565f1fd36b382a24
 C:\tools\vcpkg\bootstrap-vcpkg.bat
 $env:VCPKG_ROOT = 'C:\tools\vcpkg'
 
@@ -82,8 +92,9 @@ ctest --preset all
 token 文件为 `config/keywords.txt`；两者需使用固定模型对应的 `tokens.txt`/`en.phone` 和
 sherpa-onnx `text2token` 流程同步生成。
 
-实现边界、线程隔离、会话格式和现场验收命令详见
-[`docs/PART1_FRONTEND.md`](docs/PART1_FRONTEND.md)。
+第一部分的音频/话段设计见 [`docs/PART1_FRONTEND.md`](docs/PART1_FRONTEND.md)，第二部分的
+AEC、流式识别、命令语法和执行边界见
+[`docs/PART2_AEC_ASR_COMMANDS.md`](docs/PART2_AEC_ASR_COMMANDS.md)。
 
 ## 初步技术选型
 
@@ -93,9 +104,9 @@ sherpa-onnx `text2token` 流程同步生成。
 | 回声消除 | WebRTC AEC3 | 软件 AEC 优先，实测失败后才考虑带硬件 AEC 的麦克风阵列 |
 | 音频前端 | C++ | 负责低延迟采集、时钟对齐、AEC、重采样和环形缓冲区 |
 | 唤醒词 | sherpa-onnx 开放词表 KWS | 通过文字或拼音配置短语，无需为每个唤醒词重新训练模型 |
-| 语音识别 | FunASR Paraformer 或 sherpa-onnx | 中文本地识别，最终以目标设备基准测试决定 |
-| 编排层 | Python | 负责文本规范化、命令解析、动作校验和顺序执行 |
-| Windows 控制 | GSMTC、ShellExecute、UI Automation | 从稳定系统 API 开始，逐步扩展应用适配器 |
+| 语音识别 | FunASR 来源的 Online Paraformer，由 sherpa-onnx 运行 | 复用同一套 ONNX Runtime，KWS 命中后才创建会话 |
+| 编排层 | C++ 确定性规则 | 完整消费文本，先形成计划再严格保序执行 |
+| Windows 控制 | GSMTC、IAudioEndpointVolume | 使用显式 Play/Pause 和相对音量百分点，不发送媒体键 |
 
 ## 唤醒词配置方式
 
@@ -131,11 +142,11 @@ sherpa-onnx `text2token` 流程同步生成。
 
 ### 命令与执行
 
-- [ ] 一次口述 3 条命令的端到端保序执行成功率不低于 85%
-- [ ] 播放、暂停、上一首、下一首、打开配置的软件和打开配置的路径均可执行
-- [ ] 每个动作都有连续序号以及 `queued/running/succeeded/failed/skipped` 状态记录
-- [ ] 未注册动作和白名单外参数不会被猜测执行，高风险动作必须经过确认
-- [ ] 前置唤醒的首动作延迟小于 2.5 秒，后置唤醒小于 3.5 秒
+- [ ] 安静环境下四条基础命令的计划准确率不低于 95%，扬声器播放时不低于 85%
+- [ ] 播放、暂停、增加音量和降低音量均可执行；相对音量默认步长为 5 个百分点
+- [ ] 一次口述最多 8 条命令，动作严格保序，并分别记录 `queued/started/succeeded/noop/failed`
+- [ ] partial、不完整候选、未知残留和超范围数值不会执行；重复 final 不会重复控制系统
+- [ ] 最终识别结果到计划生成的 P95 不超过 1.5 秒
 
 ### 稳定性与隐私
 

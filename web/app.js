@@ -70,6 +70,7 @@ function handle(message) {
     $('rms').textContent = Number(payload[state.source]?.rms ?? payload.processed?.rms ?? 0).toFixed(3);
     $('queue-depth').textContent = payload.queue_depth ?? 0;
     $('drops').textContent = payload.telemetry_dropped ?? 0;
+    if (payload.aec) updateAec(payload.aec);
     if (message.source === 'replay') $('replay-seek').value = Number(payload.sample || 0) / SAMPLE_RATE;
     syncViewControls();
   } else if (type === 'kws_hit') {
@@ -81,6 +82,31 @@ function handle(message) {
     if ((message.source === 'replay' ? 'replay' : 'live') === state.activeMode) {
       state.candidates.push(payload);
     }
+    addEvent(message);
+  } else if (type === 'aec_status' || type === 'aec_stats') {
+    updateAec(payload || {});
+    addEvent(message);
+  } else if (type === 'asr_status') {
+    $('asr-state').textContent = payload.state || payload.status || '未知';
+    addEvent(message);
+  } else if (type === 'asr_partial' || type === 'asr_final') {
+    const final = type === 'asr_final' || payload.is_final;
+    $(final ? 'asr-final' : 'asr-partial').textContent = payload.text || '—';
+    $('asr-state').textContent = final ? '最终结果' : '识别中';
+    $('asr-utterance').textContent = payload.utterance_id || '—';
+    $('asr-latency').textContent = Number.isFinite(Number(payload.latency_ms)) ? `${Number(payload.latency_ms).toFixed(0)} ms` : '—';
+    $('asr-rtf').textContent = Number.isFinite(Number(payload.rtf)) ? Number(payload.rtf).toFixed(3) : '—';
+    $('asr-revision').textContent = payload.revision ?? '—';
+    addEvent(message);
+  } else if (type === 'command_plan' || type === 'command_rejected') {
+    $('command-plan').textContent = type === 'command_rejected'
+      ? `拒绝：${payload.reason || '规则不匹配'}`
+      : (payload.summary || payload.normalized_text || JSON.stringify(payload.actions || []));
+    $('action-state').textContent = type === 'command_plan' ? '已规划' : '已拒绝';
+    addEvent(message);
+  } else if (type.startsWith('action_')) {
+    $('action-state').textContent = type.slice('action_'.length);
+    $('action-result').textContent = payload.message || payload.error_code || JSON.stringify(payload);
     addEvent(message);
   } else if (type === 'config_state' || type === 'config_applied') {
     const pending = payload.restart_required || [];
@@ -118,6 +144,17 @@ function handle(message) {
   }
 }
 
+function updateAec(aec) {
+  $('aec-state').textContent = aec.state || aec.status || (aec.enabled === false ? '禁用' : '运行中');
+  $('aec-delay').textContent = aec.external_delay_ms == null ? '—' : `${Number(aec.external_delay_ms).toFixed(1)} ms`;
+  $('aec-drift').textContent = aec.drift_ppm == null ? '—' : `${Number(aec.drift_ppm).toFixed(1)} ppm`;
+  $('aec-erle').textContent = aec.erle_db == null ? '—' : `${Number(aec.erle_db).toFixed(1)} dB`;
+  $('aec-fifo').textContent = aec.render_fifo_ms == null ? '—' : `${Number(aec.render_fifo_ms).toFixed(0)} ms`;
+  const processing = aec.processing_p95_ms ?? aec.processing_max_ms;
+  $('aec-p95').textContent = processing == null ? '—' : `${Number(processing).toFixed(2)} ms`;
+  $('aec-resets').textContent = aec.reset_count ?? 0;
+}
+
 function addEvent(message) {
   const row = document.createElement('tr');
   const at = message.timestamp_sample ? (message.timestamp_sample / SAMPLE_RATE).toFixed(2) + 's' : new Date().toLocaleTimeString();
@@ -136,7 +173,12 @@ function loadConfig(config) {
   for (const input of $('config-form').elements) {
     if (!input.name) continue;
     const [group, key] = input.name.split('.');
-    if (config[group]?.[key] !== undefined) input.value = config[group][key];
+    if (config[group]?.[key] !== undefined) {
+      if (input.type === 'checkbox') input.checked = !!config[group][key];
+      else if (input.dataset.list !== undefined && Array.isArray(config[group][key])) {
+        input.value = config[group][key].join(', ');
+      } else input.value = config[group][key];
+    }
   }
 }
 
@@ -146,7 +188,11 @@ function configPatch() {
     if (!input.name) continue;
     const [group, key] = input.name.split('.');
     patch[group] ??= {};
-    patch[group][key] = input.type === 'number' ? Number(input.value) : input.value;
+    patch[group][key] = input.type === 'checkbox' ? input.checked
+      : (input.type === 'number' ? Number(input.value)
+        : (input.dataset.list !== undefined
+          ? input.value.split(/[,，\n]+/).map((value) => value.trim()).filter(Boolean)
+          : input.value));
   }
   return patch;
 }
@@ -296,9 +342,11 @@ function drawCursor(track, x, label = '') {
 
 function draw() {
   const wave = canvas('waveform');
+  const aec = canvas('aec-band');
   const vad = canvas('vad');
   const kws = canvas('kws');
   wave.c.clearRect(0, 0, wave.w, wave.h);
+  aec.c.clearRect(0, 0, aec.w, aec.h);
   vad.c.clearRect(0, 0, vad.w, vad.h);
   kws.c.clearRect(0, 0, kws.w, kws.h);
 
@@ -312,20 +360,37 @@ function draw() {
   const xAt = (sample, width) => (Number(sample) - bounds.start) / bounds.windowSamples * width;
   const pointWidth = Math.max(1, wave.w / Math.max(1, state.view.durationSeconds * Number(state.config?.web?.telemetry_hz || 20)));
 
-  wave.c.strokeStyle = '#59e1d9';
-  wave.c.lineWidth = 1;
-  wave.c.beginPath();
+  const strokeWave = (source, color, width = 1) => {
+    wave.c.strokeStyle = color;
+    wave.c.lineWidth = width;
+    wave.c.beginPath();
+    data.telemetry.forEach((frame) => {
+      const sample = sampleOf(frame);
+      if (sample < bounds.start || sample > bounds.end) return;
+      const value = frame[source] || frame.processed || {min: 0, max: 0};
+      const x = xAt(sample, wave.w);
+      const y1 = wave.h / 2 - (value.max || 0) * wave.h * .44;
+      const y2 = wave.h / 2 - (value.min || 0) * wave.h * .44;
+      wave.c.moveTo(x, y1);
+      wave.c.lineTo(x, y2);
+    });
+    wave.c.stroke();
+  };
+  if (state.source === 'compare') {
+    strokeWave('microphone', '#f2bd66', 1);
+    strokeWave('processed', '#59e1d9', 1.25);
+  } else {
+    strokeWave(state.source, state.source === 'microphone' ? '#f2bd66' : '#59e1d9');
+  }
+
   data.telemetry.forEach((frame) => {
     const sample = sampleOf(frame);
     if (sample < bounds.start || sample > bounds.end) return;
-    const value = frame[state.source] || frame.processed || {min: 0, max: 0};
-    const x = xAt(sample, wave.w);
-    const y1 = wave.h / 2 - (value.max || 0) * wave.h * .44;
-    const y2 = wave.h / 2 - (value.min || 0) * wave.h * .44;
-    wave.c.moveTo(x, y1);
-    wave.c.lineTo(x, y2);
+    const status = frame.aec || {};
+    aec.c.fillStyle = status.degraded ? 'rgba(255,107,114,.72)'
+      : status.active ? 'rgba(89,225,217,.72)' : 'rgba(83,97,115,.55)';
+    aec.c.fillRect(xAt(sample, aec.w), 6, Math.ceil(pointWidth) + 1, aec.h - 12);
   });
-  wave.c.stroke();
 
   vad.c.fillStyle = 'rgba(116,226,154,.72)';
   data.telemetry.forEach((frame, index) => {
@@ -380,6 +445,7 @@ function draw() {
     const ratio = Math.max(0, Math.min(1, state.view.cursorRatio));
     const cursorSample = bounds.start + ratio * bounds.windowSamples;
     drawCursor(wave, ratio * wave.w, `${(cursorSample / SAMPLE_RATE).toFixed(3)} s`);
+    drawCursor(aec, ratio * aec.w);
     drawCursor(vad, ratio * vad.w);
     drawCursor(kws, ratio * kws.w);
   }
@@ -485,7 +551,7 @@ $('view-scrubber').addEventListener('input', () => {
   state.view.endSample = Number($('view-scrubber').value) * SAMPLE_RATE;
   syncViewControls();
 });
-for (const id of ['waveform', 'vad', 'kws']) installTimelineDrag($(id));
+for (const id of ['waveform', 'aec-band', 'vad', 'kws']) installTimelineDrag($(id));
 
 syncViewControls();
 setActiveMode('live');

@@ -22,10 +22,25 @@ struct AudioPacket {
   AudioStreamKind stream{AudioStreamKind::microphone};
   AudioFormat format{};
   std::vector<float> samples;
+  // QPC timestamp of the first sample as reported by WASAPI. The unit is
+  // 100 ns, matching IAudioCaptureClient::GetBuffer.
   std::uint64_t qpc_100ns{};
+  // QPC timestamp at which the packet entered the application. Keeping this
+  // separate from qpc_100ns makes WebRTC's stream-delay calculation
+  // reproducible and allows deterministic replay to use a virtual clock.
+  std::uint64_t arrival_qpc_100ns{};
   std::uint64_t device_position{};
+  // Incremented whenever an endpoint is reopened. A different epoch means
+  // device_position and all stateful preprocessing must be re-anchored.
+  std::uint64_t stream_epoch{};
+  // Monotonic within an epoch. Zero is also the legacy/default value, so gap
+  // detection is enabled after the first non-zero sequence is observed.
+  std::uint64_t sequence{};
   bool silent{};
   bool discontinuity{};
+  // AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR. A packet with this flag must not be
+  // used to update clock/drift estimates.
+  bool timestamp_error{};
   // Loopback devices do not deliver packets while the render endpoint is idle.
   // Such gaps are filled with format-correct silence and remain distinguishable
   // in the recording timeline and deterministic replay.

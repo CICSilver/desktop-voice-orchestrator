@@ -76,3 +76,53 @@ TEST_CASE("segmenter rejects wake-only speech") {
   REQUIRE(result.candidates.empty());
   REQUIRE(result.rejections.size() == 1);
 }
+
+TEST_CASE("runtime segmenter path plans spans without copying candidate PCM") {
+  dvo::TimedRingBuffer ring(16000 * 10);
+  auto values = audio(16000 * 10);
+  ring.push(0, values);
+  dvo::UtteranceSegmenter segmenter(config(), ring);
+  segmenter.add_vad_interval({{1000, 9000}});
+  segmenter.set_vad_state(false, 9000);
+  segmenter.add_kws_hit(hit({4000, 5500}));
+
+  auto result = segmenter.advance_for_assembly(10600);
+  REQUIRE(result.assemblies.size() == 1);
+  CHECK(result.assemblies.front().candidate.pcm.empty());
+  CHECK(result.assemblies.front().candidate.source_spans ==
+        std::vector<dvo::SampleSpan>{{1000, 4000}, {5500, 9000}});
+  CHECK(result.assemblies.front().join_silence_samples == 2400);
+}
+
+TEST_CASE("provisional ASR backfill includes active VAD speech before the wake") {
+  dvo::TimedRingBuffer ring(16000 * 10);
+  ring.push(0, audio(16000 * 10));
+  dvo::UtteranceSegmenter segmenter(config(), ring);
+
+  // A completed phrase is close enough to the still-active phrase to be one
+  // command envelope. The active phrase crosses the KWS hit and therefore has
+  // not yet produced a completed VadInterval.
+  segmenter.add_vad_interval({{500, 1000}});
+  segmenter.set_vad_state(true, 2000);
+  const auto start = segmenter.add_kws_hit(hit({4000, 5500}));
+
+  REQUIRE(start.has_value());
+  CHECK(start->provisional_left_spans ==
+        std::vector<dvo::SampleSpan>{{500, 4000}});
+  CHECK_FALSE(start->provisional_left_spans.front().overlaps(start->wake_span));
+}
+
+TEST_CASE("segmenter recovers trust after a discontinuity reset") {
+  dvo::TimedRingBuffer ring(16000 * 10);
+  ring.push(0, audio(16000 * 10));
+  dvo::UtteranceSegmenter segmenter(config(), ring);
+
+  segmenter.reset(true);
+  segmenter.add_vad_interval({{1000, 7000}});
+  segmenter.set_vad_state(false, 7000);
+  REQUIRE(segmenter.add_kws_hit(hit({1000, 2500})).has_value());
+
+  const auto result = segmenter.advance(8600);
+  REQUIRE(result.candidates.size() == 1);
+  CHECK_FALSE(result.candidates.front().discontinuity);
+}

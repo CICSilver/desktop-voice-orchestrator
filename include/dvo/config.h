@@ -19,8 +19,27 @@ struct AudioConfig {
 };
 
 struct PreprocessConfig {
-  std::string implementation{"bypass"};
-  bool aec_enabled{false};
+  std::string implementation{"webrtc_aec3"};
+  bool aec_enabled{true};
+};
+
+struct AecConfig {
+  bool enabled{true};
+  std::uint32_t processing_rate_hz{16000};
+  bool high_pass_filter{true};
+  bool noise_suppression{false};
+  bool gain_control{false};
+  bool request_raw_capture{true};
+  bool request_post_volume_loopback{true};
+  std::uint32_t alignment_wait_ms{30};
+  std::uint32_t target_render_buffer_ms{60};
+  std::uint32_t max_render_buffer_ms{500};
+  std::uint32_t drift_window_ms{5000};
+  std::int32_t max_drift_ppm{1000};
+  std::uint32_t hard_resync_error_ms{80};
+  std::int32_t delay_offset_ms{0};
+  std::string missing_render_policy{"bypass_reset"};
+  std::uint32_t stats_hz{1};
 };
 
 struct RingConfig { std::uint32_t duration_ms{20000}; };
@@ -61,6 +80,37 @@ struct SegmentationConfig {
   std::uint32_t max_candidate_ms{18000};
   std::uint32_t min_command_speech_ms{250};
   std::uint32_t embedded_join_silence_ms{150};
+  std::uint32_t assembly_queue_capacity{4};
+};
+
+struct AsrConfig {
+  bool enabled{true};
+  std::string implementation{"sherpa_online_paraformer"};
+  std::filesystem::path encoder;
+  std::filesystem::path decoder;
+  std::filesystem::path tokens;
+  std::string provider{"cpu"};
+  std::int32_t num_threads{1};
+  std::uint32_t feed_chunk_ms{100};
+  std::uint32_t max_active_streams{2};
+  std::uint32_t queue_capacity{512};
+  std::uint32_t max_pending_audio_ms{60000};
+  bool emit_partials{true};
+  bool exact_final_redecode{true};
+};
+
+struct CommandsConfig {
+  bool enabled{true};
+  std::uint32_t default_volume_step_percent{5};
+  std::uint32_t max_spoken_volume_step_percent{20};
+  std::uint32_t max_actions_per_utterance{8};
+  std::uint32_t action_timeout_ms{2000};
+  std::uint32_t queue_capacity{32};
+  std::vector<std::string> play_phrases{"播放音乐"};
+  std::vector<std::string> pause_phrases{"暂停音乐"};
+  std::vector<std::string> volume_up_phrases{"增加音量"};
+  std::vector<std::string> volume_down_phrases{"降低音量"};
+  std::vector<std::string> connectors{"然后", "再", "接着", "并且"};
 };
 
 struct WebConfig {
@@ -79,10 +129,13 @@ struct RecordingConfig {
 struct AppConfig {
   AudioConfig audio;
   PreprocessConfig preprocess;
+  AecConfig aec;
   RingConfig ring;
   KwsConfig kws;
   VadConfig vad;
   SegmentationConfig segmentation;
+  AsrConfig asr;
+  CommandsConfig commands;
   WebConfig web;
   RecordingConfig recording;
   std::filesystem::path project_root;

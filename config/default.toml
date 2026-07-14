@@ -1,32 +1,60 @@
-# Desktop Voice Orchestrator 第一部分默认配置
+# Desktop Voice Orchestrator 默认配置（第二部分）
 #
-# 单位统一使用 Hz、ms、样本数。标记“热”的参数可由调试界面应用；
-# 标记“冷”的参数会保存到覆盖配置，但必须重启进程才能生效。
+# 单位统一使用 Hz、ms、样本数和百分比。标记“热”的参数可由调试台立即应用；
+# 标记“冷”的参数会保存到 local.toml，但需要重启进程后生效。
 
 [audio]
-# 冷：WASAPI endpoint ID；default 表示系统默认控制台设备。
+# 冷：WASAPI endpoint ID；default 表示跟随系统默认设备。
 microphone_device = "default"
 loopback_device = "default"
-# 冷：默认设备变化时是否跟随新设备。
+# 冷：默认设备改变时是否自动重连。
 follow_default_device = true
-# 固定：KWS/VAD/环形缓冲的内部格式。
+# 固定：KWS、VAD、AEC输出、ASR和环形缓冲统一使用16 kHz单声道。
 target_sample_rate = 16000
 frame_ms = 10
-# 固定容量采集队列，范围 500..10000 ms；满时重置推理状态而不阻塞采集。
+# 固定容量采集队列，合法范围500..10000 ms；溢出会重置状态而不会阻塞采集线程。
 queue_capacity_ms = 2000
 
 [preprocess]
-# 冷：第一部分只允许 bypass；该接口以后由 WebRTC AEC3 实现替换。
-implementation = "bypass"
-aec_enabled = false
+# 冷：webrtc_aec3 或 bypass。未编译WebRTC时会明确降级到旁路。
+implementation = "webrtc_aec3"
+aec_enabled = true
+
+[aec]
+enabled = true
+# 冷：第二部分固定16 kHz；以后可基于真实数据评估32/48 kHz。
+processing_rate_hz = 16000
+high_pass_filter = true
+# 冷：本阶段关闭NS/AGC，以便单独评估AEC效果。
+noise_suppression = false
+gain_control = false
+# 冷：优先请求原始麦克风和音量/静音之后的loopback；不支持时自动回退并产生事件。
+request_raw_capture = true
+request_post_volume_loopback = true
+# 热：等待同时间轴render包的最大时间，范围0..100 ms。
+alignment_wait_ms = 30
+# 热：render FIFO目标/上限；目标至少10 ms，上限范围100..2000 ms。
+target_render_buffer_ms = 60
+max_render_buffer_ms = 500
+# 热：设备时钟斜率估计窗口和允许的最大相对漂移。
+drift_window_ms = 5000
+max_drift_ppm = 1000
+# 热：对齐误差超过该值时硬重置AEC、KWS、VAD和待定候选。
+hard_resync_error_ms = 80
+# 热：实验用软件延迟偏置，单位ms。
+delay_offset_ms = 0
+# 固定：参考流不可用时输出旁路mic，同时重置AEC并标记degraded。
+missing_render_policy = "bypass_reset"
+# 热：AEC统计推送频率，范围1..20 Hz。
+stats_hz = 1
 
 [ring]
-# 冷：内存音频保留时长，范围 1000..120000 ms；默认正好 20 秒。
+# 冷：内存音频保留时长，范围1000..120000 ms；默认20秒。
 duration_ms = 20000
 
 [kws]
 enabled = true
-# 冷：固定使用 sherpa-onnx v1.13.2 的中英 Zipformer KWS chunk-16 模型。
+# 冷：sherpa-onnx v1.13.2 中英Zipformer KWS chunk-16模型。
 encoder = "models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/encoder-epoch-13-avg-2-chunk-16-left-64.int8.onnx"
 decoder = "models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/decoder-epoch-13-avg-2-chunk-16-left-64.onnx"
 joiner = "models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/joiner-epoch-13-avg-2-chunk-16-left-64.int8.onnx"
@@ -37,9 +65,9 @@ provider = "cpu"
 num_threads = 1
 max_active_paths = 4
 num_trailing_blanks = 1
-# 热：分数越大越容易保留关键词路径，建议范围 0..20。
+# 热：关键词路径加分，建议范围0..20。
 boosting_score = 1.0
-# 热：声学触发阈值，范围 0..1；越低越容易触发。
+# 热：KWS命中阈值，范围0..1。
 threshold = 0.25
 
 [vad]
@@ -47,41 +75,79 @@ enabled = true
 model = "models/silero_vad.int8.onnx"
 provider = "cpu"
 num_threads = 1
-# 热：语音概率阈值，范围 0..1。
+# 热：语音概率阈值，范围0..1。
 threshold = 0.25
-# 固定：16 kHz 模型每次输入 512 样本（32 ms）。
 window_size = 512
-# 热：保留话段的最短语音、关闭话段的最短静音和单段最大长度。
 min_speech_ms = 150
 min_silence_ms = 600
 max_speech_ms = 18000
 
 [segmentation]
-# 热：KWS token 区间两侧额外剔除范围，避免唤醒词尾音进入 ASR。
+# 热：KWS token区间两侧额外剔除范围。
 wake_guard_ms = 100
-# 热：候选命令首尾上下文；不会跨过唤醒词防护区。
 pre_roll_ms = 150
 post_roll_ms = 150
-# 热：等待该时长静音后结束整段多命令口述，必须 >= VAD min_silence_ms。
 endpoint_silence_ms = 900
-# 热：最大候选长度，不能超过 ring.duration_ms。
 max_candidate_ms = 18000
-# 热：唤醒词一侧至少有这么多有效语音才被当作命令。
 min_command_speech_ms = 250
-# 热：embedded 左右 PCM 拼接时插入的静音。
+# 热：embedded候选左右PCM之间插入的静音。
 embedded_join_silence_ms = 150
+# 冷：候选/ASR前置音频异步组装的总在途上限，合法范围1..64；队列满时显式取消且不反压音频线程。
+assembly_queue_capacity = 4
+
+[asr]
+enabled = true
+# 冷：使用现有sherpa-onnx运行FunASR来源、带sherpa元数据的在线Paraformer重导出。
+implementation = "sherpa_online_paraformer"
+encoder = "models/sherpa-onnx-streaming-paraformer-zh/encoder.int8.onnx"
+decoder = "models/sherpa-onnx-streaming-paraformer-zh/decoder.int8.onnx"
+tokens = "models/sherpa-onnx-streaming-paraformer-zh/tokens.txt"
+provider = "cpu"
+num_threads = 1
+# 热：实时会话每次投递的音频块，范围10..1000 ms且必须是10的倍数。
+feed_chunk_ms = 100
+max_active_streams = 2
+# 固定有界队列；满时取消候选，绝不阻塞实时音频路径。
+queue_capacity = 512
+max_pending_audio_ms = 60000
+# 热：部分文本只用于调试展示，永不执行命令。
+emit_partials = true
+# 固定：候选完成后，用精确剔除唤醒词的PCM重新解码一次作为权威结果。
+exact_final_redecode = true
+
+[commands]
+enabled = true
+# 热：未口述数值时调整的Windows音量滑块百分点。
+default_volume_step_percent = 5
+# 热：口述相对幅度上限；合法范围1..20，超范围整句拒绝。
+max_spoken_volume_step_percent = 20
+max_actions_per_utterance = 8
+# 冷：GSMTC异步调用的整次动作截止时间；超时会取消WinRT操作并产生action_failed/action_timeout。
+# Core Audio音量接口为同步COM调用，无法安全抢占，只记录实际耗时。
+action_timeout_ms = 2000
+# 冷：有界动作队列容量；修改后重启生效。
+queue_capacity = 32
+# 热：多命令连接词；命令也允许直接相邻或以常见标点分隔。
+connectors = ["然后", "再", "接着", "并且"]
+
+[commands.phrases]
+# 热：规则为严格全串匹配，不做模糊同义词推断。
+play = ["播放音乐"]
+pause = ["暂停音乐"]
+volume_up = ["增加音量"]
+volume_down = ["降低音量"]
 
 [web]
 enabled = true
-# 冷：只允许本机回环地址。
+# 冷：调试服务只允许绑定本机回环地址。
 bind = "127.0.0.1"
 port = 8765
-# 热：JSON 遥测刷新率，范围 1..60 Hz。
+# 热：JSON遥测刷新率，范围1..60 Hz。
 telemetry_hz = 20
 static_root = "web"
 
 [recording]
-# 冷：只有用户显式点击录制后才会创建文件；目录已在 .gitignore 中排除。
+# 冷：只有用户在调试台显式开始录制后才会写盘。
 session_root = "data/sessions"
-# 固定容量异步写盘队列；溢出会将会话标记 incomplete，但不会阻塞音频处理。
+# 固定容量异步写盘队列；溢出会标记会话不完整，不阻塞音频处理。
 queue_capacity_ms = 5000

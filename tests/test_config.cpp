@@ -22,7 +22,62 @@ TEST_CASE("checked-in default configuration is valid") {
   const auto config = store.load();
   REQUIRE(config.audio.target_sample_rate == 16000);
   REQUIRE(config.ring.duration_ms == 20000);
+  REQUIRE(config.commands.play_phrases == std::vector<std::string>{"播放音乐"});
+  REQUIRE(config.commands.action_timeout_ms == 2000);
+  REQUIRE(config.commands.connectors ==
+          std::vector<std::string>{"然后", "再", "接着", "并且"});
   REQUIRE(store.validate(config).ok());
+
+  auto unsafe = config;
+  unsafe.asr.exact_final_redecode = false;
+  const auto validation = store.validate(unsafe);
+  REQUIRE_FALSE(validation.ok());
+}
+
+TEST_CASE("command grammar patch uses nested phrases and survives overlay reload") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  const auto temp = temporary_directory();
+  const auto local = temp / "config/local.toml";
+  dvo::ConfigStore store(root / "config/default.toml", local, root);
+  auto config = store.load();
+  const auto original = config;
+
+  auto result = store.apply_patch(
+      config,
+      {{"commands",
+        {{"default_volume_step_percent", 7},
+         {"max_actions_per_utterance", 2},
+         {"action_timeout_ms", 1350},
+         {"queue_capacity", 17},
+         {"connectors", {"接下来"}},
+         {"phrases",
+          {{"play", {"开始播放"}},
+           {"pause", {"停止播放"}},
+           {"volume_up", {"音量加"}},
+           {"volume_down", {"音量减"}}}}}}});
+  REQUIRE(result.ok());
+  CHECK(config.commands.default_volume_step_percent == 7);
+  CHECK(config.commands.max_actions_per_utterance == 2);
+  CHECK(config.commands.play_phrases == std::vector<std::string>{"开始播放"});
+  const auto public_config = store.to_public_json(config);
+  CHECK(public_config["commands"]["phrases"]["play"] ==
+        nlohmann::json::array({"开始播放"}));
+
+  store.save_overrides(config);
+  const auto reloaded = store.load();
+  CHECK(reloaded.commands.connectors == std::vector<std::string>{"接下来"});
+  CHECK(reloaded.commands.volume_down_phrases == std::vector<std::string>{"音量减"});
+  CHECK(reloaded.commands.action_timeout_ms == 1350);
+  CHECK(reloaded.commands.queue_capacity == 17);
+
+  auto invalid = original;
+  result = store.apply_patch(
+      invalid,
+      {{"commands", {{"phrases", {{"play", {"同一个"}},
+                                    {"pause", {"同一个"}}}}}}});
+  REQUIRE_FALSE(result.ok());
+  CHECK(invalid.commands.play_phrases == original.commands.play_phrases);
+  std::filesystem::remove_all(temp);
 }
 
 TEST_CASE("hot config patch validates and saves an overlay") {

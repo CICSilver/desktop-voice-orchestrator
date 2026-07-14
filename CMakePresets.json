@@ -11,6 +11,9 @@
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake",
         "VCPKG_TARGET_TRIPLET": "x64-windows",
+        "VCPKG_OVERLAY_PORTS": "${sourceDir}/vcpkg-overlay/ports",
+        "VCPKG_MANIFEST_FEATURES": "webrtc-aec",
+        "DVO_ENABLE_WEBRTC_AEC": "ON",
         "BUILD_TESTING": "ON"
       }
     },
@@ -19,12 +22,26 @@
       "inherits": "windows-x64",
       "displayName": "Windows x64 core tests (without sherpa)",
       "binaryDir": "${sourceDir}/build/windows-x64-no-sherpa",
-      "cacheVariables": { "DVO_ENABLE_SHERPA": "OFF" }
+      "cacheVariables": {
+        "DVO_ENABLE_SHERPA": "OFF",
+        "DVO_ENABLE_WEBRTC_AEC": "OFF",
+        "VCPKG_MANIFEST_FEATURES": ""
+      }
+    },
+    {
+      "name": "windows-x64-sherpa-no-aec",
+      "inherits": "windows-x64-no-sherpa",
+      "displayName": "Windows x64 ASR verification (sherpa, without WebRTC AEC)",
+      "binaryDir": "${sourceDir}/build/asr-verify",
+      "cacheVariables": {
+        "DVO_ENABLE_SHERPA": "ON"
+      }
     }
   ],
   "buildPresets": [
     { "name": "release", "configurePreset": "windows-x64", "configuration": "Release" },
-    { "name": "core-release", "configurePreset": "windows-x64-no-sherpa", "configuration": "Release" }
+    { "name": "core-release", "configurePreset": "windows-x64-no-sherpa", "configuration": "Release" },
+    { "name": "asr-release", "configurePreset": "windows-x64-sherpa-no-aec", "configuration": "Release" }
   ],
   "testPresets": [
     {
@@ -36,6 +53,12 @@
     {
       "name": "all",
       "configurePreset": "windows-x64",
+      "configuration": "Release",
+      "output": { "outputOnFailure": true }
+    },
+    {
+      "name": "asr",
+      "configurePreset": "windows-x64-sherpa-no-aec",
       "configuration": "Release",
       "output": { "outputOnFailure": true }
     }

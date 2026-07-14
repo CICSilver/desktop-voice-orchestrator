@@ -25,6 +25,11 @@ class TimedRingBuffer {
   void push(std::uint64_t first_sample, std::span<const float> samples);
   void reset(std::uint64_t next_sample = 0);
   [[nodiscard]] RingSlice slice(SampleSpan span) const;
+  // Worker-oriented copy that releases the shared lock between short chunks,
+  // allowing the 10 ms writer to run. If reset/overwrite reaches unread data,
+  // the snapshot is returned empty and explicitly marked truncated.
+  [[nodiscard]] RingSlice slice_cooperative(
+      SampleSpan span, std::size_t chunk_samples = 1600) const;
   [[nodiscard]] std::uint64_t head() const;
   [[nodiscard]] std::uint64_t tail() const;
   [[nodiscard]] std::size_t size() const;
