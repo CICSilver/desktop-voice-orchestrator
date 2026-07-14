@@ -48,10 +48,24 @@
         <div><p class="section-label">SIGNAL</p><h2>实时音频时间轴</h2></div>
         <div class="metric-row"><span>RMS <b id="rms">—</b></span><span>队列 <b id="queue-depth">0</b></span><span>丢弃 <b id="drops">0</b></span></div>
       </div>
+      <div class="wave-inspector" aria-label="波形查看控制">
+        <span id="view-mode" class="pill view-live" data-mode="live">实时跟随</span>
+        <button id="view-live" type="button" disabled>回到实时</button>
+        <label for="view-duration">显示窗口</label>
+        <select id="view-duration">
+          <option value="2">2 秒</option>
+          <option value="5">5 秒</option>
+          <option value="10">10 秒</option>
+          <option value="20" selected>20 秒</option>
+        </select>
+        <input id="view-scrubber" type="range" min="0" max="1" value="1" step="0.05" aria-label="波形时间位置">
+        <output id="view-range">等待音频…</output>
+      </div>
+      <p class="drag-hint">拖动任意波形轨道可左右查看；移动鼠标可检查触发时间。停止录制后视图会自动冻结。</p>
       <div class="canvas-wrap waveform-wrap"><canvas id="waveform"></canvas><span class="axis-label">WAVE</span></div>
       <div class="canvas-wrap vad-wrap"><canvas id="vad"></canvas><span class="axis-label">VAD</span></div>
       <div class="canvas-wrap kws-wrap"><canvas id="kws"></canvas><span class="axis-label">KWS</span></div>
-      <div class="legend"><span class="vad-key">语音</span><span class="wake-key">唤醒词剔除区</span><span class="candidate-key">候选话段</span><span>窗口：最近 20 秒</span></div>
+      <div class="legend"><span class="vad-key">语音</span><span class="wake-key">唤醒词剔除区</span><span class="candidate-key">候选话段</span><span id="window-label">窗口：最近 20 秒</span></div>
     </section>
 
     <section class="grid">

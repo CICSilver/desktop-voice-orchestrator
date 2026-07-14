@@ -42,8 +42,11 @@ class VoiceFrontendRuntime {
   void initialize_pipeline();
   void reset_pipeline(bool discontinuity);
   void start_processing();
+  void stop_processing();
   void start_captures();
   void stop_captures();
+  void reset_audio_queues();
+  void enqueue_replay_packet(AudioPacket packet);
   void enqueue_packet(AudioPacket packet);
   void processing_loop(std::stop_token stop);
   void process_microphone(AudioPacket packet);
@@ -84,6 +87,7 @@ class VoiceFrontendRuntime {
   std::jthread processing_thread_;
   std::atomic<bool> running_{};
   std::atomic<bool> replay_mode_{};
+  std::mutex replay_callback_mutex_;
 
   mutable std::mutex capture_events_mutex_;
   std::deque<std::pair<std::string, std::string>> capture_events_;

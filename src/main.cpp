@@ -31,7 +31,8 @@ std::filesystem::path project_root() {
 }
 
 void print_usage() {
-  std::cout << "voice_frontend <list-devices|live|replay|benchmark> [session] [--no-browser]\n";
+  std::cout << "voice_frontend <list-devices|live|replay|benchmark> [session] "
+               "[--no-browser] [--web-port=<port>]\n";
 }
 }  // namespace
 
@@ -54,6 +55,15 @@ int main(int argc, char** argv) {
     const auto root = project_root();
     dvo::ConfigStore store(root / "config/default.toml", root / "config/local.toml", root);
     auto config = store.load();
+    for (int index = 2; index < argc; ++index) {
+      const std::string_view argument = argv[index];
+      constexpr std::string_view prefix = "--web-port=";
+      if (argument.starts_with(prefix)) {
+        const auto port = std::stoi(std::string(argument.substr(prefix.size())));
+        if (port <= 0 || port > 65535) throw std::invalid_argument("web port must be in [1, 65535]");
+        config.web.port = static_cast<std::uint16_t>(port);
+      }
+    }
     dvo::VoiceFrontendRuntime runtime(config, store);
     const bool no_browser = std::find_if(argv + 2, argv + argc,
         [](const char* value) { return std::string_view(value) == "--no-browser"; }) != argv + argc;

@@ -28,11 +28,19 @@ void VoiceFrontendRuntime::initialize_pipeline() {
   vad_ = create_vad(config_.vad);
   kws_ = create_keyword_spotter(config_.kws);
   segmenter_ = std::make_unique<UtteranceSegmenter>(config_.segmentation, *ring_);
+  reset_audio_queues();
+  next_telemetry_sample_ = 0;
+}
+
+void VoiceFrontendRuntime::reset_audio_queues() {
   const auto queue_capacity = std::max<std::size_t>(
       1, (config_.audio.queue_capacity_ms + config_.audio.frame_ms - 1) / config_.audio.frame_ms);
   microphone_queue_ = std::make_unique<SpscQueue<AudioPacket>>(queue_capacity);
   loopback_queue_ = std::make_unique<SpscQueue<AudioPacket>>(queue_capacity);
-  next_telemetry_sample_ = 0;
+  microphone_overflow_.store(false, std::memory_order_release);
+  loopback_overflow_.store(false, std::memory_order_release);
+  latest_loopback_.reset();
+  latest_loopback_summary_ = {};
 }
 
 void VoiceFrontendRuntime::start_live(bool enable_web) {
@@ -46,6 +54,7 @@ void VoiceFrontendRuntime::start_live(bool enable_web) {
   start_processing();
   start_captures();
   emit_event("runtime_started", {{"mode", "live"}, {"vad", vad_->status()}, {"kws", kws_->status()}});
+  emit_event("runtime_mode", {{"mode", "live"}});
   emit_event("config_state", {{"config", config_store_.to_public_json(config_)}});
   emit_event("sessions", session_list());
 }
@@ -60,11 +69,13 @@ void VoiceFrontendRuntime::start_replay(const std::filesystem::path& session, bo
     debug_.start(config_.web, [this](const auto& command) { return handle_command(command); });
   }
   start_processing();
-  replay_ = std::make_unique<ReplayController>([this](AudioPacket packet) { enqueue_packet(std::move(packet)); });
+  replay_ = std::make_unique<ReplayController>(
+      [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); });
   replay_->open(session);
   replay_->set_speed(speed);
   replay_->play();
   emit_event("runtime_started", {{"mode", "replay"}, {"session", session.string()}}, 0, "replay");
+  emit_event("runtime_mode", {{"mode", "replay"}, {"session", session.string()}}, 0, "replay");
   emit_event("config_state", {{"config", config_store_.to_public_json(config_)}}, 0, "replay");
   emit_event("sessions", session_list(), 0, "replay");
 }
@@ -92,6 +103,12 @@ void VoiceFrontendRuntime::start_processing() {
   processing_thread_ = std::jthread([this](std::stop_token stop) { processing_loop(stop); });
 }
 
+void VoiceFrontendRuntime::stop_processing() {
+  if (!processing_thread_.joinable()) return;
+  processing_thread_.request_stop();
+  processing_thread_.join();
+}
+
 void VoiceFrontendRuntime::start_captures() {
   const auto event = [this](std::string type, std::string message) {
     queue_capture_event(std::move(type), std::move(message));
@@ -113,9 +130,15 @@ void VoiceFrontendRuntime::stop() {
   if (!running_.exchange(false, std::memory_order_acq_rel) && !processing_thread_.joinable()) return;
   stop_captures();
   if (replay_) { replay_->stop(); replay_.reset(); }
-  if (processing_thread_.joinable()) { processing_thread_.request_stop(); processing_thread_.join(); }
+  stop_processing();
   recorder_.stop(metrics_json());
   debug_.stop();
+}
+
+void VoiceFrontendRuntime::enqueue_replay_packet(AudioPacket packet) {
+  std::scoped_lock lock(replay_callback_mutex_);
+  if (!replay_mode_.load(std::memory_order_acquire)) return;
+  enqueue_packet(std::move(packet));
 }
 
 void VoiceFrontendRuntime::enqueue_packet(AudioPacket packet) {
@@ -254,6 +277,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     emit_event("config_state", {{"config", config_store_.to_public_json(config_)}});
     emit_event("sessions", session_list());
     emit_event("recording_state", {{"active", recorder_.active()}, {"session", recorder_.session_path().string()}});
+    emit_event("runtime_mode", {{"mode", replay_mode_.load(std::memory_order_acquire) ? "replay" : "live"}});
     if (replay_) emit_event("replay_state", replay_->state(), 0, "replay");
     return {{"ok", true}, {"metrics", metrics_json()}};
   }
@@ -375,15 +399,51 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     const auto session = std::filesystem::path(command.value("session", ""));
     if (session.empty()) throw std::invalid_argument("session is required");
     stop_captures();
-    replay_mode_.store(true, std::memory_order_release);
+    if (replay_) {
+      replay_->stop();
+      replay_.reset();
+    }
+    {
+      std::scoped_lock callback_lock(replay_callback_mutex_);
+      replay_mode_.store(false, std::memory_order_release);
+    }
+    stop_processing();
+    reset_audio_queues();
     {
       std::scoped_lock lock(pipeline_mutex_);
-      reset_pipeline(false);
+      reset_pipeline(true);
     }
+    replay_mode_.store(true, std::memory_order_release);
+    start_processing();
     if (!replay_) replay_ = std::make_unique<ReplayController>(
-        [this](AudioPacket packet) { enqueue_packet(std::move(packet)); });
+        [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); });
     replay_->open(session);
+    emit_event("runtime_mode", {{"mode", "replay"}, {"session", session.string()}}, 0, "replay");
     emit_event("replay_state", replay_->state(), 0, "replay");
+    return {{"ok", true}};
+  }
+  if (action == "live.resume") {
+    if (!replay_mode_.load(std::memory_order_acquire)) {
+      emit_event("runtime_mode", {{"mode", "live"}});
+      return {{"ok", true}, {"already_live", true}};
+    }
+    if (replay_) {
+      replay_->stop();
+      replay_.reset();
+    }
+    {
+      std::scoped_lock callback_lock(replay_callback_mutex_);
+      replay_mode_.store(false, std::memory_order_release);
+    }
+    stop_processing();
+    reset_audio_queues();
+    {
+      std::scoped_lock lock(pipeline_mutex_);
+      reset_pipeline(true);
+    }
+    start_processing();
+    start_captures();
+    emit_event("runtime_mode", {{"mode", "live"}});
     return {{"ok", true}};
   }
   if (action == "replay.play" && replay_) { replay_->play(); emit_event("replay_state", replay_->state(), 0, "replay"); return {{"ok", true}}; }
