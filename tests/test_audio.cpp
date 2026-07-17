@@ -291,6 +291,34 @@ TEST_CASE("late real render replaces an unconsumed synthetic idle interval") {
   }
 }
 
+TEST_CASE("late real render hard resync discards provisional replacement records") {
+  dvo::AudioConfig config;
+  dvo::PreprocessorTimelineConfig timeline;
+  timeline.alignment_wait_ms = 0;
+  timeline.target_render_buffer_ms = 10;
+  dvo::WebRtcAec3Preprocessor preprocessor(config, timeline);
+  constexpr std::uint64_t base_qpc = 5'600'000;
+
+  // Build more than the default 80 ms hard-resync window of provisional
+  // loopback audio, then deliver the real packet for the first interval.
+  for (std::uint64_t i = 0; i < 10; ++i) {
+    auto idle = timeline_packet(dvo::AudioStreamKind::loopback,
+                                base_qpc + i * 100'000, i * 480, i + 1,
+                                0.0F);
+    idle.synthetic = true;
+    idle.silent = true;
+    REQUIRE(preprocessor.PushPacket(idle).accepted);
+  }
+
+  const auto real = timeline_packet(dvo::AudioStreamKind::loopback, base_qpc,
+                                    0, 11, 0.35F);
+  const auto pushed = preprocessor.PushPacket(real);
+  REQUIRE(pushed.accepted);
+  REQUIRE(pushed.reset_required);
+  CHECK(pushed.reset_reason == dvo::PreprocessResetReason::hard_resync);
+  CHECK(preprocessor.Diagnostics().hard_resyncs == 1);
+}
+
 TEST_CASE("timestamp errors reset state and preserve the output sample clock") {
   dvo::AudioConfig config;
   dvo::BypassPreprocessor preprocessor(config);
@@ -384,6 +412,38 @@ TEST_CASE("independent device clocks produce a bounded drift estimate") {
     REQUIRE(diagnostics.render_resampler_rate_updates == 0);
     REQUIRE(diagnostics.drift_correction_samples > 0);
   }
+}
+
+TEST_CASE("relative drift normalizes independent nominal sample rates") {
+  dvo::AudioConfig config;
+  dvo::PreprocessorTimelineConfig timeline;
+  timeline.drift_window_ms = 1000;
+  dvo::BypassPreprocessor preprocessor(config, timeline);
+  constexpr std::uint64_t base_qpc = 25'000'000;
+
+  for (std::uint64_t i = 0; i < 125; ++i) {
+    auto render = timeline_packet(dvo::AudioStreamKind::loopback,
+                                  base_qpc + i * 100'000, i * 441,
+                                  i + 1, -0.1F);
+    render.format.sample_rate = 44'100;
+    render.samples.assign(441 * 2, -0.1F);
+    REQUIRE(preprocessor.PushPacket(render).accepted);
+
+    auto microphone = timeline_packet(dvo::AudioStreamKind::microphone,
+                                      base_qpc + i * 100'000, i * 480,
+                                      i + 1, 0.1F);
+    REQUIRE(preprocessor.PushPacket(microphone).accepted);
+    dvo::NormalizedFrame frame;
+    while (preprocessor.TryPopFrame(frame)) {
+    }
+  }
+
+  const auto diagnostics = preprocessor.Diagnostics();
+  REQUIRE(diagnostics.drift_estimate_valid);
+  CHECK(diagnostics.microphone_rate_hz == Catch::Approx(48'000.0).margin(1.0));
+  CHECK(diagnostics.render_rate_hz == Catch::Approx(44'100.0).margin(1.0));
+  CHECK(diagnostics.relative_drift_ppm == Catch::Approx(0.0).margin(1.0));
+  CHECK_FALSE(diagnostics.drift_out_of_range);
 }
 
 TEST_CASE("continuous device positions reject packet QPC scheduling jitter") {

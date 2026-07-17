@@ -533,10 +533,14 @@ bool UtteranceSegmenter::refresh_activation(
     }
     return true;
   }
+  const auto refreshed_idle_deadline = saturating_add(
+      refresh_sample, samples(activation_config_.idle_timeout_ms));
+  // Exact-final validation may finish after audible playback has already
+  // deferred the window. A plan refresh must never undo that deferral.
   activation_state_.idle_deadline_sample = std::min(
       activation_state_.hard_deadline_sample,
-      saturating_add(refresh_sample,
-                     samples(activation_config_.idle_timeout_ms)));
+      std::max(activation_state_.idle_deadline_sample,
+               refreshed_idle_deadline));
   validation_idle_deadline_sample_ =
       activation_state_.idle_deadline_sample;
   queue_transition(ActivationTransitionKind::refreshed, refresh_sample,

@@ -587,6 +587,34 @@ TEST_CASE("playback hold survives old idle and applies actual duration") {
   CHECK(fixture.segmenter.activation().active());
 }
 
+TEST_CASE("a later plan refresh preserves playback idle deferral") {
+  ActivationFixture fixture;
+  static_cast<void>(fixture.finish_keyword());
+
+  const auto followup_start = ms(1500);
+  const auto start = fixture.segmenter.set_vad_state(true, followup_start);
+  REQUIRE(start.has_value());
+  const auto followup_end = ms(1800);
+  static_cast<void>(fixture.segmenter.set_vad_state(false, followup_end));
+  fixture.segmenter.add_vad_interval({{followup_start, followup_end}});
+  const auto completed = fixture.segmenter.advance(followup_end + ms(900));
+  REQUIRE(completed.candidates.size() == 1);
+
+  REQUIRE(fixture.segmenter.begin_activation_playback(ms(2800)));
+  REQUIRE(fixture.segmenter.finish_activation_playback(ms(4000), ms(6800)));
+  const auto deferred_idle = fixture.segmenter.activation().idle_deadline_sample;
+  REQUIRE(deferred_idle == ms(11400));
+
+  REQUIRE(fixture.segmenter.refresh_activation(
+      start->activation_id, start->turn_index, ms(7000)));
+  CHECK(fixture.segmenter.activation().idle_deadline_sample == deferred_idle);
+
+  const auto next = fixture.segmenter.set_vad_state(true, ms(10000));
+  REQUIRE(next.has_value());
+  CHECK(next->activation_id == start->activation_id);
+  CHECK(next->turn_index == start->turn_index + 1);
+}
+
 TEST_CASE("playback hold never suspends hard deadline") {
   ActivationFixture fixture;
   static_cast<void>(fixture.finish_keyword());
