@@ -13,6 +13,10 @@ dvo::CommandParseContext context(std::string id = "utterance-1") {
   dvo::CommandParseContext value;
   value.runtime_session_id = "parser-test-runtime";
   value.utterance_id = std::move(id);
+  value.origin = dvo::UtteranceOrigin::followup;
+  value.activation_id = "activation-1";
+  value.turn_index = 2;
+  value.trigger_sample = 15000;
   value.wake_position = "prefix";
   value.config_revision = 11;
   value.recognition_generation = 7;
@@ -178,6 +182,11 @@ TEST_CASE("Plan IDs are deterministic per utterance and non-live sources are dry
   CHECK(first.plan->config_revision == replay_context.config_revision);
   CHECK(first.plan->recognition_generation == replay_context.recognition_generation);
   CHECK(first.plan->final_revision == replay_context.final_revision);
+  CHECK(first.plan->schema_version == 2);
+  CHECK(first.plan->origin == dvo::UtteranceOrigin::followup);
+  CHECK(first.plan->activation_id == "activation-1");
+  CHECK(first.plan->turn_index == 2);
+  CHECK(first.plan->trigger_sample == 15000);
 }
 
 TEST_CASE("Plan idempotency keys include runtime generation and final revision boundaries") {

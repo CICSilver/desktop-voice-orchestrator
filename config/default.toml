@@ -95,6 +95,12 @@ embedded_join_silence_ms = 150
 # 冷：候选/ASR前置音频异步组装的总在途上限，合法范围1..64；队列满时显式取消且不反压音频线程。
 assembly_queue_capacity = 4
 
+[activation]
+# 热：KWS命中后允许免唤醒后续命令；期限使用处理后的16kHz样本时钟。
+enabled = true
+idle_timeout_ms = 6000
+hard_limit_ms = 20000
+
 [asr]
 enabled = true
 # 冷：使用现有sherpa-onnx运行FunASR来源、带sherpa元数据的在线Paraformer重导出。
@@ -136,6 +142,14 @@ play = ["播放音乐"]
 pause = ["暂停音乐"]
 volume_up = ["增加音量"]
 volume_down = ["降低音量"]
+
+[announcements]
+# 当前仅实现结构化文字日志；未来TTS后端复用同一非阻塞接口。
+enabled = true
+backend = "log"
+queue_capacity = 32
+barge_in = false
+tail_guard_ms = 200
 
 [web]
 enabled = true

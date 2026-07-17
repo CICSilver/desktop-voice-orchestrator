@@ -39,8 +39,8 @@ struct RecognitionBegin {
   std::string utterance_id;
   std::uint64_t generation{};
   std::string source{"live"};
-  std::uint64_t left_backfill_first_sample{};
-  SharedPcm left_backfill;
+  std::uint64_t backfill_first_sample{};
+  SharedPcm backfill;
   std::uint32_t sample_rate{kProcessingSampleRate};
 };
 
@@ -106,6 +106,9 @@ struct RecognitionResult {
   // provisional stream; for exact-final it covers only the authoritative pass.
   double inference_ms{};
   double rtf{};
+  // True for both a successful authoritative result and an error raised by
+  // the fresh exact-final decode. Provisional stream failures leave it false.
+  bool exact_final_attempt{};
   bool exact_final{};
   std::shared_ptr<const UtteranceCandidate> candidate;
   std::string detail;

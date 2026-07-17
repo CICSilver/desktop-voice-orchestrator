@@ -79,13 +79,18 @@ struct VadInterval {
 };
 
 enum class WakePosition { prefix, suffix, embedded };
+enum class UtteranceOrigin { keyword, followup };
 
 struct UtteranceCandidate {
   std::string utterance_id;
-  WakePosition position{WakePosition::prefix};
+  UtteranceOrigin origin{UtteranceOrigin::keyword};
+  std::string activation_id;
+  std::uint32_t turn_index{};
+  std::uint64_t trigger_sample{};
+  std::optional<WakePosition> position{WakePosition::prefix};
   std::string keyword;
   std::vector<std::string> tokens;
-  SampleSpan wake_span;
+  std::optional<SampleSpan> wake_span{SampleSpan{}};
   std::vector<SampleSpan> source_spans;
   std::vector<float> pcm;
   std::uint32_t sample_rate{kProcessingSampleRate};
@@ -109,6 +114,14 @@ struct UtteranceCandidate {
     case WakePosition::prefix: return "prefix";
     case WakePosition::suffix: return "suffix";
     case WakePosition::embedded: return "embedded";
+  }
+  return "unknown";
+}
+
+[[nodiscard]] inline const char* to_string(UtteranceOrigin origin) {
+  switch (origin) {
+    case UtteranceOrigin::keyword: return "keyword";
+    case UtteranceOrigin::followup: return "followup";
   }
   return "unknown";
 }

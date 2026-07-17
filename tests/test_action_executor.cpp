@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -105,6 +106,10 @@ TEST_CASE("Ordered executor invokes all actions serially in plan order") {
       });
 
   auto command = plan("ordered", "播放音乐暂停音乐增加音量降低音量");
+  command.origin = dvo::UtteranceOrigin::followup;
+  command.activation_id = "activation-ordered";
+  command.turn_index = 3;
+  command.trigger_sample = 1200;
   REQUIRE(executor.try_submit(command, [&](const dvo::CommandPlan& accepted) {
             CHECK(accepted.command_id == command.command_id);
             accepted_published.store(true, std::memory_order_release);
@@ -124,11 +129,58 @@ TEST_CASE("Ordered executor invokes all actions serially in plan order") {
       CHECK(results[i * 2].status == dvo::ActionStatus::started);
       CHECK(results[i * 2 + 1].status == dvo::ActionStatus::succeeded);
       CHECK(results[i * 2].action_id == command.actions[i].action_id);
+      CHECK(results[i * 2].origin == command.origin);
+      CHECK(results[i * 2].activation_id == command.activation_id);
+      CHECK(results[i * 2].turn_index == command.turn_index);
+      CHECK(results[i * 2].trigger_sample == command.trigger_sample);
       CHECK(results[i * 2].source == command.source);
       CHECK(results[i * 2].timestamp_sample == command.timestamp_sample);
     }
   }
   executor.stop();
+}
+
+TEST_CASE("Plan-started observer runs once after dequeue and before actions") {
+  auto backend = std::make_shared<FakeBackend>();
+  std::mutex mutex;
+  std::vector<std::string> lifecycle;
+  dvo::OrderedActionExecutor executor(
+      backend, {},
+      [&](const dvo::ActionResult& result) {
+        if (result.status != dvo::ActionStatus::started) return;
+        std::scoped_lock lock(mutex);
+        lifecycle.push_back("action:" + result.action_id);
+      },
+      [&](const dvo::CommandPlan& started) {
+        std::scoped_lock lock(mutex);
+        lifecycle.push_back("plan:" + started.command_id);
+      });
+
+  const auto command = plan("plan-started", "播放音乐暂停音乐");
+  REQUIRE(executor.try_submit(command).accepted());
+  REQUIRE(executor.wait_until_idle(std::chrono::seconds(2)));
+  {
+    std::scoped_lock lock(mutex);
+    REQUIRE(lifecycle.size() == 3);
+    CHECK(lifecycle[0] == "plan:" + command.command_id);
+    CHECK(lifecycle[1] == "action:" + command.actions[0].action_id);
+    CHECK(lifecycle[2] == "action:" + command.actions[1].action_id);
+  }
+}
+
+TEST_CASE("Plan-started observer exceptions do not cancel action execution") {
+  auto backend = std::make_shared<FakeBackend>();
+  std::atomic<std::size_t> observer_calls{};
+  dvo::OrderedActionExecutor executor(
+      backend, {}, {}, [&](const dvo::CommandPlan&) {
+        ++observer_calls;
+        throw std::runtime_error("injected observer failure");
+      });
+
+  REQUIRE(executor.try_submit(plan("throwing-plan-observer")).accepted());
+  REQUIRE(executor.wait_until_idle(std::chrono::seconds(2)));
+  CHECK(observer_calls == 1);
+  CHECK(backend->call_count() == 1);
 }
 
 TEST_CASE("Executor ledger makes each action ID an at-most-once terminal attempt") {

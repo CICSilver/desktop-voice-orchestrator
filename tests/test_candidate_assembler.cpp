@@ -89,10 +89,14 @@ TEST_CASE("backfill assembly runs on the bounded worker and preserves timing met
   dvo::CandidateAssembler assembler(ring, 2);
   dvo::BackfillAssemblyRequest request;
   request.utterance_id = "backfill";
+  request.origin = dvo::UtteranceOrigin::followup;
+  request.activation_id = "activation-backfill";
+  request.turn_index = 3;
+  request.trigger_sample = 321;
   request.source_spans = {{100, 200}, {300, 400}};
   request.join_silence_samples = 2;
   request.trailing_silence_samples = 3;
-  request.wake_end_sample = 456;
+  request.stream_start_sample = 456;
   request.recognition_generation = 7;
   REQUIRE(assembler.try_submit(std::move(request)));
 
@@ -101,8 +105,12 @@ TEST_CASE("backfill assembly runs on the bounded worker and preserves timing met
   REQUIRE(std::holds_alternative<dvo::BackfillAssemblyResult>(raw));
   auto result = std::get<dvo::BackfillAssemblyResult>(std::move(raw));
   CHECK(result.utterance_id == "backfill");
+  CHECK(result.origin == dvo::UtteranceOrigin::followup);
+  CHECK(result.activation_id == "activation-backfill");
+  CHECK(result.turn_index == 3);
+  CHECK(result.trigger_sample == 321);
   CHECK(result.first_sample == 100);
-  CHECK(result.wake_end_sample == 456);
+  CHECK(result.stream_start_sample == 456);
   CHECK(result.recognition_generation == 7);
   REQUIRE(result.pcm.size() == 205);
   CHECK(result.pcm[99] == 199.0F);
