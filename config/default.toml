@@ -43,6 +43,19 @@ max_drift_ppm = 1000
 hard_resync_error_ms = 80
 # 热：实验用软件延迟偏置，单位ms。
 delay_offset_ms = 0
+# 热：多通道原始麦克风的通道选择；0..31选择对应通道，-1才对全部通道求平均。
+# 默认选择通道0，避免阵列通道时差或反相导致算术平均相消人声。
+microphone_channel_index = 0
+# 热：基于真实loopback与原始麦克风的归一化互相关估计外部回声延迟。
+# 只有render能量和相关峰达到门槛时才更新；最终提示值=自动估计+delay_offset_ms。
+auto_delay_enabled = true
+auto_delay_min_ms = 0
+auto_delay_max_ms = 250
+# 热：分析窗口500..5000 ms；更新间隔100..窗口长度ms。窗口越长越稳但收敛越慢。
+auto_delay_window_ms = 1000
+auto_delay_update_ms = 500
+# 热：相关峰门槛0.10..0.95；提高可减少近端说话造成的错误更新。
+auto_delay_min_correlation = 0.35
 # 固定：参考流不可用时输出旁路mic，同时重置AEC并标记degraded。
 missing_render_policy = "bypass_reset"
 # 热：AEC统计推送频率，范围1..20 Hz。

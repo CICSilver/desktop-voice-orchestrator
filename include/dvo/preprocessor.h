@@ -59,6 +59,13 @@ struct PreprocessorTimelineConfig {
   std::uint32_t hard_resync_error_ms{80};
   double max_drift_ppm{1000.0};
   std::int32_t delay_offset_ms{};
+  std::int32_t microphone_channel_index{};
+  bool auto_delay_enabled{true};
+  std::uint32_t auto_delay_min_ms{};
+  std::uint32_t auto_delay_max_ms{250};
+  std::uint32_t auto_delay_window_ms{1000};
+  std::uint32_t auto_delay_update_ms{500};
+  float auto_delay_min_correlation{0.35F};
   bool high_pass_filter{true};
   bool noise_suppression{};
   bool gain_control{};
@@ -89,10 +96,14 @@ struct PreprocessDiagnostics {
   bool speexdsp_compiled{};
   bool microphone_resampler_speex{};
   bool render_resampler_speex{};
+  bool auto_delay_enabled{};
+  bool auto_delay_available{};
 
   double microphone_rate_hz{};
   double render_rate_hz{};
   double relative_drift_ppm{};
+  double auto_delay_ms{};
+  double auto_delay_confidence{};
   int stream_delay_ms{};
 
   std::size_t microphone_buffered_samples{};
@@ -113,8 +124,13 @@ struct PreprocessDiagnostics {
   std::uint64_t buffer_overflows{};
   std::uint64_t output_frames_dropped{};
   std::uint64_t resampler_failures{};
+  std::int32_t last_resampler_error_code{};
+  std::uint32_t last_resampler_input_expected{};
+  std::uint32_t last_resampler_input_consumed{};
   std::uint64_t render_resampler_rate_updates{};
   std::uint64_t render_synthetic_samples_replaced{};
+  std::uint64_t auto_delay_updates{};
+  std::uint64_t auto_delay_rejections{};
   std::uint64_t processing_measurements{};
   double last_processing_time_us{};
   double average_processing_time_us{};

@@ -2,7 +2,9 @@
 #include <catch2/catch_approx.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <string_view>
+#include <vector>
 
 #include "dvo/preprocessor.h"
 
@@ -29,6 +31,42 @@ dvo::AudioPacket timeline_packet(dvo::AudioStreamKind stream, std::uint64_t qpc,
   return packet;
 }
 
+dvo::AudioPacket rate_timeline_packet(dvo::AudioStreamKind stream,
+                                      std::uint64_t qpc,
+                                      std::uint64_t device_position,
+                                      std::uint64_t sequence,
+                                      std::uint32_t sample_rate,
+                                      std::size_t frame_count, float value) {
+  dvo::AudioPacket packet;
+  packet.stream = stream;
+  packet.format = {sample_rate, 1};
+  packet.qpc_100ns = qpc;
+  packet.arrival_qpc_100ns = qpc + 20'000;
+  packet.device_position = device_position;
+  packet.stream_epoch = 1;
+  packet.sequence = sequence;
+  packet.samples.assign(frame_count, value);
+  return packet;
+}
+
+dvo::AudioPacket mono_timeline_packet(dvo::AudioStreamKind stream,
+                                      std::uint64_t frame_index,
+                                      const std::vector<float>& samples) {
+  dvo::AudioPacket packet;
+  packet.stream = stream;
+  packet.format = {16000, 1};
+  packet.qpc_100ns = 80'000'000 + frame_index * 100'000;
+  packet.arrival_qpc_100ns = packet.qpc_100ns + 5'000;
+  packet.device_position = frame_index * dvo::kFrameSamples;
+  packet.stream_epoch = 1;
+  packet.sequence = frame_index + 1;
+  const auto begin = static_cast<std::size_t>(frame_index) * dvo::kFrameSamples;
+  packet.samples.assign(samples.begin() + static_cast<std::ptrdiff_t>(begin),
+                        samples.begin() + static_cast<std::ptrdiff_t>(
+                                              begin + dvo::kFrameSamples));
+  return packet;
+}
+
 }  // namespace
 
 TEST_CASE("AEC application config maps every preprocessor setting") {
@@ -40,6 +78,13 @@ TEST_CASE("AEC application config maps every preprocessor setting") {
   config.hard_resync_error_ms = 91;
   config.max_drift_ppm = 432;
   config.delay_offset_ms = -12;
+  config.microphone_channel_index = -1;
+  config.auto_delay_enabled = false;
+  config.auto_delay_min_ms = 20;
+  config.auto_delay_max_ms = 180;
+  config.auto_delay_window_ms = 1500;
+  config.auto_delay_update_ms = 300;
+  config.auto_delay_min_correlation = 0.48F;
   config.high_pass_filter = false;
   config.noise_suppression = true;
   config.gain_control = true;
@@ -53,10 +98,56 @@ TEST_CASE("AEC application config maps every preprocessor setting") {
   REQUIRE(timeline.hard_resync_error_ms == 91);
   REQUIRE(timeline.max_drift_ppm == Catch::Approx(432.0));
   REQUIRE(timeline.delay_offset_ms == -12);
+  REQUIRE(timeline.microphone_channel_index == -1);
+  REQUIRE_FALSE(timeline.auto_delay_enabled);
+  REQUIRE(timeline.auto_delay_min_ms == 20);
+  REQUIRE(timeline.auto_delay_max_ms == 180);
+  REQUIRE(timeline.auto_delay_window_ms == 1500);
+  REQUIRE(timeline.auto_delay_update_ms == 300);
+  REQUIRE(timeline.auto_delay_min_correlation == Catch::Approx(0.48F));
   REQUIRE_FALSE(timeline.high_pass_filter);
   REQUIRE(timeline.noise_suppression);
   REQUIRE(timeline.gain_control);
   REQUIRE(timeline.stats_hz == 4);
+}
+
+TEST_CASE("microphone channel can be selected or explicitly averaged") {
+  dvo::AudioConfig config;
+  auto packet = stereo_packet(1'500'000, 0.0F);
+  for (std::size_t frame = 0; frame < 480; ++frame) {
+    packet.samples[frame * 2] = 0.25F;
+    packet.samples[frame * 2 + 1] = -0.75F;
+  }
+
+  SECTION("select one physical channel") {
+    dvo::PreprocessorTimelineConfig timeline;
+    timeline.microphone_channel_index = 1;
+    dvo::BypassPreprocessor preprocessor(config, timeline);
+    REQUIRE(preprocessor.PushPacket(packet).accepted);
+    dvo::NormalizedFrame frame;
+    REQUIRE(preprocessor.TryPopFrame(frame));
+    REQUIRE(frame.samples[80] == Catch::Approx(-0.75F));
+  }
+
+  SECTION("average all channels") {
+    dvo::PreprocessorTimelineConfig timeline;
+    timeline.microphone_channel_index = -1;
+    dvo::BypassPreprocessor preprocessor(config, timeline);
+    REQUIRE(preprocessor.PushPacket(packet).accepted);
+    dvo::NormalizedFrame frame;
+    REQUIRE(preprocessor.TryPopFrame(frame));
+    REQUIRE(frame.samples[80] == Catch::Approx(-0.25F));
+  }
+
+  SECTION("reject an unavailable channel without reading outside the packet") {
+    dvo::PreprocessorTimelineConfig timeline;
+    timeline.microphone_channel_index = 2;
+    dvo::BypassPreprocessor preprocessor(config, timeline);
+    const auto result = preprocessor.PushPacket(packet);
+    REQUIRE_FALSE(result.accepted);
+    REQUIRE(result.reset_required);
+    REQUIRE(result.reset_reason == dvo::PreprocessResetReason::invalid_packet);
+  }
 }
 
 TEST_CASE("bypass preprocessor downmixes resamples and assigns absolute QPC") {
@@ -167,6 +258,57 @@ TEST_CASE("AEC delay hint is not distorted by packet delivery backlog") {
   dvo::NormalizedFrame frame;
   REQUIRE(preprocessor.TryPopFrame(frame));
   REQUIRE(preprocessor.Diagnostics().stream_delay_ms == 23);
+}
+
+TEST_CASE("AEC automatically estimates a repeatable render to microphone delay") {
+  constexpr std::size_t frame_count = 260;
+  constexpr std::size_t delay_samples = 80 * dvo::kProcessingSampleRate / 1000;
+  std::vector<float> render(frame_count * dvo::kFrameSamples);
+  std::vector<float> microphone(render.size(), 0.0F);
+  std::uint32_t random_state = 0x12345678U;
+  for (auto& sample : render) {
+    random_state ^= random_state << 13U;
+    random_state ^= random_state >> 17U;
+    random_state ^= random_state << 5U;
+    sample = (static_cast<float>(random_state & 0xffffU) / 32767.5F - 1.0F) *
+             0.25F;
+  }
+  for (std::size_t i = delay_samples; i < microphone.size(); ++i) {
+    microphone[i] = render[i - delay_samples] * 0.7F;
+  }
+
+  dvo::AudioConfig config;
+  dvo::PreprocessorTimelineConfig timeline;
+  timeline.alignment_wait_ms = 0;
+  timeline.target_render_buffer_ms = 10;
+  timeline.auto_delay_enabled = true;
+  timeline.auto_delay_min_ms = 20;
+  timeline.auto_delay_max_ms = 150;
+  timeline.auto_delay_window_ms = 500;
+  timeline.auto_delay_update_ms = 100;
+  timeline.auto_delay_min_correlation = 0.35F;
+  timeline.delay_offset_ms = 7;
+  dvo::WebRtcAec3Preprocessor preprocessor(config, timeline);
+
+  for (std::uint64_t frame_index = 0; frame_index < frame_count; ++frame_index) {
+    REQUIRE(preprocessor.PushPacket(mono_timeline_packet(
+                dvo::AudioStreamKind::loopback, frame_index, render))
+                .accepted);
+    REQUIRE(preprocessor.PushPacket(mono_timeline_packet(
+                dvo::AudioStreamKind::microphone, frame_index, microphone))
+                .accepted);
+    dvo::NormalizedFrame output;
+    while (preprocessor.TryPopFrame(output)) {
+    }
+  }
+
+  const auto diagnostics = preprocessor.Diagnostics();
+  REQUIRE(diagnostics.auto_delay_enabled);
+  REQUIRE(diagnostics.auto_delay_available);
+  REQUIRE(diagnostics.auto_delay_updates > 1);
+  REQUIRE(diagnostics.auto_delay_confidence > 0.9);
+  REQUIRE(diagnostics.auto_delay_ms == Catch::Approx(80.0).margin(1.0));
+  REQUIRE(diagnostics.stream_delay_ms == 87);
 }
 
 TEST_CASE("compiled WebRTC backend continuously processes aligned frames") {
@@ -384,6 +526,71 @@ TEST_CASE("independent device clocks produce a bounded drift estimate") {
     REQUIRE(diagnostics.render_resampler_rate_updates == 0);
     REQUIRE(diagnostics.drift_correction_samples > 0);
   }
+}
+
+TEST_CASE("different nominal device rates do not masquerade as clock drift") {
+  dvo::AudioConfig config;
+  dvo::PreprocessorTimelineConfig timeline;
+  timeline.drift_window_ms = 1000;
+  timeline.alignment_wait_ms = 0;
+  timeline.target_render_buffer_ms = 10;
+  dvo::BypassPreprocessor preprocessor(config, timeline);
+  constexpr std::uint64_t base_qpc = 22'000'000;
+
+  for (std::uint64_t i = 0; i < 125; ++i) {
+    REQUIRE(preprocessor.PushPacket(rate_timeline_packet(
+                dvo::AudioStreamKind::loopback, base_qpc + i * 100'000,
+                i * 480, i + 1, 48'000, 480, -0.1F))
+                .accepted);
+    REQUIRE(preprocessor.PushPacket(rate_timeline_packet(
+                dvo::AudioStreamKind::microphone, base_qpc + i * 100'000,
+                i * 160, i + 1, 16'000, 160, 0.1F))
+                .accepted);
+    dvo::NormalizedFrame frame;
+    while (preprocessor.TryPopFrame(frame)) {
+    }
+  }
+
+  const auto diagnostics = preprocessor.Diagnostics();
+  REQUIRE(diagnostics.drift_estimate_valid);
+  REQUIRE(diagnostics.microphone_rate_hz == Catch::Approx(16'000.0).margin(1.0));
+  REQUIRE(diagnostics.render_rate_hz == Catch::Approx(48'000.0).margin(1.0));
+  REQUIRE(std::abs(diagnostics.relative_drift_ppm) < 10.0);
+  REQUIRE_FALSE(diagnostics.drift_out_of_range);
+}
+
+TEST_CASE("Speex fractional rate updates stay bounded for live clock estimates") {
+  if (!dvo::speexdsp_compiled()) return;
+
+  dvo::AudioConfig config;
+  dvo::PreprocessorTimelineConfig timeline;
+  timeline.drift_window_ms = 1000;
+  timeline.alignment_wait_ms = 0;
+  timeline.target_render_buffer_ms = 10;
+  dvo::BypassPreprocessor preprocessor(config, timeline);
+  constexpr std::uint64_t base_qpc = 25'000'000;
+
+  for (std::uint64_t i = 0; i < 250; ++i) {
+    const auto render_qpc = base_qpc + static_cast<std::uint64_t>(
+        std::llround(static_cast<long double>(i) * 99'993.48L));
+    REQUIRE(preprocessor.PushPacket(timeline_packet(
+                dvo::AudioStreamKind::loopback, render_qpc, i * 480,
+                i + 1, -0.1F))
+                .accepted);
+    REQUIRE(preprocessor.PushPacket(timeline_packet(
+                dvo::AudioStreamKind::microphone, base_qpc + i * 100'000,
+                i * 480, i + 1, 0.1F))
+                .accepted);
+    dvo::NormalizedFrame frame;
+    while (preprocessor.TryPopFrame(frame)) {
+    }
+  }
+
+  const auto diagnostics = preprocessor.Diagnostics();
+  REQUIRE(diagnostics.render_resampler_speex);
+  REQUIRE(diagnostics.render_resampler_rate_updates >= 2);
+  REQUIRE(diagnostics.resampler_failures == 0);
+  REQUIRE(diagnostics.last_resampler_error_code == 0);
 }
 
 TEST_CASE("continuous device positions reject packet QPC scheduling jitter") {

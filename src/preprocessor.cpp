@@ -241,6 +241,7 @@ class ClockRateEstimator {
   }
 
   [[nodiscard]] bool valid() const { return rate_valid_; }
+  [[nodiscard]] double nominal_rate_hz() const { return nominal_rate_hz_; }
   [[nodiscard]] double rate_hz() const {
     return rate_valid_ ? estimated_rate_hz_ : nominal_rate_hz_;
   }
@@ -266,6 +267,166 @@ struct BackendMetrics {
   std::optional<double> residual_echo_likelihood;
   std::optional<double> divergent_filter_fraction;
   std::optional<int> estimated_delay_ms;
+};
+
+// Estimates the acoustic/system lag between the post-volume loopback signal
+// and the raw microphone signal. The history is allocated once and correlation
+// runs on a 4:1 decimated window at most twice a second by default. This keeps
+// the estimator deterministic and avoids allocating in the 10 ms frame path.
+class AcousticDelayEstimator {
+ public:
+  explicit AcousticDelayEstimator(const PreprocessorTimelineConfig& config,
+                                  bool runtime_enabled)
+      : enabled_(config.auto_delay_enabled && runtime_enabled),
+        min_delay_ms_(config.auto_delay_min_ms),
+        max_delay_ms_(config.auto_delay_max_ms),
+        window_samples_(static_cast<std::size_t>(config.auto_delay_window_ms) *
+                        kProcessingSampleRate / 1000),
+        update_samples_(static_cast<std::size_t>(config.auto_delay_update_ms) *
+                        kProcessingSampleRate / 1000),
+        max_delay_samples_(static_cast<std::size_t>(config.auto_delay_max_ms) *
+                           kProcessingSampleRate / 1000),
+        minimum_correlation_(config.auto_delay_min_correlation),
+        capacity_(window_samples_ + max_delay_samples_ + 1),
+        render_(enabled_ ? capacity_ : 0),
+        capture_(enabled_ ? capacity_ : 0) {}
+
+  void observe(const std::array<float, kFrameSamples>& render,
+               const std::array<float, kFrameSamples>& capture,
+               bool trustworthy_render) {
+    if (!enabled_) return;
+    if (!trustworthy_render) {
+      clear_history();
+      return;
+    }
+    for (std::size_t i = 0; i < kFrameSamples; ++i) {
+      render_[write_index_] = render[i];
+      capture_[write_index_] = capture[i];
+      write_index_ = (write_index_ + 1) % capacity_;
+      sample_count_ = std::min(sample_count_ + 1, capacity_);
+    }
+    samples_since_update_ += kFrameSamples;
+    if (sample_count_ < capacity_ || samples_since_update_ < update_samples_) return;
+    samples_since_update_ = 0;
+    estimate();
+  }
+
+  void reset() {
+    clear_history();
+    available_ = false;
+    delay_ms_ = 0.0;
+    confidence_ = 0.0;
+    rejected_streak_ = 0;
+    updates_ = 0;
+    rejections_ = 0;
+  }
+
+  [[nodiscard]] bool enabled() const { return enabled_; }
+  [[nodiscard]] bool available() const { return available_; }
+  [[nodiscard]] double delay_ms() const { return delay_ms_; }
+  [[nodiscard]] double confidence() const { return confidence_; }
+  [[nodiscard]] std::uint64_t updates() const { return updates_; }
+  [[nodiscard]] std::uint64_t rejections() const { return rejections_; }
+
+ private:
+  static constexpr std::size_t kDecimation = 4;
+  static constexpr double kMinimumRenderRms = 0.01;
+
+  void clear_history() {
+    write_index_ = 0;
+    sample_count_ = 0;
+    samples_since_update_ = 0;
+  }
+
+  [[nodiscard]] float sample_back(const std::vector<float>& values,
+                                  std::size_t samples_back) const {
+    const auto latest = (write_index_ + capacity_ - 1) % capacity_;
+    return values[(latest + capacity_ - (samples_back % capacity_)) % capacity_];
+  }
+
+  void estimate() {
+    double best_correlation{-1.0};
+    std::uint32_t best_delay_ms{};
+
+    for (std::uint32_t delay_ms = min_delay_ms_; delay_ms <= max_delay_ms_;
+         ++delay_ms) {
+      const auto delay_samples = static_cast<std::size_t>(delay_ms) *
+                                 kProcessingSampleRate / 1000;
+      double sum_render{};
+      double sum_capture{};
+      double sum_render_squared{};
+      double sum_capture_squared{};
+      double sum_product{};
+      std::size_t count{};
+      for (std::size_t back = 0; back < window_samples_; back += kDecimation) {
+        const auto render_sample =
+            static_cast<double>(sample_back(render_, back + delay_samples));
+        const auto capture_sample = static_cast<double>(sample_back(capture_, back));
+        sum_render += render_sample;
+        sum_capture += capture_sample;
+        sum_render_squared += render_sample * render_sample;
+        sum_capture_squared += capture_sample * capture_sample;
+        sum_product += render_sample * capture_sample;
+        ++count;
+      }
+      if (count == 0) continue;
+      const auto count_value = static_cast<double>(count);
+      const auto render_variance =
+          sum_render_squared - sum_render * sum_render / count_value;
+      const auto capture_variance =
+          sum_capture_squared - sum_capture * sum_capture / count_value;
+      const auto render_rms = std::sqrt(sum_render_squared / count_value);
+      if (render_rms < kMinimumRenderRms || render_variance <= 1e-9 ||
+          capture_variance <= 1e-9) {
+        continue;
+      }
+      const auto covariance =
+          sum_product - sum_render * sum_capture / count_value;
+      const auto correlation =
+          std::abs(covariance / std::sqrt(render_variance * capture_variance));
+      if (correlation > best_correlation) {
+        best_correlation = correlation;
+        best_delay_ms = delay_ms;
+      }
+    }
+
+    if (best_correlation < static_cast<double>(minimum_correlation_)) {
+      ++rejections_;
+      ++rejected_streak_;
+      confidence_ = std::max(0.0, best_correlation);
+      if (rejected_streak_ >= 4) available_ = false;
+      return;
+    }
+
+    constexpr double kSmoothing = 0.25;
+    delay_ms_ = available_ ? delay_ms_ * (1.0 - kSmoothing) +
+                                 static_cast<double>(best_delay_ms) * kSmoothing
+                           : static_cast<double>(best_delay_ms);
+    confidence_ = best_correlation;
+    available_ = true;
+    rejected_streak_ = 0;
+    ++updates_;
+  }
+
+  bool enabled_{};
+  std::uint32_t min_delay_ms_{};
+  std::uint32_t max_delay_ms_{};
+  std::size_t window_samples_{};
+  std::size_t update_samples_{};
+  std::size_t max_delay_samples_{};
+  float minimum_correlation_{};
+  std::size_t capacity_{};
+  std::vector<float> render_;
+  std::vector<float> capture_;
+  std::size_t write_index_{};
+  std::size_t sample_count_{};
+  std::size_t samples_since_update_{};
+  bool available_{};
+  double delay_ms_{};
+  double confidence_{};
+  std::uint32_t rejected_streak_{};
+  std::uint64_t updates_{};
+  std::uint64_t rejections_{};
 };
 
 class AecBackend {
@@ -375,17 +536,26 @@ std::unique_ptr<AecBackend> create_webrtc_backend(
 #endif
 }
 
-std::vector<float> downmix_packet(const AudioPacket& packet) {
+std::vector<float> downmix_packet(const AudioPacket& packet,
+                                  std::int32_t channel_index) {
   const auto channels = static_cast<std::size_t>(packet.format.channels);
   const auto input_frames = packet.samples.size() / channels;
   std::vector<float> mono(input_frames);
   if (!packet.silent) {
     for (std::size_t frame = 0; frame < input_frames; ++frame) {
-      float sum{};
-      for (std::size_t channel = 0; channel < channels; ++channel) {
-        sum += packet.samples[frame * channels + channel];
+      if (channel_index >= 0) {
+        mono[frame] = std::clamp(
+            packet.samples[frame * channels +
+                           static_cast<std::size_t>(channel_index)],
+            -1.0F, 1.0F);
+      } else {
+        float sum{};
+        for (std::size_t channel = 0; channel < channels; ++channel) {
+          sum += packet.samples[frame * channels + channel];
+        }
+        mono[frame] =
+            std::clamp(sum / static_cast<float>(channels), -1.0F, 1.0F);
       }
-      mono[frame] = std::clamp(sum / static_cast<float>(channels), -1.0F, 1.0F);
     }
   }
   return mono;
@@ -396,6 +566,9 @@ struct ResampleOutcome {
   bool used_speex{};
   bool failed{};
   bool rate_updated{};
+  int error_code{};
+  std::uint32_t input_expected{};
+  std::uint32_t input_consumed{};
 };
 
 class StreamingResampler {
@@ -405,8 +578,9 @@ class StreamingResampler {
   StreamingResampler& operator=(const StreamingResampler&) = delete;
   ~StreamingResampler() { destroy_speex(); }
 
-  ResampleOutcome process(const AudioPacket& packet, double effective_rate_hz) {
-    auto mono = downmix_packet(packet);
+  ResampleOutcome process(const AudioPacket& packet, double effective_rate_hz,
+                          std::int32_t channel_index) {
+    auto mono = downmix_packet(packet, channel_index);
     if (mono.empty()) return {};
     if (!std::isfinite(effective_rate_hz) || effective_rate_hz <= 0.0) {
       effective_rate_hz = static_cast<double>(packet.format.sample_rate);
@@ -433,9 +607,10 @@ class StreamingResampler {
   // that still-buffered interval, resample it to the exact provisional output
   // length without advancing phase a second time.
   ResampleOutcome replace_provisional(const AudioPacket& packet,
-                                      std::size_t output_count) const {
+                                      std::size_t output_count,
+                                      std::int32_t channel_index) const {
     ResampleOutcome outcome;
-    const auto mono = downmix_packet(packet);
+    const auto mono = downmix_packet(packet, channel_index);
     if (mono.empty() || output_count == 0) return outcome;
     outcome.samples.resize(output_count);
     const long double step =
@@ -534,7 +709,13 @@ class StreamingResampler {
   ResampleOutcome process_speex(const std::vector<float>& mono,
                                 double effective_rate_hz) {
     ResampleOutcome outcome;
-    constexpr std::uint32_t kRateScale = 1000;
+    // Quantizing the observed input rate to 1 Hz is at most about 10.4 ppm at
+    // 48 kHz (half a quantization step), well below the configured 1000 ppm
+    // safety bound. Finer decimal grids create large, often near-coprime
+    // fractional ratios; SpeexDSP can reject those with RESAMPLER_ERR_OVERFLOW
+    // when live clock estimates change. Native-rate integers are robust and
+    // still precise enough to keep a 60 ms render FIFO centred.
+    constexpr std::uint32_t kRateScale = 1;
     constexpr std::uint32_t kRatioDenominator =
         kProcessingSampleRate * kRateScale;
     const auto maximum_u32 = std::numeric_limits<std::uint32_t>::max();
@@ -542,6 +723,7 @@ class StreamingResampler {
         mono.size() > maximum_u32) {
       disable_speex();
       outcome.failed = true;
+      outcome.error_code = RESAMPLER_ERR_OVERFLOW;
       return outcome;
     }
 
@@ -557,6 +739,7 @@ class StreamingResampler {
       if (!speex_ || error != RESAMPLER_ERR_SUCCESS) {
         disable_speex();
         outcome.failed = true;
+        outcome.error_code = error;
         return outcome;
       }
       ratio_numerator_ = ratio_numerator;
@@ -570,6 +753,7 @@ class StreamingResampler {
       if (error != RESAMPLER_ERR_SUCCESS) {
         disable_speex();
         outcome.failed = true;
+        outcome.error_code = error;
         return outcome;
       }
       ratio_numerator_ = ratio_numerator;
@@ -584,22 +768,27 @@ class StreamingResampler {
     if (capacity_long_double > maximum_u32) {
       disable_speex();
       outcome.failed = true;
+      outcome.error_code = RESAMPLER_ERR_OVERFLOW;
       return outcome;
     }
     const auto capacity = static_cast<std::uint32_t>(capacity_long_double);
     outcome.samples.resize(capacity);
     auto input_length = static_cast<std::uint32_t>(mono.size());
+    outcome.input_expected = input_length;
     auto output_length = capacity;
     error = speex_resampler_process_float(
         speex_, 0, mono.data(), &input_length, outcome.samples.data(),
         &output_length);
     if (error != RESAMPLER_ERR_SUCCESS || input_length != mono.size()) {
+      outcome.error_code = error;
+      outcome.input_consumed = input_length;
       disable_speex();
       outcome.samples.clear();
       outcome.failed = true;
       return outcome;
     }
     outcome.samples.resize(output_length);
+    outcome.input_consumed = input_length;
     outcome.used_speex = true;
     return outcome;
   }
@@ -686,6 +875,7 @@ class TimelineEngine {
   TimelineEngine(const AudioConfig& audio, PreprocessorTimelineConfig timeline,
                  bool aec_requested, std::unique_ptr<AecBackend> backend)
       : audio_(audio), timeline_(timeline), aec_requested_(aec_requested),
+        delay_estimator_(timeline, aec_requested),
         backend_(std::move(backend)) {
     if (audio_.target_sample_rate != kProcessingSampleRate || audio_.frame_ms != 10) {
       throw std::invalid_argument("timeline preprocessor requires 16 kHz / 10 ms output");
@@ -696,6 +886,16 @@ class TimelineEngine {
         timeline_.target_render_buffer_ms > timeline_.max_buffer_ms ||
         timeline_.drift_window_ms < 1000 || timeline_.drift_window_ms > 60000 ||
         timeline_.hard_resync_error_ms < 10 || timeline_.max_drift_ppm < 0.0 ||
+        timeline_.microphone_channel_index < -1 ||
+        timeline_.microphone_channel_index > 31 ||
+        timeline_.auto_delay_min_ms > timeline_.auto_delay_max_ms ||
+        timeline_.auto_delay_max_ms > 500 ||
+        timeline_.auto_delay_window_ms < 500 ||
+        timeline_.auto_delay_window_ms > 5000 ||
+        timeline_.auto_delay_update_ms < 100 ||
+        timeline_.auto_delay_update_ms > timeline_.auto_delay_window_ms ||
+        timeline_.auto_delay_min_correlation < 0.10F ||
+        timeline_.auto_delay_min_correlation > 0.95F ||
         timeline_.stats_hz == 0 || timeline_.stats_hz > 20) {
       throw std::invalid_argument("invalid preprocessor timeline configuration");
     }
@@ -713,6 +913,7 @@ class TimelineEngine {
     diagnostics_.aec_requested = aec_requested_;
     diagnostics_.aec_compiled = webrtc_aec3_compiled();
     diagnostics_.speexdsp_compiled = speexdsp_compiled();
+    diagnostics_.auto_delay_enabled = delay_estimator_.enabled();
     diagnostics_.degraded = aec_requested_ && !backend_;
     diagnostics_.state = !aec_requested_ ? AecRuntimeState::bypass
                          : backend_       ? AecRuntimeState::waiting_for_render
@@ -723,9 +924,15 @@ class TimelineEngine {
   PreprocessPushResult push(const AudioPacket& packet) {
     PreprocessPushResult result;
     const auto output_drops_before = diagnostics_.output_frames_dropped;
+    const bool invalid_microphone_channel =
+        packet.stream == AudioStreamKind::microphone &&
+        timeline_.microphone_channel_index >= 0 &&
+        static_cast<std::uint32_t>(timeline_.microphone_channel_index) >=
+            packet.format.channels;
     if (packet.stream == AudioStreamKind::processed || packet.format.sample_rate == 0 ||
         packet.format.channels == 0 || packet.samples.empty() ||
-        packet.samples.size() % packet.format.channels != 0) {
+        packet.samples.size() % packet.format.channels != 0 ||
+        invalid_microphone_channel) {
       Reset(PreprocessResetReason::invalid_packet);
       result.reset_required = true;
       result.reset_reason = PreprocessResetReason::invalid_packet;
@@ -772,6 +979,10 @@ class TimelineEngine {
     }
 
     auto& active = stream(packet.stream);
+    const auto channel_index =
+        packet.stream == AudioStreamKind::microphone
+            ? timeline_.microphone_channel_index
+            : -1;
     const auto packet_input_samples =
         packet.samples.size() / static_cast<std::size_t>(packet.format.channels);
     std::size_t provisional_record_begin{};
@@ -799,8 +1010,9 @@ class TimelineEngine {
     }
     auto resampled = provisional_record_count != 0
                          ? active.resampler.replace_provisional(
-                               packet, provisional_output_samples)
-                         : active.resampler.process(packet, active.clock.rate_hz());
+                               packet, provisional_output_samples, channel_index)
+                         : active.resampler.process(packet, active.clock.rate_hz(),
+                                                    channel_index);
     if (active.expected_next_grid_valid) {
       const auto error = start_grid - active.expected_next_grid;
       if (std::abs(error) > hard_resync_samples_) {
@@ -815,7 +1027,8 @@ class TimelineEngine {
         set_grid_anchor(restarted, packet, start_grid);
         update_metadata(restarted, packet);
         static_cast<void>(restarted.clock.update(packet, drift_window_100ns_));
-        resampled = restarted.resampler.process(packet, restarted.clock.rate_hz());
+        resampled = restarted.resampler.process(packet, restarted.clock.rate_hz(),
+                                                channel_index);
       }
     }
 
@@ -828,6 +1041,9 @@ class TimelineEngine {
     }
     if (resampled.failed) {
       ++diagnostics_.resampler_failures;
+      diagnostics_.last_resampler_error_code = resampled.error_code;
+      diagnostics_.last_resampler_input_expected = resampled.input_expected;
+      diagnostics_.last_resampler_input_consumed = resampled.input_consumed;
       pending_discontinuity_ = true;
       result.reset_required = true;
       result.reset_reason = PreprocessResetReason::resampler_error;
@@ -926,6 +1142,7 @@ class TimelineEngine {
     pending_discontinuity_ = true;
     previous_degraded_valid_ = false;
     backend_had_render_ = false;
+    delay_estimator_.reset();
     if (backend_) backend_->reset();
     ++diagnostics_.resets;
     diagnostics_.last_reset_reason = reason;
@@ -944,6 +1161,12 @@ class TimelineEngine {
     diagnostics_.microphone_rate_hz = 0.0;
     diagnostics_.render_rate_hz = 0.0;
     diagnostics_.relative_drift_ppm = 0.0;
+    diagnostics_.auto_delay_enabled = delay_estimator_.enabled();
+    diagnostics_.auto_delay_available = false;
+    diagnostics_.auto_delay_ms = 0.0;
+    diagnostics_.auto_delay_confidence = 0.0;
+    diagnostics_.auto_delay_updates = 0;
+    diagnostics_.auto_delay_rejections = 0;
     diagnostics_.stream_delay_ms = 0;
     diagnostics_.microphone_buffered_samples = 0;
     diagnostics_.render_buffered_samples = 0;
@@ -954,6 +1177,12 @@ class TimelineEngine {
 
   [[nodiscard]] PreprocessDiagnostics diagnostics() const {
     auto value = diagnostics_;
+    value.auto_delay_enabled = delay_estimator_.enabled();
+    value.auto_delay_available = delay_estimator_.available();
+    value.auto_delay_ms = delay_estimator_.delay_ms();
+    value.auto_delay_confidence = delay_estimator_.confidence();
+    value.auto_delay_updates = delay_estimator_.updates();
+    value.auto_delay_rejections = delay_estimator_.rejections();
     value.output_frames_ready = output_.size();
     value.microphone_buffered_samples = microphone_.buffer.size();
     value.render_buffered_samples = render_.buffer.size();
@@ -1062,10 +1291,15 @@ class TimelineEngine {
     // (t_process - t_capture) is approximately zero. Packet arrival latency
     // is deliberately excluded: FIFO backlog and asymmetric delivery change
     // arrival time without changing the hardware relation and would feed AEC3
-    // a false delay hint. A measured installation-specific correction remains
-    // available through delay_offset_ms.
-    return static_cast<int>(
-        std::clamp<std::int64_t>(timeline_.delay_offset_ms, 0, 500));
+    // a false delay hint. The acoustic/system component is estimated from the
+    // aligned raw signals; delay_offset_ms remains an installation-specific
+    // correction on top of that estimate.
+    const auto automatic = delay_estimator_.available()
+                               ? static_cast<std::int64_t>(
+                                     std::llround(delay_estimator_.delay_ms()))
+                               : 0;
+    return static_cast<int>(std::clamp<std::int64_t>(
+        automatic + timeline_.delay_offset_ms, 0, 500));
   }
 
   void produce_frames() {
@@ -1102,6 +1336,15 @@ class TimelineEngine {
       diagnostics_.drift_out_of_range =
           diagnostics_.drift_estimate_valid &&
           std::abs(diagnostics_.relative_drift_ppm) > timeline_.max_drift_ppm;
+      delay_estimator_.observe(
+          render, capture,
+          render_usable && render_info.contains_real &&
+              !render_info.contains_synthetic);
+      diagnostics_.auto_delay_available = delay_estimator_.available();
+      diagnostics_.auto_delay_ms = delay_estimator_.delay_ms();
+      diagnostics_.auto_delay_confidence = delay_estimator_.confidence();
+      diagnostics_.auto_delay_updates = delay_estimator_.updates();
+      diagnostics_.auto_delay_rejections = delay_estimator_.rejections();
       const int delay_ms = stream_delay_ms();
       std::array<float, kFrameSamples> processed = capture;
       bool aec_applied{};
@@ -1209,11 +1452,18 @@ class TimelineEngine {
     diagnostics_.render_rate_hz = render_.clock.rate_hz();
     diagnostics_.drift_estimate_valid =
         microphone_.clock.valid() && render_.clock.valid() &&
-        diagnostics_.microphone_rate_hz > 0.0;
+        diagnostics_.microphone_rate_hz > 0.0 &&
+        diagnostics_.render_rate_hz > 0.0 &&
+        microphone_.clock.nominal_rate_hz() > 0.0 &&
+        render_.clock.nominal_rate_hz() > 0.0;
     if (diagnostics_.drift_estimate_valid) {
+      const auto microphone_rate_ratio =
+          diagnostics_.microphone_rate_hz /
+          microphone_.clock.nominal_rate_hz();
+      const auto render_rate_ratio =
+          diagnostics_.render_rate_hz / render_.clock.nominal_rate_hz();
       diagnostics_.relative_drift_ppm =
-          (diagnostics_.render_rate_hz / diagnostics_.microphone_rate_hz - 1.0) *
-          1'000'000.0;
+          (render_rate_ratio / microphone_rate_ratio - 1.0) * 1'000'000.0;
     } else {
       // Do not reuse a previous window after the estimator rejects an anchor.
       // Nominal-rate processing continues while a fresh window is collected.
@@ -1253,6 +1503,7 @@ class TimelineEngine {
   AudioConfig audio_;
   PreprocessorTimelineConfig timeline_;
   bool aec_requested_{};
+  AcousticDelayEstimator delay_estimator_;
   std::unique_ptr<AecBackend> backend_;
   StreamState microphone_;
   StreamState render_;
@@ -1319,6 +1570,13 @@ PreprocessorTimelineConfig make_preprocessor_timeline_config(
   timeline.hard_resync_error_ms = config.hard_resync_error_ms;
   timeline.max_drift_ppm = static_cast<double>(config.max_drift_ppm);
   timeline.delay_offset_ms = config.delay_offset_ms;
+  timeline.microphone_channel_index = config.microphone_channel_index;
+  timeline.auto_delay_enabled = config.auto_delay_enabled;
+  timeline.auto_delay_min_ms = config.auto_delay_min_ms;
+  timeline.auto_delay_max_ms = config.auto_delay_max_ms;
+  timeline.auto_delay_window_ms = config.auto_delay_window_ms;
+  timeline.auto_delay_update_ms = config.auto_delay_update_ms;
+  timeline.auto_delay_min_correlation = config.auto_delay_min_correlation;
   timeline.high_pass_filter = config.high_pass_filter;
   timeline.noise_suppression = config.noise_suppression;
   timeline.gain_control = config.gain_control;

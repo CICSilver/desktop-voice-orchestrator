@@ -32,6 +32,9 @@ class DebugServer {
   [[nodiscard]] std::string token() const;
   [[nodiscard]] std::string url() const;
   [[nodiscard]] std::uint64_t dropped() const { return dropped_.load(std::memory_order_acquire); }
+  [[nodiscard]] std::uint64_t slow_client_dropped() const {
+    return slow_client_dropped_.load(std::memory_order_acquire);
+  }
 
  private:
   struct Outbound {
@@ -56,6 +59,7 @@ class DebugServer {
   std::jthread acceptor_;
   std::mutex publish_mutex_;
   std::atomic<std::uint64_t> dropped_{};
+  std::atomic<std::uint64_t> slow_client_dropped_{};
 };
 
 }  // namespace dvo

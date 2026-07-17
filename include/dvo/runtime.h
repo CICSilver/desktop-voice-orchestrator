@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -47,10 +48,31 @@ class VoiceFrontendRuntime {
 
  private:
   struct SignalSummary { float min{}, max{}, rms{}; };
+  struct TelemetrySample {
+    std::uint64_t sample{};
+    SignalSummary microphone;
+    SignalSummary loopback;
+    SignalSummary processed;
+    bool vad{};
+    bool replay{};
+    std::size_t audio_queue_depth{};
+    std::size_t asr_queue_depth{};
+    std::size_t asr_pending_requests{};
+    std::size_t asr_pending_audio_samples{};
+    StreamingRecognizerState asr_state{StreamingRecognizerState::unavailable};
+    std::size_t assembly_outstanding{};
+    std::size_t action_queue_depth{};
+    PreprocessDiagnostics aec;
+    std::uint64_t debug_dropped{};
+    std::uint64_t audio_queue_drops{};
+    std::uint64_t audio_reset_backlog_drops{};
+  };
   void initialize_pipeline();
   void reset_pipeline(bool discontinuity, bool reset_preprocessor = true);
   void start_processing();
   void stop_processing();
+  void telemetry_loop(std::stop_token stop);
+  void publish_telemetry(TelemetrySample sample);
   void start_captures();
   void stop_captures();
   void reset_audio_queues();
@@ -86,7 +108,7 @@ class VoiceFrontendRuntime {
   [[nodiscard]] nlohmann::json session_list() const;
   [[nodiscard]] nlohmann::json metrics_json() const;
   [[nodiscard]] PreprocessDiagnostics preprocess_diagnostics_snapshot() const;
-  [[nodiscard]] static SignalSummary summarize(const std::vector<float>& values);
+  [[nodiscard]] static SignalSummary summarize(std::span<const float> values);
   [[nodiscard]] static SignalSummary summarize(const NormalizedFrame& frame);
 
   mutable std::mutex config_mutex_;
@@ -154,10 +176,20 @@ class VoiceFrontendRuntime {
   SessionRecorder recorder_;
   DebugServer debug_;
   std::jthread processing_thread_;
+  std::unique_ptr<SpscQueue<TelemetrySample>> telemetry_queue_;
+  std::jthread telemetry_thread_;
   std::atomic<bool> running_{};
   std::atomic<bool> replay_mode_{};
+  std::atomic<bool> telemetry_enabled_{};
   std::string runtime_session_id_;
   std::mutex replay_callback_mutex_;
+
+  // Enabled only by run_benchmark(). Events are copied here before the debug
+  // broker takes ownership so a headless benchmark can compare derived output
+  // without depending on a WebSocket client or diagnostic recording.
+  std::atomic<bool> benchmark_capture_enabled_{};
+  mutable std::mutex benchmark_events_mutex_;
+  std::vector<nlohmann::json> benchmark_events_;
 
   mutable std::mutex capture_events_mutex_;
   std::deque<std::pair<std::string, std::string>> capture_events_;
@@ -179,6 +211,7 @@ class VoiceFrontendRuntime {
   std::atomic<std::uint64_t> command_rejections_{};
   std::atomic<std::uint64_t> actions_succeeded_{};
   std::atomic<std::uint64_t> actions_failed_{};
+  std::atomic<std::uint64_t> telemetry_queue_drops_{};
   StreamingRecognizerState last_published_asr_state_{
       StreamingRecognizerState::unavailable};
   std::uint64_t next_telemetry_sample_{};

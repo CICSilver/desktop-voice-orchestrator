@@ -26,12 +26,66 @@ TEST_CASE("checked-in default configuration is valid") {
   REQUIRE(config.commands.action_timeout_ms == 2000);
   REQUIRE(config.commands.connectors ==
           std::vector<std::string>{"然后", "再", "接着", "并且"});
+  REQUIRE(config.aec.microphone_channel_index == 0);
+  REQUIRE(config.aec.auto_delay_enabled);
+  REQUIRE(config.aec.auto_delay_min_ms == 0);
+  REQUIRE(config.aec.auto_delay_max_ms == 250);
+  REQUIRE(config.aec.auto_delay_window_ms == 1000);
+  REQUIRE(config.aec.auto_delay_update_ms == 500);
+  REQUIRE(config.aec.auto_delay_min_correlation == Catch::Approx(0.35F));
   REQUIRE(store.validate(config).ok());
 
   auto unsafe = config;
   unsafe.asr.exact_final_redecode = false;
   const auto validation = store.validate(unsafe);
   REQUIRE_FALSE(validation.ok());
+
+  unsafe = config;
+  unsafe.web.bind = "localhost";
+  REQUIRE_FALSE(store.validate(unsafe).ok());
+}
+
+TEST_CASE("AEC calibration patch is validated exposed and persisted") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  const auto temp = temporary_directory();
+  const auto local = temp / "config/local.toml";
+  dvo::ConfigStore store(root / "config/default.toml", local, root);
+  auto config = store.load();
+
+  auto result = store.apply_patch(
+      config,
+      {{"aec",
+        {{"microphone_channel_index", -1},
+         {"delay_offset_ms", 13},
+         {"auto_delay_enabled", true},
+         {"auto_delay_min_ms", 30},
+         {"auto_delay_max_ms", 180},
+         {"auto_delay_window_ms", 1200},
+         {"auto_delay_update_ms", 300},
+         {"auto_delay_min_correlation", 0.52}}}});
+  REQUIRE(result.ok());
+  const auto public_config = store.to_public_json(config);
+  CHECK(public_config["aec"]["microphone_channel_index"] == -1);
+  CHECK(public_config["aec"]["auto_delay_min_correlation"] ==
+        Catch::Approx(0.52));
+  const auto manifest = store.to_manifest_json(config);
+  CHECK(manifest["aec"]["auto_delay_max_ms"] == 180);
+
+  store.save_overrides(config);
+  const auto reloaded = store.load();
+  CHECK(reloaded.aec.microphone_channel_index == -1);
+  CHECK(reloaded.aec.delay_offset_ms == 13);
+  CHECK(reloaded.aec.auto_delay_min_ms == 30);
+  CHECK(reloaded.aec.auto_delay_window_ms == 1200);
+
+  const auto before = reloaded;
+  auto invalid = reloaded;
+  result = store.apply_patch(invalid,
+                             {{"aec", {{"auto_delay_min_ms", 200},
+                                        {"auto_delay_max_ms", 100}}}});
+  REQUIRE_FALSE(result.ok());
+  CHECK(invalid.aec.auto_delay_min_ms == before.aec.auto_delay_min_ms);
+  std::filesystem::remove_all(temp);
 }
 
 TEST_CASE("command grammar patch uses nested phrases and survives overlay reload") {

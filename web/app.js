@@ -147,6 +147,8 @@ function handle(message) {
 function updateAec(aec) {
   $('aec-state').textContent = aec.state || aec.status || (aec.enabled === false ? '禁用' : '运行中');
   $('aec-delay').textContent = aec.external_delay_ms == null ? '—' : `${Number(aec.external_delay_ms).toFixed(1)} ms`;
+  $('aec-auto-delay').textContent = aec.auto_delay_ms == null ? '—' : `${Number(aec.auto_delay_ms).toFixed(1)} ms`;
+  $('aec-delay-confidence').textContent = aec.auto_delay_confidence == null ? '—' : Number(aec.auto_delay_confidence).toFixed(3);
   $('aec-drift').textContent = aec.drift_ppm == null ? '—' : `${Number(aec.drift_ppm).toFixed(1)} ppm`;
   $('aec-erle').textContent = aec.erle_db == null ? '—' : `${Number(aec.erle_db).toFixed(1)} dB`;
   $('aec-fifo').textContent = aec.render_fifo_ms == null ? '—' : `${Number(aec.render_fifo_ms).toFixed(0)} ms`;

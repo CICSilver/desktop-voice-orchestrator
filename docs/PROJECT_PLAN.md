@@ -132,14 +132,15 @@
 | 模块 | 建议语言 | 职责 |
 | --- | --- | --- |
 | `audio_frontend` | C++ | WASAPI、loopback、同步、AEC3、重采样、环形缓冲区 |
-| `wakeword` | C++/Python | 开放词表 KWS、关键词配置、VAD、唤醒词位置和置信度 |
-| `asr` | Python/C++ | 本地 ASR 推理、词时间戳和文本规范化 |
-| `planner` | Python | 命令切分、别名解析、动作结构生成和校验 |
-| `executor` | Python/C++ | 严格串行执行、超时、取消、日志和失败策略 |
-| `windows_adapters` | C++/Python | GSMTC、ShellExecute、UI Automation 等系统适配 |
-| `benchmark` | Python | 录音集重放、指标计算和回归报告 |
+| `wakeword` | C++ | 开放词表 KWS、关键词配置、VAD、唤醒词位置和命中轨迹 |
+| `asr` | C++ | 本地流式 ASR 推理和文本规范化 |
+| `planner` | C++ | 命令切分、别名解析、动作结构生成和校验 |
+| `executor` | C++ | 严格串行执行、超时、取消、日志和失败策略 |
+| `windows_adapters` | C++ | GSMTC、Core Audio、ShellExecute、UI Automation 等系统适配 |
+| `benchmark` | C++ | 录音集重放、指标计算和回归报告 |
 
-初期允许 C++ 音频前端以本地进程或动态库方式对 Python 暴露稳定接口；接口稳定后再决定是否合并为单一可执行程序。
+当前实现统一使用 C++20，并由单一可执行程序提供 live、replay 和 benchmark 入口；不引入
+Python 服务或第二套推理运行时。
 
 ## 6. 动作模型
 

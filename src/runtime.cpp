@@ -1,5 +1,7 @@
 #include "dvo/runtime.h"
 
+#include "dvo/benchmark_report.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -92,13 +94,28 @@ nlohmann::json preprocess_json(const PreprocessDiagnostics& diagnostics) {
           {"drift_estimate_valid", diagnostics.drift_estimate_valid},
           {"drift_out_of_range", diagnostics.drift_out_of_range},
           {"external_delay_ms", diagnostics.stream_delay_ms},
+          {"auto_delay_enabled", diagnostics.auto_delay_enabled},
+          {"auto_delay_available", diagnostics.auto_delay_available},
+          {"auto_delay_ms", diagnostics.auto_delay_available
+                                ? nlohmann::json(diagnostics.auto_delay_ms)
+                                : nlohmann::json(nullptr)},
+          {"auto_delay_confidence", diagnostics.auto_delay_available
+                                        ? nlohmann::json(diagnostics.auto_delay_confidence)
+                                        : nlohmann::json(nullptr)},
+          {"auto_delay_updates", diagnostics.auto_delay_updates},
+          {"auto_delay_rejections", diagnostics.auto_delay_rejections},
            {"resampler", {{"speex_compiled", diagnostics.speexdsp_compiled},
                            {"microphone_speex", diagnostics.microphone_resampler_speex},
                            {"render_speex", diagnostics.render_resampler_speex},
                            {"render_rate_updates", diagnostics.render_resampler_rate_updates},
                            {"synthetic_samples_replaced",
                             diagnostics.render_synthetic_samples_replaced},
-                           {"failures", diagnostics.resampler_failures}}},
+                           {"failures", diagnostics.resampler_failures},
+                           {"last_error_code", diagnostics.last_resampler_error_code},
+                           {"last_input_expected",
+                            diagnostics.last_resampler_input_expected},
+                           {"last_input_consumed",
+                            diagnostics.last_resampler_input_consumed}}},
           {"render_fifo_ms", diagnostics.render_buffered_samples * 1000.0 /
                                  static_cast<double>(kProcessingSampleRate)},
           {"render_target_ms", diagnostics.target_render_buffer_samples * 1000.0 /
@@ -178,6 +195,9 @@ void VoiceFrontendRuntime::initialize_pipeline() {
   pending_recognition_starts_.clear();
   recognition_generation_.fetch_add(1, std::memory_order_acq_rel);
   reset_audio_queues();
+  telemetry_queue_ = std::make_unique<SpscQueue<TelemetrySample>>(128);
+  telemetry_queue_drops_.store(0, std::memory_order_release);
+  telemetry_enabled_.store(false, std::memory_order_release);
   next_telemetry_sample_ = 0;
 }
 
@@ -199,6 +219,7 @@ void VoiceFrontendRuntime::start_live(bool enable_web) {
   running_.store(true, std::memory_order_release);
   if (enable_web && config_.web.enabled) {
     debug_.start(config_.web, [this](const auto& command) { return handle_command(command); });
+    telemetry_enabled_.store(true, std::memory_order_release);
   }
   start_processing();
   start_captures();
@@ -219,6 +240,7 @@ void VoiceFrontendRuntime::start_replay(const std::filesystem::path& session, bo
   running_.store(true, std::memory_order_release);
   if (enable_web && config_.web.enabled) {
     debug_.start(config_.web, [this](const auto& command) { return handle_command(command); });
+    telemetry_enabled_.store(true, std::memory_order_release);
   }
   start_processing();
   replay_ = std::make_unique<ReplayController>(
@@ -236,6 +258,15 @@ void VoiceFrontendRuntime::start_replay(const std::filesystem::path& session, bo
 }
 
 nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& session) {
+  {
+    std::scoped_lock lock(benchmark_events_mutex_);
+    benchmark_events_.clear();
+  }
+  benchmark_capture_enabled_.store(true, std::memory_order_release);
+  struct CaptureGuard {
+    std::atomic<bool>& enabled;
+    ~CaptureGuard() { enabled.store(false, std::memory_order_release); }
+  } capture_guard{benchmark_capture_enabled_};
   const auto started = std::chrono::steady_clock::now();
   const auto deadline = started + std::chrono::minutes(5);
   const auto remaining = [&] {
@@ -244,7 +275,12 @@ nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& 
                ? std::chrono::milliseconds{0}
                : std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
   };
-  start_replay(session, false, 0.0);
+  try {
+    start_replay(session, false, 0.0);
+  } catch (...) {
+    stop();
+    throw;
+  }
   const bool replay_finished = replay_ && replay_->wait_until_finished(remaining());
 
   bool pipeline_idle{};
@@ -287,18 +323,79 @@ nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& 
                                                 actions_idle)},
                                {"active_provisional_streams",
                                 active_recognizers_.size()}};
+  benchmark_capture_enabled_.store(false, std::memory_order_release);
+  std::vector<nlohmann::json> replayed_events;
+  {
+    std::scoped_lock lock(benchmark_events_mutex_);
+    replayed_events = benchmark_events_;
+  }
+  std::vector<std::string> event_read_errors;
+  const auto recorded_events =
+      read_benchmark_events(session / "events.ndjson", &event_read_errors);
+  metrics["comparison"] = build_benchmark_comparison(
+      recorded_events, replayed_events, kFrameSamples);
+  metrics["comparison"]["historical_events_available"] =
+      std::filesystem::exists(session / "events.ndjson");
+  metrics["comparison"]["event_read_errors"] = event_read_errors;
   stop();
   return metrics;
 }
 
 void VoiceFrontendRuntime::start_processing() {
+  telemetry_thread_ =
+      std::jthread([this](std::stop_token stop) { telemetry_loop(stop); });
   processing_thread_ = std::jthread([this](std::stop_token stop) { processing_loop(stop); });
 }
 
 void VoiceFrontendRuntime::stop_processing() {
-  if (!processing_thread_.joinable()) return;
-  processing_thread_.request_stop();
-  processing_thread_.join();
+  if (processing_thread_.joinable()) {
+    processing_thread_.request_stop();
+    processing_thread_.join();
+  }
+  if (telemetry_thread_.joinable()) {
+    telemetry_thread_.request_stop();
+    telemetry_thread_.join();
+  }
+}
+
+void VoiceFrontendRuntime::telemetry_loop(std::stop_token stop) {
+  while (!stop.stop_requested() ||
+         (telemetry_queue_ && telemetry_queue_->size() != 0)) {
+    TelemetrySample sample;
+    if (!telemetry_queue_ || !telemetry_queue_->try_pop(sample)) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(2));
+      continue;
+    }
+    publish_telemetry(std::move(sample));
+  }
+}
+
+void VoiceFrontendRuntime::publish_telemetry(TelemetrySample sample) {
+  const auto summary_json = [](const SignalSummary& summary) {
+    return nlohmann::json{{"min", summary.min}, {"max", summary.max},
+                          {"rms", summary.rms}};
+  };
+  emit_event(
+      "telemetry",
+      {{"sample", sample.sample},
+       {"microphone", summary_json(sample.microphone)},
+       {"loopback", summary_json(sample.loopback)},
+       {"processed", summary_json(sample.processed)},
+       {"vad", sample.vad},
+       {"queue_depth", sample.audio_queue_depth},
+       {"asr_queue_depth", sample.asr_queue_depth},
+       {"asr_pending_requests", sample.asr_pending_requests},
+       {"asr_pending_audio_samples", sample.asr_pending_audio_samples},
+       {"asr_state", to_string(sample.asr_state)},
+       {"assembly_outstanding", sample.assembly_outstanding},
+       {"action_queue_depth", sample.action_queue_depth},
+       {"aec", preprocess_json(sample.aec)},
+       {"telemetry_dropped",
+        sample.debug_dropped +
+            telemetry_queue_drops_.load(std::memory_order_relaxed)},
+       {"audio_queue_drops", sample.audio_queue_drops},
+       {"audio_reset_backlog_drops", sample.audio_reset_backlog_drops}},
+      sample.sample, sample.replay ? "replay" : "live");
 }
 
 void VoiceFrontendRuntime::start_captures() {
@@ -330,6 +427,7 @@ void VoiceFrontendRuntime::stop_captures() {
 
 void VoiceFrontendRuntime::stop() {
   if (!running_.exchange(false, std::memory_order_acq_rel) && !processing_thread_.joinable()) return;
+  telemetry_enabled_.store(false, std::memory_order_release);
   // Stop accepting control requests and wait for any admitted HTTP command
   // before replay/config/audio objects are destroyed.
   debug_.stop();
@@ -600,28 +698,35 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
     cancel_recognition(rejection.utterance_id, rejection.reason);
   }
 
-  if (frame.first_sample >= next_telemetry_sample_) {
-    const auto processed_summary = summarize(frame);
-    emit_event("telemetry",
-               {{"sample", frame.first_sample},
-                {"microphone", {{"min", microphone.min}, {"max", microphone.max}, {"rms", microphone.rms}}},
-                {"loopback", {{"min", loopback.min}, {"max", loopback.max}, {"rms", loopback.rms}}},
-                {"processed", {{"min", processed_summary.min}, {"max", processed_summary.max}, {"rms", processed_summary.rms}}},
-                {"vad", vad_update.speech}, {"queue_depth", microphone_queue_->size()},
-                {"asr_queue_depth", asr_ ? asr_->queue_depth() : 0},
-                {"asr_pending_requests", asr_ ? asr_->pending_requests() : 0},
-                {"asr_pending_audio_samples", asr_ ? asr_->pending_audio_samples() : 0},
-                {"asr_state", asr_ ? to_string(asr_->state()) : "unavailable"},
-                {"assembly_outstanding", candidate_assembler_
-                                             ? candidate_assembler_->outstanding()
-                                             : 0},
-                {"action_queue_depth", action_executor_ ? action_executor_->queue_size() : 0},
-                {"aec", preprocess_json(preprocessor_->Diagnostics())},
-                {"telemetry_dropped", debug_.dropped()},
-                {"audio_queue_drops", audio_queue_drops_.load()},
-                {"audio_reset_backlog_drops",
-                 audio_reset_backlog_drops_.load()}},
-               frame.first_sample, replay_mode_ ? "replay" : "live");
+  if (telemetry_enabled_.load(std::memory_order_relaxed) &&
+      frame.first_sample >= next_telemetry_sample_) {
+    TelemetrySample telemetry;
+    telemetry.sample = frame.first_sample;
+    telemetry.microphone = microphone;
+    telemetry.loopback = loopback;
+    telemetry.processed = summarize(frame);
+    telemetry.vad = vad_update.speech;
+    telemetry.replay = replay_mode_.load(std::memory_order_relaxed);
+    telemetry.audio_queue_depth = microphone_queue_->size();
+    if (asr_) {
+      telemetry.asr_queue_depth = asr_->queue_depth();
+      telemetry.asr_pending_requests = asr_->pending_requests();
+      telemetry.asr_pending_audio_samples = asr_->pending_audio_samples();
+      telemetry.asr_state = asr_->state();
+    }
+    telemetry.assembly_outstanding =
+        candidate_assembler_ ? candidate_assembler_->outstanding() : 0;
+    telemetry.action_queue_depth =
+        action_executor_ ? action_executor_->queue_size() : 0;
+    telemetry.aec = preprocessor_->Diagnostics();
+    telemetry.debug_dropped = debug_.dropped();
+    telemetry.audio_queue_drops =
+        audio_queue_drops_.load(std::memory_order_relaxed);
+    telemetry.audio_reset_backlog_drops =
+        audio_reset_backlog_drops_.load(std::memory_order_relaxed);
+    if (!telemetry_queue_ || !telemetry_queue_->try_push(std::move(telemetry))) {
+      telemetry_queue_drops_.fetch_add(1, std::memory_order_relaxed);
+    }
     const auto interval = std::max<std::uint64_t>(kFrameSamples,
         kProcessingSampleRate / std::max<std::uint32_t>(1, config_.web.telemetry_hz));
     next_telemetry_sample_ = frame.first_sample + interval;
@@ -859,6 +964,10 @@ void VoiceFrontendRuntime::begin_recognition(const UtteranceStart& start) {
   pending.chunk_samples = std::max<std::size_t>(
       kFrameSamples, static_cast<std::size_t>(config_.asr.feed_chunk_ms) *
                          kProcessingSampleRate / 1000);
+  const auto pending_limit =
+      static_cast<std::size_t>(config_.asr.max_pending_audio_ms) *
+      kProcessingSampleRate / 1000;
+  pending.pending.reserve(std::min(pending_limit, pending.chunk_samples * 2));
   pending.command_config_revision = command_snapshot.config_revision;
   pending.left_span_count = start.provisional_left_spans.size();
   pending_recognition_starts_.insert_or_assign(start.utterance_id, pending);
@@ -1257,6 +1366,16 @@ void VoiceFrontendRuntime::reset_pipeline(bool discontinuity, bool reset_preproc
 
 void VoiceFrontendRuntime::emit_event(std::string type, nlohmann::json payload,
                                       std::uint64_t timestamp_sample, std::string source) {
+  if (type != "telemetry" &&
+      benchmark_capture_enabled_.load(std::memory_order_acquire)) {
+    std::scoped_lock lock(benchmark_events_mutex_);
+    if (benchmark_capture_enabled_.load(std::memory_order_relaxed)) {
+      benchmark_events_.push_back({{"type", type},
+                                   {"timestamp_sample", timestamp_sample},
+                                   {"source", source},
+                                   {"payload", payload}});
+    }
+  }
   if (recorder_.active() && type != "telemetry") {
     recorder_.try_enqueue(RecordEvent{{{"type", type}, {"timestamp_sample", timestamp_sample},
                                        {"source", source}, {"payload", payload}}});
@@ -1441,6 +1560,13 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         active.aec.max_drift_ppm != current.aec.max_drift_ppm ||
         active.aec.hard_resync_error_ms != current.aec.hard_resync_error_ms ||
         active.aec.delay_offset_ms != current.aec.delay_offset_ms ||
+        active.aec.microphone_channel_index != current.aec.microphone_channel_index ||
+        active.aec.auto_delay_enabled != current.aec.auto_delay_enabled ||
+        active.aec.auto_delay_min_ms != current.aec.auto_delay_min_ms ||
+        active.aec.auto_delay_max_ms != current.aec.auto_delay_max_ms ||
+        active.aec.auto_delay_window_ms != current.aec.auto_delay_window_ms ||
+        active.aec.auto_delay_update_ms != current.aec.auto_delay_update_ms ||
+        active.aec.auto_delay_min_correlation != current.aec.auto_delay_min_correlation ||
         active.aec.stats_hz != current.aec.stats_hz;
     const bool kws_changed = active.kws.threshold != current.kws.threshold ||
                              active.kws.boosting_score != current.kws.boosting_score;
@@ -1629,7 +1755,9 @@ nlohmann::json VoiceFrontendRuntime::metrics_json() const {
           {"kws_hits", kws_hits_.load()}, {"candidates", candidates_.load()},
           {"rejections", rejections_.load()}, {"audio_queue_drops", audio_queue_drops_.load()},
           {"audio_reset_backlog_drops", audio_reset_backlog_drops_.load()},
-          {"discontinuities", discontinuities_.load()}, {"telemetry_dropped", debug_.dropped()},
+          {"discontinuities", discontinuities_.load()},
+          {"telemetry_dropped", debug_.dropped() +
+                                    telemetry_queue_drops_.load()},
           {"asr_partials", asr_partials_.load()}, {"asr_finals", asr_finals_.load()},
           {"asr_dropped", asr_dropped_.load()},
           {"assembly_dropped", assembly_dropped_.load()},
@@ -1666,7 +1794,8 @@ PreprocessDiagnostics VoiceFrontendRuntime::preprocess_diagnostics_snapshot() co
   return preprocessor_ ? preprocessor_->Diagnostics() : PreprocessDiagnostics{};
 }
 
-VoiceFrontendRuntime::SignalSummary VoiceFrontendRuntime::summarize(const std::vector<float>& values) {
+VoiceFrontendRuntime::SignalSummary VoiceFrontendRuntime::summarize(
+    std::span<const float> values) {
   if (values.empty()) return {};
   SignalSummary result{values.front(), values.front(), 0.0F};
   double squares{};
@@ -1680,7 +1809,7 @@ VoiceFrontendRuntime::SignalSummary VoiceFrontendRuntime::summarize(const std::v
 }
 
 VoiceFrontendRuntime::SignalSummary VoiceFrontendRuntime::summarize(const NormalizedFrame& frame) {
-  return summarize(std::vector<float>(frame.samples.begin(), frame.samples.end()));
+  return summarize(frame.samples);
 }
 
 }  // namespace dvo

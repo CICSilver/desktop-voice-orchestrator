@@ -104,6 +104,11 @@ struct DebugServer::SharedState {
   std::string token;
   std::string session_id;
   std::atomic<bool> stopping{};
+  std::atomic<std::uint16_t> bound_port{};
+  std::mutex startup_mutex;
+  std::condition_variable startup_cv;
+  bool startup_done{};
+  std::string startup_error;
   std::mutex commands_mutex;
   std::condition_variable commands_cv;
   std::size_t active_commands{};
@@ -127,6 +132,7 @@ void DebugServer::start(const WebConfig& config, CommandHandler commands) {
     Outbound stale;
     while (outbound_.try_pop(stale)) {}
     dropped_.store(0, std::memory_order_release);
+    slow_client_dropped_.store(0, std::memory_order_release);
   }
   auto state = std::make_shared<SharedState>();
   state->config = config;
@@ -135,10 +141,25 @@ void DebugServer::start(const WebConfig& config, CommandHandler commands) {
   state->session_id = random_token();
   {
     std::scoped_lock state_lock(state_mutex_);
-    state_ = std::move(state);
+    state_ = state;
   }
   broker_ = std::jthread([this](std::stop_token stop) { broker_loop(stop); });
   acceptor_ = std::jthread([this](std::stop_token stop) { accept_loop(stop); });
+  {
+    std::unique_lock startup_lock(state->startup_mutex);
+    if (!state->startup_cv.wait_for(startup_lock, std::chrono::seconds(3),
+                                    [&] { return state->startup_done; })) {
+      startup_lock.unlock();
+      stop();
+      throw std::runtime_error("debug server startup timed out");
+    }
+    if (!state->startup_error.empty()) {
+      const auto error = state->startup_error;
+      startup_lock.unlock();
+      stop();
+      throw std::runtime_error("debug server startup failed: " + error);
+    }
+  }
 }
 
 void DebugServer::stop() {
@@ -208,7 +229,8 @@ std::string DebugServer::token() const {
 std::string DebugServer::url() const {
   std::scoped_lock state_lock(state_mutex_);
   if (!state_) return {};
-  return "http://" + state_->config.bind + ':' + std::to_string(state_->config.port) +
+  return "http://" + state_->config.bind + ':' +
+         std::to_string(state_->bound_port.load(std::memory_order_acquire)) +
          "/?token=" + state_->token;
 }
 
@@ -253,6 +275,7 @@ void DebugServer::broker_loop(std::stop_token stop) {
           subscriber->queue.pop_front();
           ++subscriber->dropped;
           dropped_.fetch_add(1, std::memory_order_relaxed);
+          slow_client_dropped_.fetch_add(1, std::memory_order_relaxed);
         }
         subscriber->queue.push_back(envelope);
         subscriber->cv.notify_one();
@@ -270,8 +293,28 @@ void DebugServer::accept_loop(std::stop_token stop) {
   if (!state) return;
   try {
     asio::io_context io;
-    tcp::acceptor acceptor(io, {asio::ip::make_address(state->config.bind), state->config.port});
+    const tcp::endpoint endpoint{asio::ip::make_address(state->config.bind),
+                                 state->config.port};
+    tcp::acceptor acceptor(io);
+    acceptor.open(endpoint.protocol());
+#if defined(_WIN32)
+    const BOOL exclusive = TRUE;
+    if (::setsockopt(acceptor.native_handle(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                     reinterpret_cast<const char*>(&exclusive),
+                     sizeof(exclusive)) == SOCKET_ERROR) {
+      throw std::runtime_error("cannot make debug server port exclusive");
+    }
+#endif
+    acceptor.bind(endpoint);
+    acceptor.listen(asio::socket_base::max_listen_connections);
     acceptor.non_blocking(true);
+    state->bound_port.store(acceptor.local_endpoint().port(),
+                            std::memory_order_release);
+    {
+      std::scoped_lock startup_lock(state->startup_mutex);
+      state->startup_done = true;
+      state->startup_cv.notify_all();
+    }
     while (!stop.stop_requested() && !state->stopping.load()) {
       beast::error_code error;
       tcp::socket socket(io);
@@ -301,7 +344,8 @@ void DebugServer::accept_loop(std::stop_token stop) {
           if (websocket::is_upgrade(request) && request_path == "/ws") {
             const auto origin = request.find(http::field::origin);
             const auto expected = "http://" + state->config.bind + ':' +
-                                  std::to_string(state->config.port);
+                                  std::to_string(state->bound_port.load(
+                                      std::memory_order_acquire));
             if (origin == request.end() || origin->value() != expected) {
               throw std::runtime_error("WebSocket origin rejected");
             }
@@ -388,7 +432,12 @@ void DebugServer::accept_loop(std::stop_token stop) {
       }).detach();
     }
   } catch (const std::exception& e) {
-    (void)e;
+    std::scoped_lock startup_lock(state->startup_mutex);
+    if (!state->startup_done) {
+      state->startup_error = e.what();
+      state->startup_done = true;
+      state->startup_cv.notify_all();
+    }
   }
 }
 

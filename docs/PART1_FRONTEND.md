@@ -6,7 +6,7 @@
 ## 已实现范围
 
 - 两个独立的 WASAPI shared-mode、event-driven 采集线程：麦克风与 render endpoint loopback。
-- `IAudioPreprocessor` 接口及 `BypassPreprocessor`：通道混合、流式线性重采样、16 kHz 单声道、10 ms 定帧；AEC 尚未实现。
+- `IAudioPreprocessor` 接口及 `BypassPreprocessor`：第一阶段完成通道混合、流式线性重采样、16 kHz 单声道、10 ms 定帧；第二阶段已增加 `WebRtcAec3Preprocessor`。
 - 绝对 `uint64_t` 样本时钟、QPC 映射和 20 秒覆盖式环形缓冲。
 - sherpa-onnx v1.13.2 KWS 与 `silero_vad.int8.onnx`；KWS 不受 VAD 门控。
 - prefix、suffix、embedded 状态机。候选源区间与扩展唤醒区间零重叠；embedded PCM 中插入配置化静音并保留左右映射。
@@ -92,5 +92,5 @@ core-only 构建中跳过，在完整构建中使用官方参考 WAV 验证实�
 
 仓库已经提供录制、回放、事件和 benchmark 基础设施，但以下结果必须在目标硬件、房间和独立数据集上
 实际测量，不能由单元测试代替：0.5 m/2 m 召回率、8 小时负样本误唤醒、8 小时耐久、设备断连/休眠恢复、
-磁盘与慢浏览器故障注入，以及至少一名非录制者的独立验收。音乐播放指标本阶段只记录；AEC 仍为旁路，
-不作为退出门槛。
+磁盘与慢浏览器故障注入，以及至少一名非录制者的独立验收。第二阶段已经接通 AEC3，但音乐播放条件下的
+ERLE、近端人声损失、唤醒与命令准确率仍必须在目标硬件上实测，不能仅凭后端处于 `active` 判定达标。

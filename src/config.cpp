@@ -118,6 +118,17 @@ AppConfig ConfigStore::load() const {
   c.aec.max_drift_ppm = read<std::int64_t>(table, "aec.max_drift_ppm", 1000);
   c.aec.hard_resync_error_ms = read<std::int64_t>(table, "aec.hard_resync_error_ms", 80);
   c.aec.delay_offset_ms = read<std::int64_t>(table, "aec.delay_offset_ms", 0);
+  c.aec.microphone_channel_index =
+      read<std::int64_t>(table, "aec.microphone_channel_index", 0);
+  c.aec.auto_delay_enabled = read<bool>(table, "aec.auto_delay_enabled", true);
+  c.aec.auto_delay_min_ms = read<std::int64_t>(table, "aec.auto_delay_min_ms", 0);
+  c.aec.auto_delay_max_ms = read<std::int64_t>(table, "aec.auto_delay_max_ms", 250);
+  c.aec.auto_delay_window_ms =
+      read<std::int64_t>(table, "aec.auto_delay_window_ms", 1000);
+  c.aec.auto_delay_update_ms =
+      read<std::int64_t>(table, "aec.auto_delay_update_ms", 500);
+  c.aec.auto_delay_min_correlation =
+      read<double>(table, "aec.auto_delay_min_correlation", 0.35);
   c.aec.missing_render_policy = read<std::string>(table, "aec.missing_render_policy", "bypass_reset");
   c.aec.stats_hz = read<std::int64_t>(table, "aec.stats_hz", 1);
   c.ring.duration_ms = read<std::int64_t>(table, "ring.duration_ms", 20000);
@@ -228,6 +239,23 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
         "aec.max_drift_ppm must be in [0, 5000]");
   range(c.aec.hard_resync_error_ms >= 10 && c.aec.hard_resync_error_ms <= 1000,
         "aec.hard_resync_error_ms must be in [10, 1000]");
+  range(c.aec.delay_offset_ms >= -500 && c.aec.delay_offset_ms <= 500,
+        "aec.delay_offset_ms must be in [-500, 500]");
+  range(c.aec.microphone_channel_index >= -1 &&
+            c.aec.microphone_channel_index <= 31,
+        "aec.microphone_channel_index must be in [-1, 31]");
+  range(c.aec.auto_delay_min_ms <= c.aec.auto_delay_max_ms &&
+            c.aec.auto_delay_max_ms <= 500,
+        "aec auto delay range must satisfy 0 <= min <= max <= 500 ms");
+  range(c.aec.auto_delay_window_ms >= 500 &&
+            c.aec.auto_delay_window_ms <= 5000,
+        "aec.auto_delay_window_ms must be in [500, 5000]");
+  range(c.aec.auto_delay_update_ms >= 100 &&
+            c.aec.auto_delay_update_ms <= c.aec.auto_delay_window_ms,
+        "aec.auto_delay_update_ms must be in [100, auto_delay_window_ms]");
+  range(c.aec.auto_delay_min_correlation >= 0.10F &&
+            c.aec.auto_delay_min_correlation <= 0.95F,
+        "aec.auto_delay_min_correlation must be in [0.10, 0.95]");
   range(c.aec.missing_render_policy == "bypass_reset",
         "aec.missing_render_policy must be 'bypass_reset'");
   range(c.aec.stats_hz >= 1 && c.aec.stats_hz <= 20, "aec.stats_hz must be in [1, 20]");
@@ -289,8 +317,8 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
   } catch (const std::exception& error) {
     range(false, std::string("commands grammar is invalid: ") + error.what());
   }
-  range(c.web.bind == "127.0.0.1" || c.web.bind == "localhost",
-        "web.bind must be loopback-only");
+  range(c.web.bind == "127.0.0.1",
+        "web.bind must be exactly '127.0.0.1'");
   range(c.web.port > 0, "web.port must be non-zero");
   range(c.web.telemetry_hz >= 1 && c.web.telemetry_hz <= 60, "web.telemetry_hz must be in [1, 60]");
   return v;
@@ -317,6 +345,13 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                {"max_drift_ppm", c.aec.max_drift_ppm},
                {"hard_resync_error_ms", c.aec.hard_resync_error_ms},
                {"delay_offset_ms", c.aec.delay_offset_ms},
+               {"microphone_channel_index", c.aec.microphone_channel_index},
+               {"auto_delay_enabled", c.aec.auto_delay_enabled},
+               {"auto_delay_min_ms", c.aec.auto_delay_min_ms},
+               {"auto_delay_max_ms", c.aec.auto_delay_max_ms},
+               {"auto_delay_window_ms", c.aec.auto_delay_window_ms},
+               {"auto_delay_update_ms", c.aec.auto_delay_update_ms},
+               {"auto_delay_min_correlation", c.aec.auto_delay_min_correlation},
                {"missing_render_policy", c.aec.missing_render_policy},
                {"stats_hz", c.aec.stats_hz}}},
       {"kws", {{"threshold", c.kws.threshold}, {"boosting_score", c.kws.boosting_score},
@@ -382,6 +417,29 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                  {"queue_capacity_ms", c.audio.queue_capacity_ms}}},
       {"preprocess", {{"implementation", c.preprocess.implementation},
                       {"aec_enabled", c.preprocess.aec_enabled}}},
+      {"aec", {{"enabled", c.aec.enabled},
+               {"processing_rate_hz", c.aec.processing_rate_hz},
+               {"high_pass_filter", c.aec.high_pass_filter},
+               {"noise_suppression", c.aec.noise_suppression},
+               {"gain_control", c.aec.gain_control},
+               {"request_raw_capture", c.aec.request_raw_capture},
+               {"request_post_volume_loopback", c.aec.request_post_volume_loopback},
+               {"alignment_wait_ms", c.aec.alignment_wait_ms},
+               {"target_render_buffer_ms", c.aec.target_render_buffer_ms},
+               {"max_render_buffer_ms", c.aec.max_render_buffer_ms},
+               {"drift_window_ms", c.aec.drift_window_ms},
+               {"max_drift_ppm", c.aec.max_drift_ppm},
+               {"hard_resync_error_ms", c.aec.hard_resync_error_ms},
+               {"delay_offset_ms", c.aec.delay_offset_ms},
+               {"microphone_channel_index", c.aec.microphone_channel_index},
+               {"auto_delay_enabled", c.aec.auto_delay_enabled},
+               {"auto_delay_min_ms", c.aec.auto_delay_min_ms},
+               {"auto_delay_max_ms", c.aec.auto_delay_max_ms},
+               {"auto_delay_window_ms", c.aec.auto_delay_window_ms},
+               {"auto_delay_update_ms", c.aec.auto_delay_update_ms},
+               {"auto_delay_min_correlation", c.aec.auto_delay_min_correlation},
+               {"missing_render_policy", c.aec.missing_render_policy},
+               {"stats_hz", c.aec.stats_hz}}},
       {"ring", {{"duration_ms", c.ring.duration_ms}}},
       {"kws", {{"enabled", c.kws.enabled}, {"encoder", c.kws.encoder.string()},
                {"decoder", c.kws.decoder.string()}, {"joiner", c.kws.joiner.string()},
@@ -450,6 +508,14 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
       assign_if(*it, "max_drift_ppm", candidate.aec.max_drift_ppm);
       assign_if(*it, "hard_resync_error_ms", candidate.aec.hard_resync_error_ms);
       assign_if(*it, "delay_offset_ms", candidate.aec.delay_offset_ms);
+      assign_if(*it, "microphone_channel_index", candidate.aec.microphone_channel_index);
+      assign_if(*it, "auto_delay_enabled", candidate.aec.auto_delay_enabled);
+      assign_if(*it, "auto_delay_min_ms", candidate.aec.auto_delay_min_ms);
+      assign_if(*it, "auto_delay_max_ms", candidate.aec.auto_delay_max_ms);
+      assign_if(*it, "auto_delay_window_ms", candidate.aec.auto_delay_window_ms);
+      assign_if(*it, "auto_delay_update_ms", candidate.aec.auto_delay_update_ms);
+      assign_if(*it, "auto_delay_min_correlation",
+                candidate.aec.auto_delay_min_correlation);
       assign_if(*it, "stats_hz", candidate.aec.stats_hz);
     }
     if (const auto it = patch.find("kws"); it != patch.end()) {
@@ -555,6 +621,13 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
       << "\nmax_drift_ppm = " << c.aec.max_drift_ppm
       << "\nhard_resync_error_ms = " << c.aec.hard_resync_error_ms
       << "\ndelay_offset_ms = " << c.aec.delay_offset_ms
+      << "\nmicrophone_channel_index = " << c.aec.microphone_channel_index
+      << "\nauto_delay_enabled = " << (c.aec.auto_delay_enabled ? "true" : "false")
+      << "\nauto_delay_min_ms = " << c.aec.auto_delay_min_ms
+      << "\nauto_delay_max_ms = " << c.aec.auto_delay_max_ms
+      << "\nauto_delay_window_ms = " << c.aec.auto_delay_window_ms
+      << "\nauto_delay_update_ms = " << c.aec.auto_delay_update_ms
+      << "\nauto_delay_min_correlation = " << c.aec.auto_delay_min_correlation
       << "\nstats_hz = " << c.aec.stats_hz << "\n\n";
   out << "[kws]\nencoder = " << toml_string(c.kws.encoder.generic_string())
       << "\ndecoder = " << toml_string(c.kws.decoder.generic_string())

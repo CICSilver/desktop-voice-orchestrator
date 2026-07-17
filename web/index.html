@@ -54,7 +54,8 @@
       <article class="panel status-card">
         <div class="panel-heading"><div><p class="section-label">AEC3</p><h2>回声消除</h2></div><span id="aec-state" class="pill">初始化</span></div>
         <dl class="status-grid">
-          <div><dt>外部延迟</dt><dd id="aec-delay">—</dd></div><div><dt>时钟漂移</dt><dd id="aec-drift">—</dd></div>
+          <div><dt>送入 AEC 延迟</dt><dd id="aec-delay">—</dd></div><div><dt>自动延迟估计</dt><dd id="aec-auto-delay">—</dd></div>
+          <div><dt>延迟相关度</dt><dd id="aec-delay-confidence">—</dd></div><div><dt>时钟漂移</dt><dd id="aec-drift">—</dd></div>
           <div><dt>ERLE</dt><dd id="aec-erle">—</dd></div><div><dt>Render FIFO</dt><dd id="aec-fifo">—</dd></div>
           <div><dt>处理峰值</dt><dd id="aec-p95">—</dd></div><div><dt>重置次数</dt><dd id="aec-resets">0</dd></div>
         </dl>
@@ -95,6 +96,14 @@
             <label>最短命令 ms <input name="segmentation.min_command_speech_ms" type="number" min="0" step="10"></label>
           </fieldset>
           <fieldset><legend>AEC</legend>
+            <label>麦克风通道（-1 混合） <input name="aec.microphone_channel_index" type="number" min="-1" max="31" step="1"></label>
+            <label>自动估计延迟 <input name="aec.auto_delay_enabled" type="checkbox"></label>
+            <label>估计最小延迟 ms <input name="aec.auto_delay_min_ms" type="number" min="0" max="500" step="10"></label>
+            <label>估计最大延迟 ms <input name="aec.auto_delay_max_ms" type="number" min="0" max="500" step="10"></label>
+            <label>估计窗口 ms <input name="aec.auto_delay_window_ms" type="number" min="500" max="5000" step="100"></label>
+            <label>估计更新 ms <input name="aec.auto_delay_update_ms" type="number" min="100" max="5000" step="100"></label>
+            <label>最低相关度 <input name="aec.auto_delay_min_correlation" type="number" min="0.1" max="0.95" step="0.01"></label>
+            <label>人工延迟修正 ms <input name="aec.delay_offset_ms" type="number" min="-500" max="500" step="1"></label>
             <label>对齐等待 ms <input name="aec.alignment_wait_ms" type="number" min="0" max="100" step="10"></label>
             <label>Render目标 ms <input name="aec.target_render_buffer_ms" type="number" min="10" max="2000" step="10"></label>
             <label>最大漂移 ppm <input name="aec.max_drift_ppm" type="number" min="0" max="5000" step="10"></label>

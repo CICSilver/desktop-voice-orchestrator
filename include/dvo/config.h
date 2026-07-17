@@ -38,6 +38,15 @@ struct AecConfig {
   std::int32_t max_drift_ppm{1000};
   std::uint32_t hard_resync_error_ms{80};
   std::int32_t delay_offset_ms{0};
+  // -1 averages all microphone channels; otherwise selects a zero-based
+  // channel before resampling/AEC. Channel 0 is the safe default for arrays.
+  std::int32_t microphone_channel_index{0};
+  bool auto_delay_enabled{true};
+  std::uint32_t auto_delay_min_ms{0};
+  std::uint32_t auto_delay_max_ms{250};
+  std::uint32_t auto_delay_window_ms{1000};
+  std::uint32_t auto_delay_update_ms{500};
+  float auto_delay_min_correlation{0.35F};
   std::string missing_render_policy{"bypass_reset"};
   std::uint32_t stats_hz{1};
 };
