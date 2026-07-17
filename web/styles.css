@@ -47,5 +47,11 @@ fieldset { border:1px solid var(--line); border-radius:8px; margin:0 0 10px; pad
 .transcript.partial { color:var(--muted); }
 .transcript.final { color:#e8f2ff; }
 .action-result { color:var(--muted); font-size:12px; line-height:1.5; }
+.command-status { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; margin-bottom:9px; }
+.command-status div { display:flex; align-items:center; justify-content:space-between; gap:10px; min-width:0; padding:8px 10px; border:1px solid #1b2836; border-radius:7px; background:#0a1119; }
+.command-status span,.announcement-line span { color:var(--muted); font-size:11px; }
+.command-status strong { color:var(--cyan); overflow-wrap:anywhere; font:600 12px Consolas,monospace; }
+.announcement-line { display:grid; grid-template-columns:auto minmax(0,1fr); align-items:start; gap:10px; margin:9px 0; padding:8px 10px; border-left:2px solid var(--blue); background:#0a1119; }
+.announcement-line strong { color:#d9eaff; font-size:12px; font-weight:600; overflow-wrap:anywhere; }
 @media(max-width:1250px){.runtime-cards{grid-template-columns:1fr 1fr}.action-card{grid-column:1/-1}}
 @media(max-width:760px){.runtime-cards{grid-template-columns:1fr}.action-card{grid-column:auto}.status-grid{grid-template-columns:1fr}}

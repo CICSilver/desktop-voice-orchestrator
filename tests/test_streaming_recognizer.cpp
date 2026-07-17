@@ -8,6 +8,7 @@
 #include <mutex>
 #include <numeric>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -29,6 +30,8 @@ struct FakeEngineState {
   bool block_finish{};
   bool finish_entered{};
   bool release_finish{};
+  bool fail_accept{};
+  bool fail_finish{};
   std::chrono::milliseconds decode_delay{};
 };
 
@@ -48,8 +51,10 @@ class FakeSession final : public dvo::IOnlineAsrSession {
       state_->cv.wait(lock, [this] { return state_->release_accept; });
     }
     const auto delay = state_->decode_delay;
+    const auto fail = state_->fail_accept;
     lock.unlock();
     if (delay.count() > 0) std::this_thread::sleep_for(delay);
+    if (fail) throw std::runtime_error("provisional accept failed");
     lock.lock();
     return hypothesis("partial", received);
   }
@@ -62,8 +67,10 @@ class FakeSession final : public dvo::IOnlineAsrSession {
       state_->cv.wait(lock, [this] { return state_->release_finish; });
     }
     const auto delay = state_->decode_delay;
+    const auto fail = state_->fail_finish;
     lock.unlock();
     if (delay.count() > 0) std::this_thread::sleep_for(delay);
+    if (fail) throw std::runtime_error("exact final failed");
     lock.lock();
     return hypothesis("final", state_->sessions.at(index_));
   }
@@ -153,8 +160,8 @@ TEST_CASE("streaming recognizer emits partials and exact-final redecodes candida
   dvo::RecognitionBegin begin;
   begin.utterance_id = "utterance-1";
   begin.generation = 1;
-  begin.left_backfill_first_sample = 100;
-  begin.left_backfill = pcm({1.0F, 2.0F});
+  begin.backfill_first_sample = 100;
+  begin.backfill = pcm({1.0F, 2.0F});
   REQUIRE(recognizer->try_begin(std::move(begin)) ==
           dvo::RecognitionSubmitStatus::accepted);
 
@@ -202,6 +209,71 @@ TEST_CASE("streaming recognizer emits partials and exact-final redecodes candida
   CHECK((state->sessions[0] ==
          std::vector<float>{1.0F, 2.0F, 3.0F, 4.0F, 5.0F}));
   CHECK((state->sessions[1] == std::vector<float>{9.0F, 9.0F, 9.0F, 9.0F}));
+}
+
+TEST_CASE("provisional ASR failure is distinguished from exact-final failure") {
+  auto state = std::make_shared<FakeEngineState>();
+  state->fail_accept = true;
+  ResultCollector collector;
+  auto recognizer = dvo::create_streaming_recognizer(
+      fake_config(), [&collector](dvo::RecognitionResult result) {
+        collector.push(std::move(result));
+      },
+      std::make_unique<FakeEngine>(state));
+
+  dvo::RecognitionBegin begin;
+  begin.utterance_id = "recover-after-provisional-error";
+  begin.generation = 11;
+  begin.backfill = pcm({1.0F});
+  REQUIRE(recognizer->try_begin(std::move(begin)) ==
+          dvo::RecognitionSubmitStatus::accepted);
+  REQUIRE(collector.wait_for_kind(dvo::RecognitionResultKind::error));
+  auto results = collector.snapshot();
+  REQUIRE_FALSE(results.empty());
+  CHECK_FALSE(results.back().exact_final_attempt);
+  CHECK_FALSE(results.back().exact_final);
+
+  {
+    std::scoped_lock lock(state->mutex);
+    state->fail_accept = false;
+  }
+  auto candidate = std::make_shared<dvo::UtteranceCandidate>();
+  candidate->utterance_id = "recover-after-provisional-error";
+  candidate->pcm = {2.0F, 3.0F};
+  candidate->source_spans = {{200, 202}};
+  REQUIRE(recognizer->try_finalize(
+              {candidate->utterance_id, 11, "live", candidate}) ==
+          dvo::RecognitionSubmitStatus::accepted);
+  REQUIRE(collector.wait_for_kind(dvo::RecognitionResultKind::final));
+  results = collector.snapshot();
+  const auto final = std::find_if(results.begin(), results.end(), [](const auto& value) {
+    return value.kind == dvo::RecognitionResultKind::final;
+  });
+  REQUIRE(final != results.end());
+  CHECK(final->exact_final_attempt);
+  CHECK(final->exact_final);
+
+  auto failing_state = std::make_shared<FakeEngineState>();
+  failing_state->fail_finish = true;
+  ResultCollector failing_collector;
+  auto failing = dvo::create_streaming_recognizer(
+      fake_config(), [&failing_collector](dvo::RecognitionResult result) {
+        failing_collector.push(std::move(result));
+      },
+      std::make_unique<FakeEngine>(failing_state));
+  auto failing_candidate = std::make_shared<dvo::UtteranceCandidate>();
+  failing_candidate->utterance_id = "exact-final-error";
+  failing_candidate->pcm = {4.0F};
+  failing_candidate->source_spans = {{400, 401}};
+  REQUIRE(failing->try_finalize(
+              {failing_candidate->utterance_id, 12, "live", failing_candidate}) ==
+          dvo::RecognitionSubmitStatus::accepted);
+  REQUIRE(failing_collector.wait_for_kind(dvo::RecognitionResultKind::error));
+  const auto failed = failing_collector.snapshot();
+  REQUIRE_FALSE(failed.empty());
+  CHECK(failed.back().exact_final_attempt);
+  CHECK_FALSE(failed.back().exact_final);
+  CHECK(failed.back().candidate == failing_candidate);
 }
 
 TEST_CASE("generation cancellation rejects old work and cancels an active stream") {
@@ -295,7 +367,7 @@ TEST_CASE("bounded recognizer queue reports overflow without waiting for worker"
   dvo::RecognitionBegin begin;
   begin.utterance_id = "blocked";
   begin.generation = 1;
-  begin.left_backfill = pcm({1.0F});
+  begin.backfill = pcm({1.0F});
   REQUIRE(recognizer->try_begin(std::move(begin)) ==
           dvo::RecognitionSubmitStatus::accepted);
   {

@@ -92,6 +92,12 @@ struct SegmentationConfig {
   std::uint32_t assembly_queue_capacity{4};
 };
 
+struct ActivationConfig {
+  bool enabled{true};
+  std::uint32_t idle_timeout_ms{6000};
+  std::uint32_t hard_limit_ms{20000};
+};
+
 struct AsrConfig {
   bool enabled{true};
   std::string implementation{"sherpa_online_paraformer"};
@@ -122,6 +128,14 @@ struct CommandsConfig {
   std::vector<std::string> connectors{"然后", "再", "接着", "并且"};
 };
 
+struct AnnouncementsConfig {
+  bool enabled{true};
+  std::string backend{"log"};
+  std::uint32_t queue_capacity{32};
+  bool barge_in{false};
+  std::uint32_t tail_guard_ms{200};
+};
+
 struct WebConfig {
   bool enabled{true};
   std::string bind{"127.0.0.1"};
@@ -143,8 +157,10 @@ struct AppConfig {
   KwsConfig kws;
   VadConfig vad;
   SegmentationConfig segmentation;
+  ActivationConfig activation;
   AsrConfig asr;
   CommandsConfig commands;
+  AnnouncementsConfig announcements;
   WebConfig web;
   RecordingConfig recording;
   std::filesystem::path project_root;

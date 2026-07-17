@@ -10,6 +10,12 @@ const state = {
   source: 'processed',
   activeMode: 'live',
   recordingActive: null,
+  latestSample: {live: null, replay: null},
+  activation: {
+    live: {active: false, status: '未激活'},
+    replay: {active: false, status: '未激活'}
+  },
+  announcement: {live: null, replay: null},
   view: {
     frozen: false,
     snapshot: null,
@@ -21,6 +27,99 @@ const state = {
   }
 };
 const $ = (id) => document.getElementById(id);
+
+function modeOf(message) {
+  return (message.source || message.payload?.source) === 'replay' ? 'replay' : 'live';
+}
+
+function candidateEndSample(candidate) {
+  const spans = candidate.source_spans || [];
+  const finalSpan = spans.length ? spans[spans.length - 1] : null;
+  return Number(finalSpan?.end ?? candidate.wake_span?.end ?? candidate.trigger_sample ?? 0);
+}
+
+function resetModeStatus(mode) {
+  state.latestSample[mode] = null;
+  state.activation[mode] = {active: false, status: '未激活'};
+  state.announcement[mode] = null;
+  if (mode === state.activeMode) renderCommandStatus();
+}
+
+function hydrateActivation(mode, payload, status = '') {
+  const active = payload.active !== false && !!payload.activation_id;
+  const labels = {
+    dormant: '未激活',
+    keyword_turn: '关键词话段',
+    armed_idle: '等待后续',
+    followup_turn: '后续话段'
+  };
+  state.activation[mode] = {
+    active,
+    status: status || labels[payload.state] || (active ? '已激活' : (payload.status || '未激活')),
+    activationId: payload.activation_id || '',
+    turnIndex: payload.turn_index,
+    idleDeadlineSample: Number(payload.idle_deadline_sample || 0),
+    hardDeadlineSample: Number(payload.hard_deadline_sample || 0),
+    reason: payload.reason || ''
+  };
+  if (mode === state.activeMode) renderCommandStatus();
+}
+
+function hydrateAnnouncement(mode, payload, fallbackStatus = '') {
+  if (!payload || typeof payload !== 'object' || !payload.text) return;
+  state.announcement[mode] = {
+    text: payload.text,
+    kind: payload.kind || '',
+    status: payload.status || fallbackStatus
+  };
+  if (mode === state.activeMode) renderCommandStatus();
+}
+
+function updateActivation(message) {
+  const mode = modeOf(message);
+  const payload = message.payload || {};
+  const atSample = payload.at_sample ?? message.timestamp_sample;
+  if (atSample != null) {
+    state.latestSample[mode] = Math.max(state.latestSample[mode] ?? 0, Number(atSample));
+  }
+  if (message.type === 'activation_started' || message.type === 'activation_refreshed') {
+    hydrateActivation(mode, payload, message.type === 'activation_refreshed' ? '已续期' : '已激活');
+  } else {
+    hydrateActivation(mode, {...payload, active: false},
+      message.type === 'activation_expired' ? '已过期' : '已取消');
+  }
+}
+
+function renderCommandStatus() {
+  const activation = state.activation[state.activeMode];
+  const turn = activation.turnIndex == null ? '' : ` · #${activation.turnIndex}`;
+  const reason = !activation.active && activation.reason ? ` · ${activation.reason}` : '';
+  $('activation-state').textContent = `${activation.status}${turn}${reason}`;
+
+  if (!activation.active) {
+    $('activation-countdown').textContent = '—';
+  } else {
+    const now = state.latestSample[state.activeMode];
+    if (now == null) {
+      $('activation-countdown').textContent = '等待样本时间';
+    } else {
+      const hardRemaining = Math.max(0, activation.hardDeadlineSample - now) / SAMPLE_RATE;
+      const idle = activation.idleDeadlineSample > 0
+        ? `空闲 ${(Math.max(0, activation.idleDeadlineSample - now) / SAMPLE_RATE).toFixed(1)}s`
+        : '话段进行中';
+      $('activation-countdown').textContent = `${idle} / 上限 ${hardRemaining.toFixed(1)}s`;
+    }
+  }
+
+  const announcement = state.announcement[state.activeMode];
+  if (!announcement) {
+    $('announcement-text').textContent = '尚无播报';
+    return;
+  }
+  const status = announcement.status && announcement.status !== 'delivered'
+    ? ` [${announcement.status}]` : '';
+  $('announcement-text').textContent = `${announcement.text || '无文字内容'}${status}`;
+}
 
 async function command(action, payload = {}) {
   try {
@@ -57,8 +156,9 @@ function connect() {
 function handle(message) {
   const {type, payload} = message;
   if (type === 'telemetry') {
-    const messageMode = message.source === 'replay' ? 'replay' : 'live';
+    const messageMode = modeOf(message);
     if (messageMode !== state.activeMode) return;
+    state.latestSample[messageMode] = Number(payload.sample || 0);
     state.telemetry.push(payload);
     state.vad.push(!!payload.vad);
     while (state.telemetry.length > state.maxPoints) state.telemetry.shift();
@@ -66,12 +166,13 @@ function handle(message) {
 
     const cutoff = Number(payload.sample || 0) - 20 * SAMPLE_RATE;
     state.wakes = state.wakes.filter(hit => Number(hit.wake_span?.end ?? hit.at ?? 0) >= cutoff);
-    state.candidates = state.candidates.filter(item => Number(item.wake_span?.end ?? 0) >= cutoff);
+    state.candidates = state.candidates.filter(item => candidateEndSample(item) >= cutoff);
     $('rms').textContent = Number(payload[state.source]?.rms ?? payload.processed?.rms ?? 0).toFixed(3);
     $('queue-depth').textContent = payload.queue_depth ?? 0;
     $('drops').textContent = payload.telemetry_dropped ?? 0;
     if (payload.aec) updateAec(payload.aec);
     if (message.source === 'replay') $('replay-seek').value = Number(payload.sample || 0) / SAMPLE_RATE;
+    renderCommandStatus();
     syncViewControls();
   } else if (type === 'kws_hit') {
     if ((message.source === 'replay' ? 'replay' : 'live') === state.activeMode) {
@@ -104,6 +205,17 @@ function handle(message) {
       : (payload.summary || payload.normalized_text || JSON.stringify(payload.actions || []));
     $('action-state').textContent = type === 'command_plan' ? '已规划' : '已拒绝';
     addEvent(message);
+  } else if (type === 'activation_started' || type === 'activation_refreshed' ||
+             type === 'activation_expired' || type === 'activation_cancelled') {
+    updateActivation(message);
+    addEvent(message);
+  } else if (type === 'activation_state') {
+    hydrateActivation(modeOf(message), payload);
+    addEvent(message);
+  } else if (type === 'announcement' || type.startsWith('announcement_')) {
+    const mode = modeOf(message);
+    hydrateAnnouncement(mode, payload, type.slice('announcement_'.length));
+    addEvent(message);
   } else if (type.startsWith('action_')) {
     $('action-state').textContent = type.slice('action_'.length);
     $('action-result').textContent = payload.message || payload.error_code || JSON.stringify(payload);
@@ -113,6 +225,16 @@ function handle(message) {
     loadConfig(pending.length && payload.saved_config ? payload.saved_config : (payload.config || payload));
     $('restart-required').hidden = !pending.length;
     $('restart-required').textContent = pending.length ? `已保存，重启后生效：${pending.join('、')}` : '';
+    if (payload.activation_state) hydrateActivation(modeOf(message), payload.activation_state);
+    if (payload.latest_announcement) {
+      hydrateAnnouncement(modeOf(message), payload.latest_announcement);
+    }
+    addEvent(message);
+  } else if (type === 'runtime_state') {
+    if (payload.activation) hydrateActivation(modeOf(message), payload.activation);
+    if (payload.latest_announcement) {
+      hydrateAnnouncement(modeOf(message), payload.latest_announcement);
+    }
     addEvent(message);
   } else if (type === 'recording_state') {
     const active = !!payload.active;
@@ -220,11 +342,13 @@ function setActiveMode(mode, clear = false) {
   const changed = state.activeMode !== mode;
   if (clear || changed) clearTimelineData();
   state.activeMode = mode;
+  if (clear || changed) resetModeStatus(mode);
   $('source').textContent = mode === 'replay' ? 'REPLAY' : 'LIVE';
   for (const id of ['replay-play', 'replay-pause', 'replay-speed', 'replay-seek']) {
     $(id).disabled = mode !== 'replay';
   }
   syncViewControls();
+  renderCommandStatus();
 }
 
 function snapshotCurrentView() {
@@ -438,7 +562,7 @@ function draw() {
     if (first) {
       const x = xAt(first.start, wave.w);
       wave.c.fillStyle = '#8bc1ff';
-      wave.c.fillText(item.position || 'candidate', x + 4, 16);
+      wave.c.fillText(item.position || item.origin || 'candidate', x + 4, 16);
       wave.c.fillStyle = 'rgba(93,168,255,.14)';
     }
   }
@@ -524,6 +648,7 @@ $('replay-speed').onchange = () => command('replay.speed', {speed: Number($('rep
 $('replay-seek').onchange = () => {
   const seconds = Number($('replay-seek').value);
   clearTimelineData();
+  resetModeStatus('replay');
   syncViewControls();
   command('replay.seek', {seconds});
 };

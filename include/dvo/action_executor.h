@@ -46,10 +46,14 @@ class OrderedActionExecutor {
   // before the worker can dequeue it. It is intended for authoritative
   // command_plan/action_queued lifecycle events.
   using AcceptedCallback = std::function<void(const CommandPlan&)>;
+  // Runs exactly once after a plan leaves the global FIFO and before its first
+  // action_started result. Intended for non-blocking announcement dispatch.
+  using PlanStartedCallback = std::function<void(const CommandPlan&)>;
 
   OrderedActionExecutor(std::shared_ptr<IActionBackend> backend,
                         ActionExecutorConfig config = {},
-                        ResultCallback results = {});
+                        ResultCallback results = {},
+                        PlanStartedCallback plan_started = {});
   ~OrderedActionExecutor();
 
   OrderedActionExecutor(const OrderedActionExecutor&) = delete;

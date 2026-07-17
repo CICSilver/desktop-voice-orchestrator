@@ -67,7 +67,12 @@
       </article>
       <article class="panel status-card action-card">
         <div class="panel-heading"><div><p class="section-label">COMMAND</p><h2>命令执行</h2></div><span id="action-state" class="pill">空闲</span></div>
+        <div class="command-status" aria-label="连续激活状态">
+          <div><span>连续激活</span><strong id="activation-state">未激活</strong></div>
+          <div><span>剩余窗口</span><strong id="activation-countdown">—</strong></div>
+        </div>
         <p id="command-plan" class="transcript final">尚无命令计划</p>
+        <p class="announcement-line"><span>文字播报</span><strong id="announcement-text">尚无播报</strong></p>
         <p id="action-result" class="action-result">live模式实际执行；回放与基准强制dry-run。</p>
       </article>
     </section>
@@ -122,6 +127,16 @@
             <label class="wide">降低音量短语 <input name="commands.volume_down_phrases" type="text" data-list placeholder="多个短语用逗号分隔"></label>
             <label class="wide">连接词 <input name="commands.connectors" type="text" data-list placeholder="然后，再，接着，并且"></label>
           </fieldset>
+          <fieldset><legend>连续激活</legend>
+            <label>启用 <input name="activation.enabled" type="checkbox"></label>
+            <label>空闲窗口 ms <input name="activation.idle_timeout_ms" type="number" min="1000" max="10000" step="100"></label>
+            <label>总时长上限 ms <input name="activation.hard_limit_ms" type="number" min="10000" max="60000" step="1000"></label>
+          </fieldset>
+          <fieldset><legend>播报</legend>
+            <label>启用 <input name="announcements.enabled" type="checkbox"></label>
+            <label>Barge-in <input name="announcements.barge_in" type="checkbox"></label>
+            <label>TTS 尾音保护 ms <input name="announcements.tail_guard_ms" type="number" min="0" max="1000" step="10"></label>
+          </fieldset>
           <details class="cold-settings"><summary>冷参数 · 保存后重启生效</summary>
             <fieldset><legend>设备</legend>
               <label>麦克风endpoint ID <input name="audio.microphone_device" type="text"></label>
@@ -138,6 +153,10 @@
             <fieldset><legend>Paraformer模型</legend>
               <label>Provider <input name="asr.provider" type="text"></label><label>推理线程 <input name="asr.num_threads" type="number" min="1" max="16"></label>
               <label>Encoder <input name="asr.encoder" type="text"></label><label>Decoder <input name="asr.decoder" type="text"></label><label>Tokens <input name="asr.tokens" type="text"></label>
+            </fieldset>
+            <fieldset><legend>播报后端</legend>
+              <label>Backend <select name="announcements.backend"><option value="log">log</option></select></label>
+              <label>队列容量 <input name="announcements.queue_capacity" type="number" min="1" max="256"></label>
             </fieldset>
           </details>
           <p id="restart-required" class="restart-note" hidden></p>

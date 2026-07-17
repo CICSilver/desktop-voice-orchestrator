@@ -24,6 +24,62 @@ namespace {
 // the deduplication ledger.
 constexpr std::size_t kCompletedCommandSnapshotCapacity = 4096 / kMaxCommandActions;
 
+std::uint64_t candidate_end_sample(const UtteranceCandidate& candidate) {
+  if (!candidate.source_spans.empty()) return candidate.source_spans.back().end;
+  if (candidate.wake_span) return candidate.wake_span->end;
+  return candidate.trigger_sample;
+}
+
+nlohmann::json activation_json(const ActivationSnapshot& activation) {
+  return {{"active", activation.active()},
+          {"state", to_string(activation.state)},
+          {"activation_id", activation.activation_id},
+          {"turn_index", activation.turn_index},
+          {"idle_deadline_sample", activation.idle_deadline_sample},
+          {"hard_deadline_sample", activation.hard_deadline_sample},
+          {"playback_hold", activation.playback_hold}};
+}
+
+nlohmann::json announcement_request_json(const AnnouncementRequest& request,
+                                         std::string status) {
+  return {{"schema_version", request.schema_version},
+          {"announcement_id", request.announcement_id},
+          {"kind", to_string(request.kind)},
+          {"status", std::move(status)},
+          {"text", request.text},
+          {"source", to_string(request.source)},
+          {"origin", to_string(request.origin)},
+          {"activation_id", request.activation_id},
+          {"turn_index", request.turn_index},
+          {"trigger_sample", request.trigger_sample},
+          {"utterance_id", request.utterance_id},
+          {"command_id", request.command_id},
+          {"action_ids", request.action_ids},
+          {"timestamp_sample", request.timestamp_sample}};
+}
+
+nlohmann::json announcement_result_json(const AnnouncementResult& result) {
+  return {{"schema_version", result.schema_version},
+          {"announcement_id", result.announcement_id},
+          {"kind", to_string(result.kind)},
+          {"status", to_string(result.status)},
+          {"text", result.text},
+          {"source", to_string(result.source)},
+          {"origin", to_string(result.origin)},
+          {"activation_id", result.activation_id},
+          {"turn_index", result.turn_index},
+          {"trigger_sample", result.trigger_sample},
+          {"utterance_id", result.utterance_id},
+          {"command_id", result.command_id},
+          {"action_ids", result.action_ids},
+          {"timestamp_sample", result.timestamp_sample},
+          {"backend", result.backend},
+          {"render_endpoint", result.render_endpoint},
+          {"error_code", result.error_code},
+          {"message", result.message},
+          {"duration_ms", result.duration.count()}};
+}
+
 std::string command_snapshot_key(std::string_view utterance_id,
                                  std::uint64_t generation) {
   return std::to_string(utterance_id.size()) + ":" + std::string(utterance_id) + ":g" +
@@ -44,32 +100,58 @@ std::string make_runtime_session_id() {
 nlohmann::json command_plan_json(const CommandPlan& plan) {
   auto actions = nlohmann::json::array();
   for (const auto& action : plan.actions) {
-    actions.push_back({{"action_id", action.action_id}, {"sequence", action.sequence},
-                       {"type", to_string(action.type)},
-                       {"volume_delta_percent", action.volume_delta_percent}});
+    auto action_value = nlohmann::json{{"action_id", action.action_id},
+                                       {"sequence", action.sequence},
+                                       {"type", to_string(action.type)}};
+    action_value["volume_delta_percent"] =
+        action.volume_delta_percent
+            ? nlohmann::json(*action.volume_delta_percent)
+            : nlohmann::json(nullptr);
+    actions.push_back(std::move(action_value));
   }
-  return {{"command_id", plan.command_id}, {"runtime_session_id", plan.runtime_session_id},
+  auto value = nlohmann::json{{"schema_version", plan.schema_version},
+          {"command_id", plan.command_id}, {"runtime_session_id", plan.runtime_session_id},
           {"utterance_id", plan.utterance_id},
+          {"origin", to_string(plan.origin)}, {"activation_id", plan.activation_id},
+          {"turn_index", plan.turn_index}, {"trigger_sample", plan.trigger_sample},
           {"raw_text", plan.raw_text}, {"normalized_text", plan.normalized_text},
           {"parser_version", plan.parser_version}, {"config_revision", plan.config_revision},
-          {"recognition_generation", plan.recognition_generation},
-          {"final_revision", plan.final_revision},
-          {"source", to_string(plan.source)},
+           {"recognition_generation", plan.recognition_generation},
+           {"final_revision", plan.final_revision},
+           {"timestamp_sample", plan.timestamp_sample},
+           {"source", to_string(plan.source)},
           {"execution_mode", to_string(plan.execution_mode)}, {"actions", std::move(actions)}};
+  value["wake_position"] = plan.wake_position.empty()
+                               ? nlohmann::json(nullptr)
+                               : nlohmann::json(plan.wake_position);
+  return value;
 }
 
 nlohmann::json action_result_json(const ActionResult& result) {
-  return {{"command_id", result.command_id}, {"utterance_id", result.utterance_id},
-          {"action_id", result.action_id}, {"sequence", result.sequence},
-          {"type", to_string(result.type)}, {"status", to_string(result.status)},
-          {"source", to_string(result.source)},
-          {"adapter", result.adapter}, {"target_id", result.target_id},
-          {"error_code", result.error_code}, {"message", result.message},
-          {"requested_volume_delta_percent", result.requested_volume_delta_percent},
-          {"volume_before", result.volume_before}, {"volume_requested", result.volume_requested},
-          {"volume_after", result.volume_after}, {"mute_before", result.mute_before},
-          {"mute_after", result.mute_after}, {"clamped", result.clamped},
-          {"verified", result.verified}, {"duration_ms", result.duration.count()}};
+  auto value = nlohmann::json{
+      {"schema_version", result.schema_version},
+      {"command_id", result.command_id}, {"utterance_id", result.utterance_id},
+      {"origin", to_string(result.origin)}, {"activation_id", result.activation_id},
+      {"turn_index", result.turn_index}, {"trigger_sample", result.trigger_sample},
+      {"action_id", result.action_id}, {"sequence", result.sequence},
+      {"type", to_string(result.type)}, {"status", to_string(result.status)},
+      {"source", to_string(result.source)},
+      {"timestamp_sample", result.timestamp_sample},
+      {"adapter", result.adapter},
+      {"target_id", result.target_id}, {"error_code", result.error_code},
+      {"message", result.message}, {"clamped", result.clamped},
+      {"verified", result.verified}, {"duration_ms", result.duration.count()}};
+  const auto optional_json = [](const auto& item) {
+    return item ? nlohmann::json(*item) : nlohmann::json(nullptr);
+  };
+  value["requested_volume_delta_percent"] =
+      optional_json(result.requested_volume_delta_percent);
+  value["volume_before"] = optional_json(result.volume_before);
+  value["volume_requested"] = optional_json(result.volume_requested);
+  value["volume_after"] = optional_json(result.volume_after);
+  value["mute_before"] = optional_json(result.mute_before);
+  value["mute_after"] = optional_json(result.mute_after);
+  return value;
 }
 
 CommandGrammar command_grammar(const CommandsConfig& config) {
@@ -84,50 +166,56 @@ CommandGrammar command_grammar(const CommandsConfig& config) {
 }
 
 nlohmann::json preprocess_json(const PreprocessDiagnostics& diagnostics) {
-  return {{"state", to_string(diagnostics.state)}, {"enabled", diagnostics.aec_requested},
+  auto value = nlohmann::json{
+          {"state", to_string(diagnostics.state)}, {"enabled", diagnostics.aec_requested},
           {"compiled", diagnostics.aec_compiled}, {"active", diagnostics.aec_active},
           {"degraded", diagnostics.degraded}, {"render_available", diagnostics.render_available},
           {"render_synthetic", diagnostics.render_synthetic},
           {"microphone_rate_hz", diagnostics.microphone_rate_hz},
           {"render_rate_hz", diagnostics.render_rate_hz},
           {"drift_ppm", diagnostics.relative_drift_ppm},
-          {"drift_estimate_valid", diagnostics.drift_estimate_valid},
-          {"drift_out_of_range", diagnostics.drift_out_of_range},
-          {"external_delay_ms", diagnostics.stream_delay_ms},
-          {"auto_delay_enabled", diagnostics.auto_delay_enabled},
-          {"auto_delay_available", diagnostics.auto_delay_available},
-          {"auto_delay_ms", diagnostics.auto_delay_available
+            {"drift_estimate_valid", diagnostics.drift_estimate_valid},
+            {"drift_out_of_range", diagnostics.drift_out_of_range},
+            {"external_delay_ms", diagnostics.stream_delay_ms},
+            {"auto_delay_enabled", diagnostics.auto_delay_enabled},
+            {"auto_delay_available", diagnostics.auto_delay_available},
+            {"auto_delay_ms", diagnostics.auto_delay_available
                                 ? nlohmann::json(diagnostics.auto_delay_ms)
                                 : nlohmann::json(nullptr)},
           {"auto_delay_confidence", diagnostics.auto_delay_available
                                         ? nlohmann::json(diagnostics.auto_delay_confidence)
-                                        : nlohmann::json(nullptr)},
-          {"auto_delay_updates", diagnostics.auto_delay_updates},
-          {"auto_delay_rejections", diagnostics.auto_delay_rejections},
-           {"resampler", {{"speex_compiled", diagnostics.speexdsp_compiled},
-                           {"microphone_speex", diagnostics.microphone_resampler_speex},
-                           {"render_speex", diagnostics.render_resampler_speex},
-                           {"render_rate_updates", diagnostics.render_resampler_rate_updates},
-                           {"synthetic_samples_replaced",
-                            diagnostics.render_synthetic_samples_replaced},
-                           {"failures", diagnostics.resampler_failures},
-                           {"last_error_code", diagnostics.last_resampler_error_code},
-                           {"last_input_expected",
-                            diagnostics.last_resampler_input_expected},
-                           {"last_input_consumed",
-                            diagnostics.last_resampler_input_consumed}}},
-          {"render_fifo_ms", diagnostics.render_buffered_samples * 1000.0 /
-                                 static_cast<double>(kProcessingSampleRate)},
+                                          : nlohmann::json(nullptr)},
+            {"auto_delay_updates", diagnostics.auto_delay_updates},
+            {"auto_delay_rejections", diagnostics.auto_delay_rejections},
+            {"render_fifo_ms", diagnostics.render_buffered_samples * 1000.0 /
+                                  static_cast<double>(kProcessingSampleRate)},
           {"render_target_ms", diagnostics.target_render_buffer_samples * 1000.0 /
                                    static_cast<double>(kProcessingSampleRate)},
           {"processing_average_ms", diagnostics.average_processing_time_us / 1000.0},
           {"processing_max_ms", diagnostics.max_processing_time_us / 1000.0},
-          {"erle_db", diagnostics.echo_return_loss_enhancement_db},
-          {"erl_db", diagnostics.echo_return_loss_db},
-          {"residual_echo_likelihood", diagnostics.residual_echo_likelihood},
-          {"estimated_delay_ms", diagnostics.estimated_delay_ms},
           {"reset_count", diagnostics.resets}, {"fallback_frames", diagnostics.fallback_frames},
           {"last_reset_reason", to_string(diagnostics.last_reset_reason)}};
+  const auto optional_json = [](const auto& item) {
+    return item ? nlohmann::json(*item) : nlohmann::json(nullptr);
+  };
+  value["erle_db"] = optional_json(diagnostics.echo_return_loss_enhancement_db);
+  value["erl_db"] = optional_json(diagnostics.echo_return_loss_db);
+  value["residual_echo_likelihood"] =
+      optional_json(diagnostics.residual_echo_likelihood);
+  value["divergent_filter_fraction"] =
+      optional_json(diagnostics.divergent_filter_fraction);
+  value["estimated_delay_ms"] = optional_json(diagnostics.estimated_delay_ms);
+  value["resampler"] = nlohmann::json{
+      {"speex_compiled", diagnostics.speexdsp_compiled},
+      {"microphone_speex", diagnostics.microphone_resampler_speex},
+      {"render_speex", diagnostics.render_resampler_speex},
+      {"render_rate_updates", diagnostics.render_resampler_rate_updates},
+      {"synthetic_samples_replaced", diagnostics.render_synthetic_samples_replaced},
+      {"failures", diagnostics.resampler_failures},
+      {"last_error_code", diagnostics.last_resampler_error_code},
+      {"last_input_expected", diagnostics.last_resampler_input_expected},
+      {"last_input_consumed", diagnostics.last_resampler_input_consumed}};
+  return value;
 }
 
 }  // namespace
@@ -155,7 +243,8 @@ void VoiceFrontendRuntime::initialize_pipeline() {
   }
   vad_ = create_vad(config_.vad);
   kws_ = create_keyword_spotter(config_.kws);
-  segmenter_ = std::make_unique<UtteranceSegmenter>(config_.segmentation, *ring_);
+  segmenter_ = std::make_unique<UtteranceSegmenter>(
+      config_.segmentation, config_.activation, *ring_);
   candidate_assembler_ = std::make_unique<CandidateAssembler>(
       *ring_, config_.segmentation.assembly_queue_capacity);
   StreamingRecognizerConfig asr_config;
@@ -186,14 +275,33 @@ void VoiceFrontendRuntime::initialize_pipeline() {
     completed_command_snapshots_.clear();
     completed_command_snapshot_order_.clear();
   }
+  announcement_dispatcher_ = std::make_unique<AnnouncementDispatcher>(
+      std::make_shared<LogAnnouncementBackend>(),
+      AnnouncementDispatcherConfig{config_.announcements.queue_capacity, false},
+      [this](const AnnouncementResult& result) {
+        handle_announcement_result(result);
+      });
   action_executor_ = std::make_unique<OrderedActionExecutor>(
       create_windows_action_backend(
           {config_.audio.loopback_device, config_.commands.action_timeout_ms}),
       ActionExecutorConfig{config_.commands.queue_capacity, 4096, ExecutionMode::live},
-      [this](const ActionResult& result) { handle_action_result(result); });
+      [this](const ActionResult& result) { handle_action_result(result); },
+      [this](const CommandPlan& plan) { handle_plan_started(plan); });
+  {
+    std::scoped_lock announcement_lock(announcement_state_mutex_);
+    latest_live_announcement_ = nullptr;
+    latest_replay_announcement_ = nullptr;
+  }
   active_recognizers_.clear();
   pending_recognition_starts_.clear();
   recognition_generation_.fetch_add(1, std::memory_order_acq_rel);
+  announcement_playback_active_.store(false, std::memory_order_release);
+  announcement_guard_until_sample_.store(0, std::memory_order_release);
+  announcement_kws_reset_pending_.store(false, std::memory_order_release);
+  announcement_playback_start_sample_ = 0;
+  vad_speech_active_ = false;
+  suppress_current_vad_interval_ = false;
+  last_published_activation_state_ = {};
   reset_audio_queues();
   telemetry_queue_ = std::make_unique<SpscQueue<TelemetrySample>>(128);
   telemetry_queue_drops_.store(0, std::memory_order_release);
@@ -228,6 +336,7 @@ void VoiceFrontendRuntime::start_live(bool enable_web) {
   emit_event("asr_status", {{"state", to_string(asr_->state())},
                             {"status", asr_->status()}});
   emit_event("runtime_mode", {{"mode", "live"}});
+  emit_activation_state("live");
   emit_event("config_state", {{"config", config_store_.to_public_json(config_)}});
   emit_event("sessions", session_list());
 }
@@ -253,6 +362,7 @@ void VoiceFrontendRuntime::start_replay(const std::filesystem::path& session, bo
   emit_event("asr_status", {{"state", to_string(asr_->state())},
                             {"status", asr_->status()}}, 0, "replay");
   emit_event("runtime_mode", {{"mode", "replay"}, {"session", session.string()}}, 0, "replay");
+  emit_activation_state("replay");
   emit_event("config_state", {{"config", config_store_.to_public_json(config_)}}, 0, "replay");
   emit_event("sessions", session_list(), 0, "replay");
 }
@@ -309,6 +419,9 @@ nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& 
   const bool asr_idle = asr_ ? asr_->wait_until_idle(remaining()) : true;
   const bool actions_idle =
       action_executor_ ? action_executor_->wait_until_idle(remaining()) : true;
+  const bool announcements_idle = announcement_dispatcher_
+                                      ? announcement_dispatcher_->wait_until_idle(remaining())
+                                      : true;
   auto metrics = metrics_json();
   metrics["elapsed_ms"] = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started).count();
@@ -316,11 +429,12 @@ nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& 
   metrics["benchmark_wait"] = {{"replay_finished", replay_finished},
                                {"pipeline_idle", pipeline_idle},
                                {"asr_load_finished", asr_load_finished},
-                               {"asr_idle", asr_idle},
-                               {"actions_idle", actions_idle},
-                               {"timed_out", !(replay_finished && pipeline_idle &&
-                                                asr_load_finished && asr_idle &&
-                                                actions_idle)},
+                                {"asr_idle", asr_idle},
+                                {"actions_idle", actions_idle},
+                                {"announcements_idle", announcements_idle},
+                                {"timed_out", !(replay_finished && pipeline_idle &&
+                                                 asr_load_finished && asr_idle &&
+                                                 actions_idle && announcements_idle)},
                                {"active_provisional_streams",
                                 active_recognizers_.size()}};
   benchmark_capture_enabled_.store(false, std::memory_order_release);
@@ -389,6 +503,8 @@ void VoiceFrontendRuntime::publish_telemetry(TelemetrySample sample) {
        {"asr_state", to_string(sample.asr_state)},
        {"assembly_outstanding", sample.assembly_outstanding},
        {"action_queue_depth", sample.action_queue_depth},
+       {"announcement_queue_depth", sample.announcement_queue_depth},
+       {"activation", activation_json(sample.activation)},
        {"aec", preprocess_json(sample.aec)},
        {"telemetry_dropped",
         sample.debug_dropped +
@@ -434,6 +550,16 @@ void VoiceFrontendRuntime::stop() {
   stop_captures();
   if (replay_) { replay_->stop(); replay_.reset(); }
   stop_processing();
+  {
+    std::scoped_lock lock(pipeline_mutex_);
+    if (segmenter_) {
+      segmenter_->cancel_activation(ring_ ? ring_->tail() : 0,
+                                    "runtime_stopped");
+      emit_activation_events(segmenter_->take_activation_events());
+      emit_activation_state_if_changed(ring_ ? ring_->tail() : 0,
+                                       replay_mode_.load() ? "replay" : "live");
+    }
+  }
   stop_async_services();
   recorder_.stop(metrics_json());
 }
@@ -448,6 +574,12 @@ void VoiceFrontendRuntime::stop_async_services() {
   asr_.reset();
   if (action_executor_) action_executor_->stop(false);
   action_executor_.reset();
+  if (announcement_dispatcher_) announcement_dispatcher_->stop(false);
+  announcement_dispatcher_.reset();
+  announcement_playback_active_.store(false, std::memory_order_release);
+  announcement_guard_until_sample_.store(0, std::memory_order_release);
+  announcement_kws_reset_pending_.store(false, std::memory_order_release);
+  announcement_playback_start_sample_ = 0;
   {
     std::scoped_lock command_lock(command_mutex_);
     command_snapshots_.clear();
@@ -654,8 +786,36 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
   }
 
   const auto vad_update = vad_->accept(frame);
-  segmenter_->set_vad_state(vad_update.speech, frame.first_sample + frame.samples.size());
-  for (const auto& interval : vad_update.completed) segmenter_->add_vad_interval(interval);
+  const bool vad_started = vad_update.speech && !vad_speech_active_;
+  vad_speech_active_ = vad_update.speech;
+  const auto frame_end = frame.first_sample + frame.samples.size();
+  const auto vad_transition_sample = vad_update.speech
+                                         ? frame.first_sample
+                                         : (!vad_update.completed.empty()
+                                                ? vad_update.completed.back().span.end
+                                                : frame_end);
+  const bool capture_blocked =
+      announcement_capture_blocked(vad_transition_sample);
+  if (!capture_blocked &&
+      announcement_kws_reset_pending_.exchange(false,
+                                                std::memory_order_acq_rel)) {
+    kws_->reset(frame_end);
+  }
+  if (capture_blocked && vad_started) {
+    suppress_current_vad_interval_ = true;
+  }
+  if (auto start = segmenter_->set_vad_state(
+          vad_update.speech, vad_transition_sample,
+          !capture_blocked && !suppress_current_vad_interval_)) {
+    followup_turns_.fetch_add(1, std::memory_order_relaxed);
+    begin_recognition(*start);
+  }
+  for (const auto& interval : vad_update.completed) {
+    if (!suppress_current_vad_interval_) segmenter_->add_vad_interval(interval);
+  }
+  if (!vad_update.speech && !vad_update.completed.empty()) {
+    suppress_current_vad_interval_ = false;
+  }
 
   if (auto hit = kws_->accept(frame)) {
     const auto guard = static_cast<std::uint64_t>(config_.segmentation.wake_guard_ms) * kProcessingSampleRate / 1000;
@@ -664,8 +824,22 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
     kws_hits_.fetch_add(1, std::memory_order_relaxed);
     emit_event("kws_hit", kws_json(*hit), hit->detected_at_sample,
                replay_mode_ ? "replay" : "live");
-    if (auto start = segmenter_->add_kws_hit(std::move(*hit))) {
-      begin_recognition(*start);
+    if (capture_blocked || suppress_current_vad_interval_) {
+      emit_event("kws_suppressed",
+                 {{"reason", "announcement_playback_guard"},
+                  {"keyword", hit->keyword}},
+                 hit->detected_at_sample,
+                 replay_mode_ ? "replay" : "live");
+    } else {
+      const bool rearming = segmenter_->activation().active();
+      if (auto start = segmenter_->add_kws_hit(std::move(*hit))) {
+        emit_activation_events(segmenter_->take_activation_events());
+        if (rearming) {
+          if (candidate_assembler_) candidate_assembler_->cancel_pending();
+          cancel_recognition_generation("keyword activation rearmed");
+        }
+        begin_recognition(*start);
+      }
     }
   }
 
@@ -675,9 +849,17 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
       frame.first_sample + frame.samples.size());
   for (auto& request : segmented.assemblies) {
     const auto utterance_id = request.candidate.utterance_id;
+    const auto origin = request.candidate.origin;
+    const auto activation_id = request.candidate.activation_id;
+    const auto turn_index = request.candidate.turn_index;
+    const auto trigger_sample = request.candidate.trigger_sample;
     if (candidate_assembler_ && candidate_assembler_->try_submit(std::move(request))) {
       emit_event("candidate_assembly_queued",
                  {{"utterance_id", utterance_id},
+                  {"origin", to_string(origin)},
+                   {"activation_id", activation_id},
+                   {"turn_index", turn_index},
+                   {"trigger_sample", trigger_sample},
                   {"outstanding", candidate_assembler_->outstanding()}},
                  frame.first_sample, replay_mode_ ? "replay" : "live");
     } else {
@@ -685,18 +867,35 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
       assembly_dropped_.fetch_add(1, std::memory_order_relaxed);
       rejections_.fetch_add(1, std::memory_order_relaxed);
       emit_event("candidate_rejected",
-                 {{"utterance_id", utterance_id}, {"reason", reason}},
+                 {{"utterance_id", utterance_id},
+                  {"origin", to_string(origin)},
+                   {"activation_id", activation_id},
+                   {"turn_index", turn_index},
+                   {"trigger_sample", trigger_sample},
+                  {"reason", reason}},
                  frame.first_sample, replay_mode_ ? "replay" : "live");
+      abandon_followup(origin, activation_id, turn_index, frame_end, reason);
       cancel_recognition(utterance_id, reason);
     }
   }
   for (const auto& rejection : segmented.rejections) {
     rejections_.fetch_add(1, std::memory_order_relaxed);
     emit_event("candidate_rejected", {{"utterance_id", rejection.utterance_id},
-                                       {"reason", rejection.reason}}, frame.first_sample,
+                                       {"origin", to_string(rejection.origin)},
+                                       {"activation_id", rejection.activation_id},
+                                       {"turn_index", rejection.turn_index},
+                                       {"trigger_sample", rejection.trigger_sample},
+                                       {"reason", rejection.reason}},
+               rejection.end_sample,
                replay_mode_ ? "replay" : "live");
+    abandon_followup(rejection.origin, rejection.activation_id,
+                     rejection.turn_index, rejection.end_sample,
+                     rejection.reason);
     cancel_recognition(rejection.utterance_id, rejection.reason);
   }
+  emit_activation_events(std::move(segmented.activation_events));
+  emit_activation_state_if_changed(
+      frame_end, replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
 
   if (telemetry_enabled_.load(std::memory_order_relaxed) &&
       frame.first_sample >= next_telemetry_sample_) {
@@ -718,6 +917,9 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
         candidate_assembler_ ? candidate_assembler_->outstanding() : 0;
     telemetry.action_queue_depth =
         action_executor_ ? action_executor_->queue_size() : 0;
+    telemetry.announcement_queue_depth =
+        announcement_dispatcher_ ? announcement_dispatcher_->queue_size() : 0;
+    telemetry.activation = segmenter_->activation();
     telemetry.aec = preprocessor_->Diagnostics();
     telemetry.debug_dropped = debug_.dropped();
     telemetry.audio_queue_drops =
@@ -759,17 +961,23 @@ void VoiceFrontendRuntime::complete_backfill(BackfillAssemblyResult result) {
     erase_command_snapshot(result.utterance_id, result.recognition_generation);
     emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel,
                               result.utterance_id, result.recognition_generation,
-                              result.wake_end_sample, 0,
+                              result.stream_start_sample, 0,
                               replay_mode_.load(std::memory_order_acquire) ? "replay" : "live",
                               result.rejection.empty()
                                   ? "recognition start no longer pending"
-                                  : result.rejection});
+                                  : result.rejection,
+                              result.origin, result.activation_id,
+                              result.turn_index, result.trigger_sample});
     emit_event("asr_backfill_stale",
                {{"utterance_id", result.utterance_id},
+                {"origin", to_string(result.origin)},
+                {"activation_id", result.activation_id},
+                {"turn_index", result.turn_index},
+                {"trigger_sample", result.trigger_sample},
                 {"reason", result.rejection.empty()
                                ? "recognition start no longer pending"
                                : result.rejection}},
-               result.wake_end_sample,
+               result.stream_start_sample,
                replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
     return;
   }
@@ -780,18 +988,32 @@ void VoiceFrontendRuntime::complete_backfill(BackfillAssemblyResult result) {
       result.recognition_generation != pending.generation ||
       pending.generation != recognition_generation_.load(std::memory_order_acquire)) {
     asr_dropped_.fetch_add(1, std::memory_order_relaxed);
-    erase_command_snapshot(result.utterance_id, pending.generation);
-    emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel,
-                              result.utterance_id, pending.generation,
-                              result.wake_end_sample, 0,
-                              replay_mode_.load(std::memory_order_acquire) ? "replay" : "live",
-                              result.rejection.empty() ? "stale recognition generation"
-                                                       : result.rejection});
+    if (result.recognition_generation != pending.generation ||
+        pending.generation !=
+            recognition_generation_.load(std::memory_order_acquire)) {
+      erase_command_snapshot(result.utterance_id, pending.generation);
+    }
+    if (result.recognition_generation != pending.generation ||
+        pending.generation !=
+            recognition_generation_.load(std::memory_order_acquire)) {
+      emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel,
+                                result.utterance_id, pending.generation,
+                                result.stream_start_sample, 0,
+                                replay_mode_.load(std::memory_order_acquire)
+                                     ? "replay"
+                                     : "live",
+                                "stale recognition generation", pending.origin,
+                                pending.activation_id, pending.turn_index,
+                                pending.trigger_sample});
+    }
     emit_event("asr_backfill_rejected",
                {{"utterance_id", result.utterance_id},
+                {"origin", to_string(pending.origin)},
+                {"activation_id", pending.activation_id},
+                {"turn_index", pending.turn_index},
                 {"reason", result.rejection.empty() ? "stale recognition generation"
                                                      : result.rejection}},
-               result.wake_end_sample,
+               result.stream_start_sample,
                replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
     return;
   }
@@ -801,17 +1023,14 @@ void VoiceFrontendRuntime::complete_backfill(BackfillAssemblyResult result) {
   if (!asr_ || recognizer_state == StreamingRecognizerState::unavailable ||
       recognizer_state == StreamingRecognizerState::stopped) {
     asr_dropped_.fetch_add(1, std::memory_order_relaxed);
-    erase_command_snapshot(result.utterance_id, pending.generation);
-    emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel,
-                              result.utterance_id, pending.generation,
-                              result.wake_end_sample, 0,
-                              replay_mode_.load(std::memory_order_acquire) ? "replay" : "live",
-                              "recognizer unavailable before stream begin"});
     emit_event("asr_unavailable",
                {{"utterance_id", result.utterance_id},
+                {"origin", to_string(pending.origin)},
+                {"activation_id", pending.activation_id},
+                {"turn_index", pending.turn_index},
                 {"state", to_string(recognizer_state)},
                 {"status", asr_ ? asr_->status() : "recognizer unavailable"}},
-               result.wake_end_sample,
+               result.stream_start_sample,
                replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
     return;
   }
@@ -821,30 +1040,30 @@ void VoiceFrontendRuntime::complete_backfill(BackfillAssemblyResult result) {
   begin.utterance_id = result.utterance_id;
   begin.generation = pending.generation;
   begin.source = replay_mode_.load(std::memory_order_acquire) ? "replay" : "live";
-  begin.left_backfill_first_sample = backfill->empty() ? pending.wake_end_sample
-                                                       : result.first_sample;
-  begin.left_backfill = std::move(backfill);
+  begin.backfill_first_sample = backfill->empty() ? pending.stream_start_sample
+                                                  : result.first_sample;
+  begin.backfill = std::move(backfill);
   const auto submitted = asr_->try_begin(std::move(begin));
   if (submitted != RecognitionSubmitStatus::accepted) {
     asr_dropped_.fetch_add(1, std::memory_order_relaxed);
-    erase_command_snapshot(result.utterance_id, pending.generation);
-    emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel,
-                              result.utterance_id, pending.generation,
-                              result.wake_end_sample, 0,
-                              replay_mode_.load(std::memory_order_acquire) ? "replay" : "live",
-                              "recognizer rejected begin: " +
-                                  std::string(to_string(submitted))});
     emit_event("asr_overloaded",
                {{"utterance_id", result.utterance_id},
+                {"origin", to_string(pending.origin)},
+                {"activation_id", pending.activation_id},
+                {"turn_index", pending.turn_index},
                 {"status", to_string(submitted)}},
-               result.wake_end_sample,
+               result.stream_start_sample,
                replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
     return;
   }
 
   ActiveRecognitionFeed active;
   active.generation = pending.generation;
-  active.wake_end_sample = pending.wake_end_sample;
+  active.stream_start_sample = pending.stream_start_sample;
+  active.origin = pending.origin;
+  active.activation_id = pending.activation_id;
+  active.turn_index = pending.turn_index;
+  active.trigger_sample = pending.trigger_sample;
   active.pending_first_sample = pending.pending_first_sample;
   active.chunk_samples = pending.chunk_samples;
   active.pending = std::move(pending.pending);
@@ -853,11 +1072,15 @@ void VoiceFrontendRuntime::complete_backfill(BackfillAssemblyResult result) {
   emit_event("asr_queued",
              {{"utterance_id", result.utterance_id},
               {"generation", pending.generation},
+              {"origin", to_string(pending.origin)},
+              {"activation_id", pending.activation_id},
+              {"turn_index", pending.turn_index},
+              {"trigger_sample", pending.trigger_sample},
               {"state", to_string(recognizer_state)},
               {"command_config_revision", pending.command_config_revision},
-              {"left_spans", pending.left_span_count},
+              {"backfill_spans", pending.backfill_span_count},
               {"backfill_truncated", result.truncated}},
-             result.wake_end_sample,
+             result.stream_start_sample,
              replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
 }
 
@@ -866,8 +1089,15 @@ void VoiceFrontendRuntime::complete_candidate(CandidateAssemblyResult result) {
     rejections_.fetch_add(1, std::memory_order_relaxed);
     emit_event("candidate_rejected",
                {{"utterance_id", result.utterance_id},
+                {"origin", to_string(result.origin)},
+                {"activation_id", result.activation_id},
+                {"turn_index", result.turn_index},
+                {"trigger_sample", result.trigger_sample},
                 {"reason", result.rejection}},
-               0, replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
+               result.trigger_sample,
+               replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
+    abandon_followup(result.origin, result.activation_id, result.turn_index,
+                     result.end_sample, result.rejection);
     cancel_recognition(result.utterance_id, result.rejection);
     return;
   }
@@ -875,7 +1105,7 @@ void VoiceFrontendRuntime::complete_candidate(CandidateAssemblyResult result) {
   candidates_.fetch_add(1, std::memory_order_relaxed);
   auto shared = std::make_shared<const UtteranceCandidate>(
       std::move(*result.candidate));
-  const auto timestamp = shared->wake_span.end;
+  const auto timestamp = candidate_end_sample(*shared);
   emit_event("candidate", candidate_json(*shared), timestamp,
              replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
   if (recorder_.active()) recorder_.try_enqueue(RecordCandidate{shared});
@@ -886,18 +1116,26 @@ void VoiceFrontendRuntime::begin_recognition(const UtteranceStart& start) {
   const auto generation = recognition_generation_.load(std::memory_order_acquire);
   const auto source = replay_mode_.load(std::memory_order_acquire) ? "replay" : "live";
   emit_utterance_lifecycle({UtteranceLifecyclePhase::begin, start.utterance_id,
-                            generation, start.wake_span.end, 0, source,
-                            "keyword-associated utterance created"});
+                            generation, start.stream_start_sample, 0, source,
+                            start.origin == UtteranceOrigin::keyword
+                                ? "keyword-associated utterance created"
+                                : "activation follow-up utterance created",
+                            start.origin, start.activation_id, start.turn_index,
+                            start.trigger_sample});
   if (!asr_ || !config_.asr.enabled) {
     emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, start.utterance_id,
-                              generation, start.wake_span.end, 0, source,
-                              "streaming recognition is disabled"});
+                              generation, start.stream_start_sample, 0, source,
+                              "streaming recognition is disabled", start.origin,
+                              start.activation_id, start.turn_index,
+                              start.trigger_sample});
     return;
   }
   UtteranceCommandSnapshot command_snapshot;
   {
     std::scoped_lock command_lock(command_mutex_);
-    command_snapshot = {command_parser_, command_config_revision_, commands_enabled_};
+    command_snapshot = {command_parser_, command_config_revision_, commands_enabled_,
+                        start.origin, start.activation_id, start.turn_index,
+                        start.trigger_sample};
     const auto key = command_snapshot_key(start.utterance_id, generation);
     completed_command_snapshots_.erase(key);
     std::erase(completed_command_snapshot_order_, key);
@@ -907,13 +1145,13 @@ void VoiceFrontendRuntime::begin_recognition(const UtteranceStart& start) {
   if (recognizer_state == StreamingRecognizerState::unavailable ||
       recognizer_state == StreamingRecognizerState::stopped) {
     asr_dropped_.fetch_add(1, std::memory_order_relaxed);
-    erase_command_snapshot(start.utterance_id, generation);
-    emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, start.utterance_id,
-                              generation, start.wake_span.end, 0, source,
-                              "recognizer unavailable at utterance begin"});
     emit_event("asr_unavailable", {{"utterance_id", start.utterance_id},
+                                    {"origin", to_string(start.origin)},
+                                    {"activation_id", start.activation_id},
+                                    {"turn_index", start.turn_index},
                                     {"state", to_string(recognizer_state)},
-                                    {"status", asr_->status()}}, start.wake_span.end,
+                                    {"status", asr_->status()}},
+               start.stream_start_sample,
                replay_mode_ ? "replay" : "live");
     return;
   }
@@ -921,46 +1159,54 @@ void VoiceFrontendRuntime::begin_recognition(const UtteranceStart& start) {
                                 pending_recognition_starts_.size();
   if (starting_streams >= config_.asr.max_active_streams) {
     asr_dropped_.fetch_add(1, std::memory_order_relaxed);
-    erase_command_snapshot(start.utterance_id, generation);
-    emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, start.utterance_id,
-                              generation, start.wake_span.end, 0, source,
-                              "active recognizer stream limit reached"});
     emit_event("asr_stream_rejected",
                {{"utterance_id", start.utterance_id},
+                {"origin", to_string(start.origin)},
+                {"activation_id", start.activation_id},
+                {"turn_index", start.turn_index},
                 {"reason", "active_stream_limit"},
                 {"active_streams", starting_streams},
                 {"max_active_streams", config_.asr.max_active_streams}},
-               start.wake_span.end,
+               start.stream_start_sample,
                replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
     return;
   }
 
   BackfillAssemblyRequest request;
   request.utterance_id = start.utterance_id;
-  request.source_spans = start.provisional_left_spans;
+  request.origin = start.origin;
+  request.activation_id = start.activation_id;
+  request.turn_index = start.turn_index;
+  request.trigger_sample = start.trigger_sample;
+  request.source_spans = start.backfill_spans;
   request.trailing_silence_samples =
-      static_cast<std::size_t>(config_.segmentation.embedded_join_silence_ms) *
-      kProcessingSampleRate / 1000;
-  request.wake_end_sample = start.wake_span.end;
+      start.origin == UtteranceOrigin::keyword
+          ? static_cast<std::size_t>(config_.segmentation.embedded_join_silence_ms) *
+                kProcessingSampleRate / 1000
+          : 0;
+  request.stream_start_sample = start.stream_start_sample;
   request.recognition_generation = generation;
   if (!candidate_assembler_ || !candidate_assembler_->try_submit(std::move(request))) {
     assembly_dropped_.fetch_add(1, std::memory_order_relaxed);
     asr_dropped_.fetch_add(1, std::memory_order_relaxed);
-    erase_command_snapshot(start.utterance_id, generation);
-    emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, start.utterance_id,
-                              generation, start.wake_span.end, 0, source,
-                              "audio backfill assembly queue is full"});
     emit_event("asr_backfill_rejected",
                {{"utterance_id", start.utterance_id},
+                {"origin", to_string(start.origin)},
+                {"activation_id", start.activation_id},
+                {"turn_index", start.turn_index},
                 {"reason", "audio assembly queue is full"}},
-               start.wake_span.end,
+               start.stream_start_sample,
                replay_mode_ ? "replay" : "live");
     return;
   }
 
   PendingRecognitionStart pending;
   pending.generation = generation;
-  pending.wake_end_sample = start.wake_span.end;
+  pending.stream_start_sample = start.stream_start_sample;
+  pending.origin = start.origin;
+  pending.activation_id = start.activation_id;
+  pending.turn_index = start.turn_index;
+  pending.trigger_sample = start.trigger_sample;
   pending.chunk_samples = std::max<std::size_t>(
       kFrameSamples, static_cast<std::size_t>(config_.asr.feed_chunk_ms) *
                          kProcessingSampleRate / 1000);
@@ -969,15 +1215,19 @@ void VoiceFrontendRuntime::begin_recognition(const UtteranceStart& start) {
       kProcessingSampleRate / 1000;
   pending.pending.reserve(std::min(pending_limit, pending.chunk_samples * 2));
   pending.command_config_revision = command_snapshot.config_revision;
-  pending.left_span_count = start.provisional_left_spans.size();
+  pending.backfill_span_count = start.backfill_spans.size();
   pending_recognition_starts_.insert_or_assign(start.utterance_id, pending);
   emit_event("asr_backfill_queued",
              {{"utterance_id", start.utterance_id},
               {"generation", generation},
+              {"origin", to_string(start.origin)},
+              {"activation_id", start.activation_id},
+              {"turn_index", start.turn_index},
+              {"trigger_sample", start.trigger_sample},
               {"command_config_revision", command_snapshot.config_revision},
-              {"left_spans", start.provisional_left_spans.size()},
+              {"backfill_spans", start.backfill_spans.size()},
               {"assembly_outstanding", candidate_assembler_->outstanding()}},
-             start.wake_span.end, replay_mode_ ? "replay" : "live");
+             start.stream_start_sample, replay_mode_ ? "replay" : "live");
 }
 
 void VoiceFrontendRuntime::feed_recognizers(const NormalizedFrame& frame) {
@@ -988,14 +1238,18 @@ void VoiceFrontendRuntime::feed_recognizers(const NormalizedFrame& frame) {
   const auto pending_limit = static_cast<std::size_t>(config_.asr.max_pending_audio_ms) *
                              kProcessingSampleRate / 1000;
   for (auto& [utterance_id, pending] : pending_recognition_starts_) {
-    if (frame_end <= pending.wake_end_sample) continue;
-    const auto start_sample = std::max(frame.first_sample, pending.wake_end_sample);
+    if (frame_end <= pending.stream_start_sample) continue;
+    const auto start_sample = std::max(frame.first_sample, pending.stream_start_sample);
     const auto offset = static_cast<std::size_t>(start_sample - frame.first_sample);
     const auto incoming = frame.samples.size() - offset;
     if (pending.pending.size() + incoming > pending_limit) {
       asr_dropped_.fetch_add(1, std::memory_order_relaxed);
       emit_event("asr_overloaded",
                  {{"utterance_id", utterance_id},
+                  {"origin", to_string(pending.origin)},
+                  {"activation_id", pending.activation_id},
+                  {"turn_index", pending.turn_index},
+                  {"trigger_sample", pending.trigger_sample},
                   {"status", "pending backfill audio limit reached"}},
                  frame.first_sample, replay_mode_ ? "replay" : "live");
       cancel_recognition_generation("ASR backfill assembly did not keep up");
@@ -1011,11 +1265,11 @@ void VoiceFrontendRuntime::feed_recognizers(const NormalizedFrame& frame) {
   bool cancel_generation_for_overload{};
   for (auto it = active_recognizers_.begin(); it != active_recognizers_.end();) {
     auto& state = it->second;
-    if (frame_end <= state.wake_end_sample) {
+    if (frame_end <= state.stream_start_sample) {
       ++it;
       continue;
     }
-    const auto start_sample = std::max(frame.first_sample, state.wake_end_sample);
+    const auto start_sample = std::max(frame.first_sample, state.stream_start_sample);
     const auto offset = static_cast<std::size_t>(start_sample - frame.first_sample);
     if (state.pending.empty()) state.pending_first_sample = start_sample;
     state.pending.insert(state.pending.end(), frame.samples.begin() +
@@ -1031,6 +1285,10 @@ void VoiceFrontendRuntime::feed_recognizers(const NormalizedFrame& frame) {
       const auto status = asr_->try_accept(std::move(chunk));
       if (status != RecognitionSubmitStatus::accepted) {
         emit_event("asr_overloaded", {{"utterance_id", it->first},
+                                       {"origin", to_string(state.origin)},
+                                       {"activation_id", state.activation_id},
+                                       {"turn_index", state.turn_index},
+                                       {"trigger_sample", state.trigger_sample},
                                        {"status", to_string(status)}}, frame.first_sample,
                    replay_mode_ ? "replay" : "live");
         asr_dropped_.fetch_add(1, std::memory_order_relaxed);
@@ -1039,9 +1297,11 @@ void VoiceFrontendRuntime::feed_recognizers(const NormalizedFrame& frame) {
       }
       emit_utterance_lifecycle({UtteranceLifecyclePhase::chunk, it->first,
                                 state.generation, state.pending_first_sample,
-                                state.chunk_samples,
-                                replay_mode_.load(std::memory_order_acquire) ? "replay" : "live",
-                                "streaming ASR audio chunk accepted"});
+                                 state.chunk_samples,
+                                 replay_mode_.load(std::memory_order_acquire) ? "replay" : "live",
+                                 "streaming ASR audio chunk accepted",
+                                 state.origin, state.activation_id,
+                                 state.turn_index, state.trigger_sample});
       state.pending.erase(state.pending.begin(),
                           state.pending.begin() +
                               static_cast<std::ptrdiff_t>(state.chunk_samples));
@@ -1068,11 +1328,16 @@ void VoiceFrontendRuntime::finalize_recognition(
   const auto utterance_id = candidate->utterance_id;
   if (!asr_) {
     const auto generation = recognition_generation_.load(std::memory_order_acquire);
+    abandon_followup(candidate->origin, candidate->activation_id,
+                     candidate->turn_index, candidate_end_sample(*candidate),
+                     "recognizer unavailable at finalize");
     erase_command_snapshot(utterance_id, generation);
     emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, utterance_id,
-                              generation, candidate->wake_span.end, 0,
+                              generation, candidate_end_sample(*candidate), 0,
                               replay_mode_.load(std::memory_order_acquire) ? "replay" : "live",
-                              "recognizer unavailable at finalize"});
+                              "recognizer unavailable at finalize",
+                              candidate->origin, candidate->activation_id,
+                              candidate->turn_index, candidate->trigger_sample});
     return;
   }
   const auto it = active_recognizers_.find(utterance_id);
@@ -1088,26 +1353,39 @@ void VoiceFrontendRuntime::finalize_recognition(
   if (status != RecognitionSubmitStatus::accepted) {
     asr_dropped_.fetch_add(1, std::memory_order_relaxed);
     emit_event("asr_finalize_dropped", {{"utterance_id", utterance_id},
-                                         {"status", to_string(status)}}, 0,
+                                         {"origin", to_string(candidate->origin)},
+                                         {"activation_id", candidate->activation_id},
+                                         {"turn_index", candidate->turn_index},
+                                         {"trigger_sample", candidate->trigger_sample},
+                                         {"status", to_string(status)}},
+               candidate_end_sample(*candidate),
                source);
     emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, utterance_id,
-                              generation, candidate->wake_span.end,
+                              generation, candidate_end_sample(*candidate),
                               candidate->pcm.size(), source,
                               "exact-final submission rejected: " +
-                                  std::string(to_string(status))});
+                                  std::string(to_string(status)),
+                              candidate->origin, candidate->activation_id,
+                              candidate->turn_index, candidate->trigger_sample});
     if (status == RecognitionSubmitStatus::queue_full ||
         status == RecognitionSubmitStatus::pending_audio_full) {
       cancel_recognition_generation("ASR exact-final submission overloaded");
     } else {
       erase_command_snapshot(utterance_id, generation);
     }
+    abandon_followup(candidate->origin, candidate->activation_id,
+                     candidate->turn_index, candidate_end_sample(*candidate),
+                     "exact-final submission rejected: " +
+                         std::string(to_string(status)));
   } else {
     emit_utterance_lifecycle({UtteranceLifecyclePhase::finalize, utterance_id,
                               generation, candidate->source_spans.empty()
-                                              ? candidate->wake_span.end
+                                              ? candidate_end_sample(*candidate)
                                               : candidate->source_spans.front().start,
                               candidate->pcm.size(), source,
-                              "authoritative exact-final decode queued"});
+                              "authoritative exact-final decode queued",
+                              candidate->origin, candidate->activation_id,
+                              candidate->turn_index, candidate->trigger_sample});
   }
 }
 
@@ -1121,12 +1399,35 @@ void VoiceFrontendRuntime::cancel_recognition(const std::string& utterance_id,
                                      ? pending->second.generation
                                      : recognition_generation_.load(
                                            std::memory_order_acquire));
+  std::optional<UtteranceCommandSnapshot> command_snapshot;
+  {
+    const auto key = command_snapshot_key(utterance_id, generation);
+    std::scoped_lock command_lock(command_mutex_);
+    if (const auto snapshot = command_snapshots_.find(key);
+        snapshot != command_snapshots_.end()) {
+      command_snapshot = snapshot->second;
+    } else if (const auto completed = completed_command_snapshots_.find(key);
+               completed != completed_command_snapshots_.end()) {
+      command_snapshot = completed->second;
+    }
+  }
+  if (command_snapshot) {
+    abandon_followup(command_snapshot->origin, command_snapshot->activation_id,
+                     command_snapshot->turn_index,
+                     ring_ ? ring_->tail() : 0, reason);
+  }
   if (pending != pending_recognition_starts_.end()) {
     pending_recognition_starts_.erase(pending);
   }
   const auto source = replay_mode_.load(std::memory_order_acquire) ? "replay" : "live";
   emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, utterance_id,
-                            generation, 0, 0, source, reason});
+                            generation, 0, 0, source, reason,
+                            command_snapshot ? command_snapshot->origin
+                                             : UtteranceOrigin::keyword,
+                            command_snapshot ? command_snapshot->activation_id
+                                             : std::string{},
+                            command_snapshot ? command_snapshot->turn_index : 0,
+                            command_snapshot ? command_snapshot->trigger_sample : 0});
   if (it == active_recognizers_.end() || !asr_) {
     erase_command_snapshot(utterance_id, generation);
     return;
@@ -1146,14 +1447,36 @@ void VoiceFrontendRuntime::cancel_recognition_generation(std::string reason) {
   const auto utterance_count = active_recognizers_.size() +
                                pending_recognition_starts_.size();
   const auto source = replay_mode_.load(std::memory_order_acquire) ? "replay" : "live";
+  std::vector<UtteranceCommandSnapshot> command_snapshots;
+  {
+    std::scoped_lock command_lock(command_mutex_);
+    command_snapshots.reserve(command_snapshots_.size() +
+                              completed_command_snapshots_.size());
+    for (const auto& [key, snapshot] : command_snapshots_) {
+      static_cast<void>(key);
+      command_snapshots.push_back(snapshot);
+    }
+    for (const auto& [key, snapshot] : completed_command_snapshots_) {
+      static_cast<void>(key);
+      command_snapshots.push_back(snapshot);
+    }
+  }
+  for (const auto& snapshot : command_snapshots) {
+    abandon_followup(snapshot.origin, snapshot.activation_id,
+                     snapshot.turn_index, ring_ ? ring_->tail() : 0, reason);
+  }
   for (const auto& [utterance_id, state] : active_recognizers_) {
     emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, utterance_id,
-                              state.generation, 0, 0, source, reason});
+                              state.generation, 0, 0, source, reason,
+                              state.origin, state.activation_id,
+                              state.turn_index, state.trigger_sample});
   }
   for (const auto& [utterance_id, state] : pending_recognition_starts_) {
     if (!active_recognizers_.contains(utterance_id)) {
       emit_utterance_lifecycle({UtteranceLifecyclePhase::cancel, utterance_id,
-                                state.generation, 0, 0, source, reason});
+                                state.generation, 0, 0, source, reason,
+                                state.origin, state.activation_id,
+                                state.turn_index, state.trigger_sample});
     }
   }
   if (utterance_count != 0) {
@@ -1187,7 +1510,11 @@ void VoiceFrontendRuntime::emit_utterance_lifecycle(UtteranceLifecycleEvent even
              {{"phase", to_string(event.phase)},
               {"utterance_id", event.utterance_id},
               {"generation", event.generation},
-              {"first_sample", event.first_sample},
+               {"origin", to_string(event.origin)},
+               {"activation_id", event.activation_id},
+               {"turn_index", event.turn_index},
+               {"trigger_sample", event.trigger_sample},
+               {"first_sample", event.first_sample},
               {"sample_count", event.sample_count},
               {"detail", event.detail}},
              timestamp, source);
@@ -1216,8 +1543,8 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
           completed_command_snapshots_.erase(completed_command_snapshot_order_.front());
           completed_command_snapshot_order_.pop_front();
         }
-      } else if (result.kind == RecognitionResultKind::cancelled ||
-                 result.kind == RecognitionResultKind::error) {
+      } else if (result.kind == RecognitionResultKind::error &&
+                 result.exact_final_attempt) {
         command_snapshots_.erase(it);
         completed_command_snapshots_.erase(key);
         std::erase(completed_command_snapshot_order_, key);
@@ -1231,12 +1558,34 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
   }
   const std::string source = result.source == "replay" ? "replay" : "live";
   const auto type = std::string("asr_") + to_string(result.kind);
+  const auto origin = result.candidate
+                          ? result.candidate->origin
+                          : (command_snapshot ? command_snapshot->origin
+                                              : UtteranceOrigin::keyword);
+  const auto activation_id = result.candidate
+                                 ? result.candidate->activation_id
+                                 : (command_snapshot
+                                        ? command_snapshot->activation_id
+                                        : std::string{});
+  const auto turn_index = result.candidate
+                              ? result.candidate->turn_index
+                              : (command_snapshot ? command_snapshot->turn_index : 0);
+  const auto trigger_sample = result.candidate
+                                  ? result.candidate->trigger_sample
+                                  : (command_snapshot
+                                         ? command_snapshot->trigger_sample
+                                         : 0);
   auto payload = nlohmann::json{{"utterance_id", result.utterance_id},
+                                {"origin", to_string(origin)},
+                                {"activation_id", activation_id},
+                                {"turn_index", turn_index},
+                                {"trigger_sample", trigger_sample},
                                 {"generation", result.generation},
                                 {"revision", result.revision},
                                 {"text", result.hypothesis.text},
                                 {"tokens", result.hypothesis.tokens},
                                 {"is_final", result.kind == RecognitionResultKind::final},
+                                {"exact_final_attempt", result.exact_final_attempt},
                                 {"exact_final", result.exact_final},
                                 {"latency_ms", result.latency_ms},
                                 {"inference_ms", result.inference_ms},
@@ -1254,19 +1603,51 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
     asr_partials_.fetch_add(1, std::memory_order_relaxed);
     return;
   }
+  if (result.kind == RecognitionResultKind::cancelled) {
+    std::scoped_lock pipeline_lock(pipeline_mutex_);
+    active_recognizers_.erase(result.utterance_id);
+    pending_recognition_starts_.erase(result.utterance_id);
+    return;
+  }
+  if (result.kind == RecognitionResultKind::error) {
+    std::scoped_lock pipeline_lock(pipeline_mutex_);
+    active_recognizers_.erase(result.utterance_id);
+    pending_recognition_starts_.erase(result.utterance_id);
+    if (result.exact_final_attempt) {
+      const auto resolution_sample = result.candidate
+                                         ? candidate_end_sample(*result.candidate)
+                                         : (ring_ ? ring_->tail()
+                                                  : result.audio_end_sample);
+      abandon_followup(origin, activation_id, turn_index,
+                       resolution_sample,
+                       result.detail.empty() ? "exact-final ASR error"
+                                             : result.detail);
+    }
+    return;
+  }
   if (result.kind != RecognitionResultKind::final) return;
   asr_finals_.fetch_add(1, std::memory_order_relaxed);
 
   const auto reject = [&](std::string reason) {
     command_rejections_.fetch_add(1, std::memory_order_relaxed);
     auto rejection = nlohmann::json{{"utterance_id", result.utterance_id},
+                                    {"origin", to_string(origin)},
+                                    {"activation_id", activation_id},
+                                    {"turn_index", turn_index},
+                                    {"trigger_sample", trigger_sample},
                                     {"text", result.hypothesis.text},
-                                    {"reason", std::move(reason)}};
+                                    {"reason", reason}};
     if (command_snapshot) {
       rejection["config_revision"] = command_snapshot->config_revision;
     }
     emit_event("command_rejected", std::move(rejection),
                result.audio_end_sample, source);
+    std::scoped_lock pipeline_lock(pipeline_mutex_);
+    abandon_followup(origin, activation_id, turn_index,
+                     result.candidate
+                         ? candidate_end_sample(*result.candidate)
+                         : result.audio_end_sample,
+                     std::move(reason));
   };
   if (!result.exact_final || !result.candidate) return reject("result is not an exact final decode");
   if (!command_snapshot || !command_snapshot->parser) {
@@ -1281,11 +1662,17 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
   CommandParseContext context;
   context.runtime_session_id = runtime_session_id_;
   context.utterance_id = result.utterance_id;
-  context.wake_position = to_string(result.candidate->position);
+  context.origin = result.candidate->origin;
+  context.activation_id = result.candidate->activation_id;
+  context.turn_index = result.candidate->turn_index;
+  context.trigger_sample = result.candidate->trigger_sample;
+  context.wake_position = result.candidate->position
+                              ? to_string(*result.candidate->position)
+                              : "";
   context.config_revision = command_snapshot->config_revision;
   context.recognition_generation = result.generation;
   context.final_revision = result.revision;
-  context.timestamp_sample = result.candidate->wake_span.end;
+  context.timestamp_sample = candidate_end_sample(*result.candidate);
   context.source = source == "live" ? ExecutionSource::live : ExecutionSource::replay;
   context.execution_mode = source == "live" ? ExecutionMode::live : ExecutionMode::dry_run;
   auto parsed = command_snapshot->parser->parse(result.hypothesis.text, context);
@@ -1296,13 +1683,19 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
 
   auto plan = std::move(*parsed.plan);
   SubmitResult submitted;
+  bool activation_eligible = true;
   {
     // Serialize the final generation check with pipeline resets. Whichever
     // side obtains the frame-boundary lock first defines whether this final is
     // executable or stale.
     std::scoped_lock pipeline_lock(pipeline_mutex_);
     if (result.generation != recognition_generation_.load(std::memory_order_acquire)) return;
-    submitted = action_executor_
+    activation_eligible = plan.origin != UtteranceOrigin::followup ||
+                          (segmenter_ && segmenter_->followup_plan_eligible(
+                                             plan.activation_id,
+                                             plan.turn_index));
+    if (activation_eligible) {
+      submitted = action_executor_
                     ? action_executor_->try_submit(
                           std::move(plan),
                           [this, timestamp = result.audio_end_sample,
@@ -1314,18 +1707,41 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
                               emit_event("action_queued",
                                          {{"command_id", accepted.command_id},
                                           {"utterance_id", accepted.utterance_id},
+                                          {"origin", to_string(accepted.origin)},
+                                          {"activation_id", accepted.activation_id},
+                                          {"turn_index", accepted.turn_index},
+                                          {"trigger_sample", accepted.trigger_sample},
                                           {"action_id", action.action_id},
                                           {"sequence", action.sequence},
                                           {"type", to_string(action.type)}},
                                          timestamp, source);
                             }
+                            if (segmenter_ && segmenter_->refresh_activation(
+                                                  accepted.activation_id,
+                                                  accepted.turn_index,
+                                                  accepted.timestamp_sample)) {
+                              auto events = segmenter_->take_activation_events();
+                              const auto refresh_sample = events.empty()
+                                                              ? accepted.timestamp_sample
+                                                              : events.back().at_sample;
+                              emit_activation_events(std::move(events), source);
+                              emit_activation_state_if_changed(
+                                  refresh_sample, source);
+                            }
                           })
                     : SubmitResult{SubmitStatus::stopped,
                                    "action executor unavailable"};
+    }
+  }
+  if (!activation_eligible) {
+    return reject("follow-up started outside the validated activation window");
   }
   if (!submitted.accepted()) {
     emit_event("action_submit_failed",
                {{"utterance_id", result.utterance_id},
+                {"origin", to_string(origin)},
+                {"activation_id", activation_id},
+                {"turn_index", turn_index},
                 {"status", to_string(submitted.status)},
                 {"error", submitted.error}},
                result.audio_end_sample, source);
@@ -1350,6 +1766,249 @@ void VoiceFrontendRuntime::handle_action_result(const ActionResult& result) {
              to_string(result.source));
 }
 
+void VoiceFrontendRuntime::handle_plan_started(const CommandPlan& plan) {
+  AnnouncementsConfig announcements;
+  {
+    std::scoped_lock config_lock(config_mutex_);
+    announcements = config_.announcements;
+  }
+
+  auto request = make_plan_announcement(
+      plan, plan.command_id + ":plan-started");
+  announcements_requested_.fetch_add(1, std::memory_order_relaxed);
+  if (!announcements.enabled) {
+    auto payload = announcement_request_json(request, "suppressed");
+    {
+      std::scoped_lock announcement_lock(announcement_state_mutex_);
+      (request.source == ExecutionSource::live ? latest_live_announcement_
+                                                : latest_replay_announcement_) = payload;
+    }
+    emit_event("announcement", std::move(payload),
+               request.timestamp_sample, to_string(request.source));
+    return;
+  }
+
+  // This synchronous structured event is the user-visible announcement. It
+  // is emitted by the plan-start observer before execute_plan can publish the
+  // first action_started result. Backend delivery remains fully asynchronous.
+  auto payload = announcement_request_json(request, "requested");
+  {
+    std::scoped_lock announcement_lock(announcement_state_mutex_);
+    (request.source == ExecutionSource::live ? latest_live_announcement_
+                                              : latest_replay_announcement_) = payload;
+  }
+  emit_event("announcement", std::move(payload), request.timestamp_sample,
+             to_string(request.source));
+  const auto submitted = announcement_dispatcher_
+                             ? announcement_dispatcher_->try_submit(request)
+                             : AnnouncementSubmitResult{
+                                   AnnouncementSubmitStatus::stopped,
+                                   "announcement dispatcher unavailable"};
+  if (submitted.accepted()) return;
+
+  announcements_dropped_.fetch_add(1, std::memory_order_relaxed);
+  auto diagnostic = announcement_request_json(
+      request, std::string("dropped:") + to_string(submitted.status));
+  diagnostic["error"] = submitted.error;
+  {
+    std::scoped_lock announcement_lock(announcement_state_mutex_);
+    (request.source == ExecutionSource::live ? latest_live_announcement_
+                                              : latest_replay_announcement_) = diagnostic;
+  }
+  emit_event("announcement_dropped", std::move(diagnostic),
+             request.timestamp_sample, to_string(request.source));
+}
+
+void VoiceFrontendRuntime::handle_announcement_result(
+    const AnnouncementResult& result) {
+  // The log backend's authoritative audit event was already published
+  // synchronously by handle_plan_started. Omitting its instantaneous worker
+  // lifecycle keeps replay event order independent of thread scheduling.
+  if (result.backend == "log") return;
+
+  if (result.status == AnnouncementStatus::playback_failed) {
+    announcements_failed_.fetch_add(1, std::memory_order_relaxed);
+  }
+  auto lifecycle_payload = announcement_result_json(result);
+  {
+    std::scoped_lock announcement_lock(announcement_state_mutex_);
+    (result.source == ExecutionSource::live ? latest_live_announcement_
+                                             : latest_replay_announcement_) =
+        lifecycle_payload;
+  }
+  emit_event(std::string("announcement_") + to_string(result.status),
+             std::move(lifecycle_payload), result.timestamp_sample,
+             to_string(result.source));
+
+  if (result.source != ExecutionSource::live) return;
+  std::scoped_lock pipeline_lock(pipeline_mutex_);
+  AnnouncementsConfig announcements;
+  {
+    // Match config.apply's pipeline -> config lock order so a hot policy
+    // update cannot race a playback gate start or terminal transition.
+    std::scoped_lock config_lock(config_mutex_);
+    announcements = config_.announcements;
+  }
+
+  if (result.status == AnnouncementStatus::playback_started) {
+    if (!announcements.enabled || announcements.barge_in) return;
+    announcement_guard_until_sample_.store(0, std::memory_order_release);
+    announcement_kws_reset_pending_.store(false, std::memory_order_release);
+    announcement_playback_active_.store(true, std::memory_order_release);
+    const auto at_sample = ring_ ? ring_->tail() : result.timestamp_sample;
+    announcement_playback_start_sample_ = at_sample;
+    // Preserve a turn that already owns a candidate, but do not let an
+    // unrelated speech interval which merely began before playback later
+    // become a suffix/embedded keyword candidate across TTS audio.
+    if (vad_speech_active_ &&
+        (!segmenter_ || segmenter_->pending_count() == 0)) {
+      suppress_current_vad_interval_ = true;
+    }
+    if (segmenter_ && segmenter_->begin_activation_playback(at_sample)) {
+      emit_activation_state_if_changed(at_sample, "live");
+    }
+    return;
+  }
+
+  // Gate ownership is established at playback_started. A hot barge-in or
+  // enabled change must not prevent the matching terminal callback from
+  // releasing the segmenter hold.
+  if (!announcement_playback_active_.exchange(false,
+                                               std::memory_order_acq_rel)) {
+    return;
+  }
+  const auto at_sample = ring_ ? ring_->tail() : result.timestamp_sample;
+  if (announcements.enabled && !announcements.barge_in) {
+    const auto tail_guard_samples =
+        static_cast<std::uint64_t>(announcements.tail_guard_ms) *
+        kProcessingSampleRate / 1000;
+    announcement_guard_until_sample_.store(at_sample + tail_guard_samples,
+                                            std::memory_order_release);
+    announcement_kws_reset_pending_.store(true, std::memory_order_release);
+  } else {
+    announcement_guard_until_sample_.store(0, std::memory_order_release);
+    announcement_kws_reset_pending_.store(false, std::memory_order_release);
+  }
+  const auto playback_samples =
+      at_sample >= announcement_playback_start_sample_
+          ? at_sample - announcement_playback_start_sample_
+          : 0;
+  announcement_playback_start_sample_ = 0;
+  if (segmenter_) {
+    if (segmenter_->finish_activation_playback(playback_samples, at_sample)) {
+      emit_activation_events(segmenter_->take_activation_events(), "live");
+      emit_activation_state_if_changed(at_sample, "live");
+    }
+  }
+}
+
+void VoiceFrontendRuntime::emit_activation_events(
+    std::vector<ActivationTransition> events, std::string source) {
+  if (source.empty()) {
+    source = replay_mode_.load(std::memory_order_acquire) ? "replay" : "live";
+  }
+  for (auto& event : events) {
+    switch (event.kind) {
+      case ActivationTransitionKind::started:
+        activations_started_.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case ActivationTransitionKind::refreshed:
+        activations_refreshed_.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case ActivationTransitionKind::expired:
+        activations_expired_.fetch_add(1, std::memory_order_relaxed);
+        break;
+      case ActivationTransitionKind::cancelled:
+        activations_cancelled_.fetch_add(1, std::memory_order_relaxed);
+        break;
+    }
+    const bool active = event.kind == ActivationTransitionKind::started ||
+                        event.kind == ActivationTransitionKind::refreshed;
+    const auto state = event.kind == ActivationTransitionKind::started
+                           ? "keyword_turn"
+                           : (event.kind == ActivationTransitionKind::refreshed
+                                  ? "armed_idle"
+                                  : "dormant");
+    emit_event(std::string("activation_") + to_string(event.kind),
+               {{"active", active},
+                {"state", state},
+                {"activation_id", event.activation_id},
+                {"turn_index", event.turn_index},
+                {"at_sample", event.at_sample},
+                {"idle_deadline_sample", event.idle_deadline_sample},
+                {"hard_deadline_sample", event.hard_deadline_sample},
+                {"reason", event.reason}},
+               event.at_sample, source);
+  }
+}
+
+void VoiceFrontendRuntime::emit_activation_state(std::string source) {
+  nlohmann::json state = activation_json(ActivationSnapshot{});
+  std::uint64_t timestamp{};
+  {
+    std::scoped_lock pipeline_lock(pipeline_mutex_);
+    if (segmenter_) {
+      last_published_activation_state_ = segmenter_->activation();
+      state = activation_json(last_published_activation_state_);
+    }
+    if (ring_) timestamp = ring_->tail();
+  }
+  if (source.empty()) {
+    source = replay_mode_.load(std::memory_order_acquire) ? "replay" : "live";
+  }
+  emit_event("activation_state", std::move(state), timestamp,
+             std::move(source));
+}
+
+void VoiceFrontendRuntime::emit_activation_state_if_changed(
+    std::uint64_t timestamp_sample, const std::string& source) {
+  if (!segmenter_) return;
+  const auto& current = segmenter_->activation();
+  const bool changed =
+      current.state != last_published_activation_state_.state ||
+      current.activation_id != last_published_activation_state_.activation_id ||
+      current.turn_index != last_published_activation_state_.turn_index ||
+      current.idle_deadline_sample !=
+          last_published_activation_state_.idle_deadline_sample ||
+      current.hard_deadline_sample !=
+          last_published_activation_state_.hard_deadline_sample ||
+      current.playback_hold != last_published_activation_state_.playback_hold;
+  if (!changed) return;
+  last_published_activation_state_ = current;
+  emit_event("activation_state", activation_json(current), timestamp_sample,
+             source);
+}
+
+void VoiceFrontendRuntime::abandon_followup(
+    UtteranceOrigin origin, const std::string& activation_id,
+    std::uint32_t turn_index, std::uint64_t at_sample, std::string reason) {
+  if (origin != UtteranceOrigin::followup || !segmenter_ ||
+      activation_id.empty()) {
+    return;
+  }
+  if (segmenter_->abandon_followup(activation_id, turn_index, at_sample,
+                                   std::move(reason))) {
+    emit_activation_events(segmenter_->take_activation_events());
+    emit_activation_state_if_changed(
+        at_sample,
+        replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
+  }
+}
+
+bool VoiceFrontendRuntime::announcement_capture_blocked(
+    std::uint64_t at_sample) const {
+  {
+    std::scoped_lock config_lock(config_mutex_);
+    if (!config_.announcements.enabled || config_.announcements.barge_in) {
+      return false;
+    }
+  }
+  if (announcement_playback_active_.load(std::memory_order_acquire)) return true;
+  const auto guard_until =
+      announcement_guard_until_sample_.load(std::memory_order_acquire);
+  return guard_until != 0 && at_sample < guard_until;
+}
+
 void VoiceFrontendRuntime::reset_pipeline(bool discontinuity, bool reset_preprocessor) {
   if (candidate_assembler_) candidate_assembler_->cancel_pending();
   const auto next = ring_ ? ring_->tail() : 0;
@@ -1357,7 +2016,18 @@ void VoiceFrontendRuntime::reset_pipeline(bool discontinuity, bool reset_preproc
   if (preprocessor_ && discontinuity && reset_preprocessor) preprocessor_->reset();
   if (vad_) vad_->reset();
   if (kws_) kws_->reset(next);
-  if (segmenter_) segmenter_->reset(discontinuity);
+  if (segmenter_) {
+    segmenter_->reset(discontinuity);
+    emit_activation_events(segmenter_->take_activation_events());
+    emit_activation_state_if_changed(
+        next, replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
+  }
+  announcement_playback_active_.store(false, std::memory_order_release);
+  announcement_guard_until_sample_.store(0, std::memory_order_release);
+  announcement_kws_reset_pending_.store(false, std::memory_order_release);
+  announcement_playback_start_sample_ = 0;
+  vad_speech_active_ = false;
+  suppress_current_vad_interval_ = false;
   if (discontinuity) {
     cancel_recognition_generation("audio pipeline reset");
     discontinuities_.fetch_add(1, std::memory_order_relaxed);
@@ -1405,12 +2075,38 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
   std::scoped_lock control_lock(control_mutex_);
   const auto action = command.value("action", "");
   if (action == "state.get") {
+    nlohmann::json activation_state = activation_json(ActivationSnapshot{});
+    std::uint64_t activation_sample{};
+    {
+      std::scoped_lock pipeline_lock(pipeline_mutex_);
+      if (segmenter_) {
+        last_published_activation_state_ = segmenter_->activation();
+        activation_state = activation_json(last_published_activation_state_);
+      }
+      if (ring_) activation_sample = ring_->tail();
+    }
+    const auto mode = replay_mode_.load(std::memory_order_acquire)
+                          ? std::string("replay")
+                          : std::string("live");
+    nlohmann::json latest_announcement = nullptr;
+    {
+      std::scoped_lock announcement_lock(announcement_state_mutex_);
+      latest_announcement = mode == "live" ? latest_live_announcement_
+                                            : latest_replay_announcement_;
+    }
     emit_event("config_state", {{"config", config_store_.to_public_json(config_)}});
     emit_event("sessions", session_list());
     emit_event("recording_state", {{"active", recorder_.active()}, {"session", recorder_.session_path().string()}});
-    emit_event("runtime_mode", {{"mode", replay_mode_.load(std::memory_order_acquire) ? "replay" : "live"}});
+    emit_event("runtime_mode", {{"mode", mode}});
+    emit_event("activation_state", activation_state, activation_sample, mode);
+    emit_event("runtime_state", {{"mode", mode},
+                                  {"activation", activation_state},
+                                  {"latest_announcement", latest_announcement}},
+               activation_sample, mode);
     if (replay_) emit_event("replay_state", replay_->state(), 0, "replay");
-    return {{"ok", true}, {"metrics", metrics_json()}};
+    return {{"ok", true}, {"metrics", metrics_json()},
+            {"activation_state", std::move(activation_state)},
+            {"latest_announcement", std::move(latest_announcement)}};
   }
   if (action == "recording.start") {
     const auto model_file = [](const std::filesystem::path& path) {
@@ -1510,6 +2206,11 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     changed(candidate.segmentation.assembly_queue_capacity !=
                 current.segmentation.assembly_queue_capacity,
             "segmentation.assembly_queue_capacity");
+    changed(candidate.announcements.backend != current.announcements.backend,
+            "announcements.backend");
+    changed(candidate.announcements.queue_capacity !=
+                current.announcements.queue_capacity,
+            "announcements.queue_capacity");
     const bool save = command.value("save", false);
     if (!restart_required.empty() && !save) {
       const std::vector<std::string> errors{
@@ -1529,6 +2230,10 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     active.recording = current.recording;
     active.segmentation.assembly_queue_capacity =
         current.segmentation.assembly_queue_capacity;
+    active.announcements = candidate.announcements;
+    active.announcements.backend = current.announcements.backend;
+    active.announcements.queue_capacity =
+        current.announcements.queue_capacity;
     active.kws = current.kws;
     active.kws.threshold = candidate.kws.threshold;
     active.kws.boosting_score = candidate.kws.boosting_score;
@@ -1584,6 +2289,14 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
             current.segmentation.min_command_speech_ms ||
         active.segmentation.embedded_join_silence_ms !=
             current.segmentation.embedded_join_silence_ms;
+    const bool activation_changed =
+        active.activation.enabled != current.activation.enabled ||
+        active.activation.idle_timeout_ms != current.activation.idle_timeout_ms ||
+        active.activation.hard_limit_ms != current.activation.hard_limit_ms;
+    const bool release_announcement_gate =
+        current.announcements.enabled &&
+        !current.announcements.barge_in &&
+        (!active.announcements.enabled || active.announcements.barge_in);
     const bool parser_changed =
         active.commands.default_volume_step_percent !=
             current.commands.default_volume_step_percent ||
@@ -1597,7 +2310,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         active.commands.volume_down_phrases != current.commands.volume_down_phrases ||
         active.commands.connectors != current.commands.connectors;
     const bool pipeline_changed = aec_changed || kws_changed || vad_changed ||
-                                  segmentation_changed;
+                                  segmentation_changed || activation_changed;
 
     std::unique_ptr<IAudioPreprocessor> new_preprocessor;
     if (aec_changed) {
@@ -1626,16 +2339,43 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         std::scoped_lock config_lock(config_mutex_);
         config_ = active;
       }
+      if (release_announcement_gate &&
+          announcement_playback_active_.exchange(
+              false, std::memory_order_acq_rel)) {
+        const auto at_sample = ring_ ? ring_->tail() : 0;
+        const auto playback_samples =
+            at_sample >= announcement_playback_start_sample_
+                ? at_sample - announcement_playback_start_sample_
+                : 0;
+        announcement_playback_start_sample_ = 0;
+        announcement_guard_until_sample_.store(0, std::memory_order_release);
+        announcement_kws_reset_pending_.store(false,
+                                               std::memory_order_release);
+        if (segmenter_ && segmenter_->finish_activation_playback(
+                              playback_samples, at_sample)) {
+          emit_activation_events(segmenter_->take_activation_events());
+          emit_activation_state_if_changed(
+              at_sample,
+              replay_mode_.load(std::memory_order_acquire) ? "replay"
+                                                           : "live");
+        }
+      }
       if (pipeline_changed) {
         if (new_preprocessor) preprocessor_ = std::move(new_preprocessor);
         if (new_vad) vad_ = std::move(new_vad);
         if (new_kws) kws_ = std::move(new_kws);
         cancelled_candidates = segmenter_->pending_count();
-        segmenter_->reconfigure(config_.segmentation);
+        segmenter_->reconfigure(config_.segmentation, config_.activation);
+        emit_activation_events(segmenter_->take_activation_events());
+        emit_activation_state_if_changed(
+            ring_ ? ring_->tail() : 0,
+            replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
         if (candidate_assembler_) candidate_assembler_->cancel_pending();
         const auto next = ring_->tail();
         kws_->reset(next);
         vad_->reset();
+        vad_speech_active_ = false;
+        suppress_current_vad_interval_ = false;
         cancel_recognition_generation("audio pipeline config hot swap");
       }
       // Keeping this exchange under the frame-boundary lock makes the config
@@ -1766,6 +2506,14 @@ nlohmann::json VoiceFrontendRuntime::metrics_json() const {
                                        : 0},
           {"command_plans", command_plans_.load()},
           {"command_rejections", command_rejections_.load()},
+          {"activations_started", activations_started_.load()},
+          {"activations_refreshed", activations_refreshed_.load()},
+          {"activations_expired", activations_expired_.load()},
+          {"activations_cancelled", activations_cancelled_.load()},
+          {"followup_turns", followup_turns_.load()},
+          {"announcements_requested", announcements_requested_.load()},
+          {"announcements_dropped", announcements_dropped_.load()},
+          {"announcements_failed", announcements_failed_.load()},
           {"actions_succeeded", actions_succeeded_.load()}, {"actions_failed", actions_failed_.load()},
           {"recording_incomplete", recorder_.incomplete()}};
   if (preprocessor_) result["aec"] = preprocess_json(preprocess_diagnostics_snapshot());
@@ -1783,6 +2531,9 @@ nlohmann::json VoiceFrontendRuntime::metrics_json() const {
                      {"stale_results", stats.suppressed_stale_results}};
   }
   if (action_executor_) result["action_queue_depth"] = action_executor_->queue_size();
+  if (announcement_dispatcher_) {
+    result["announcement_queue_depth"] = announcement_dispatcher_->queue_size();
+  }
   return result;
 }
 

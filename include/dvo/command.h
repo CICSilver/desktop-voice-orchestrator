@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "dvo/audio_types.h"
+
 namespace dvo {
 
 inline constexpr std::size_t kMaxCommandActions = 8;
@@ -49,10 +51,14 @@ struct PlannedAction {
 };
 
 struct CommandPlan {
-  std::uint32_t schema_version{1};
+  std::uint32_t schema_version{2};
   std::string command_id;
   std::string runtime_session_id;
   std::string utterance_id;
+  UtteranceOrigin origin{UtteranceOrigin::keyword};
+  std::string activation_id;
+  std::uint32_t turn_index{};
+  std::uint64_t trigger_sample{};
   std::string wake_position;
   std::string raw_text;
   std::string normalized_text;
@@ -72,6 +78,10 @@ struct ActionResult {
   std::uint32_t schema_version{1};
   std::string command_id;
   std::string utterance_id;
+  UtteranceOrigin origin{UtteranceOrigin::keyword};
+  std::string activation_id;
+  std::uint32_t turn_index{};
+  std::uint64_t trigger_sample{};
   std::string action_id;
   std::uint32_t sequence{};
   ActionType type{ActionType::media_play};

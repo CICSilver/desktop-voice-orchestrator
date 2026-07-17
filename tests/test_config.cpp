@@ -24,6 +24,11 @@ TEST_CASE("checked-in default configuration is valid") {
   REQUIRE(config.ring.duration_ms == 20000);
   REQUIRE(config.commands.play_phrases == std::vector<std::string>{"播放音乐"});
   REQUIRE(config.commands.action_timeout_ms == 2000);
+  REQUIRE(config.activation.enabled);
+  REQUIRE(config.activation.idle_timeout_ms == 6000);
+  REQUIRE(config.activation.hard_limit_ms == 20000);
+  REQUIRE(config.announcements.backend == "log");
+  REQUIRE_FALSE(config.announcements.barge_in);
   REQUIRE(config.commands.connectors ==
           std::vector<std::string>{"然后", "再", "接着", "并且"});
   REQUIRE(config.aec.microphone_channel_index == 0);
@@ -143,19 +148,30 @@ TEST_CASE("hot config patch validates and saves an overlay") {
   const auto initial_revision = config.revision;
   auto result = store.apply_patch(config, {{"audio", {{"microphone_device", "test-endpoint"}}},
                                             {"kws", {{"threshold", 0.42}}},
-                                            {"vad", {{"threshold", 0.33}}}});
+                                            {"vad", {{"threshold", 0.33}}},
+                                            {"activation", {{"idle_timeout_ms", 5000},
+                                                            {"hard_limit_ms", 18000}}},
+                                            {"announcements", {{"enabled", false},
+                                                               {"tail_guard_ms", 250}}}});
   REQUIRE(result.ok());
   REQUIRE(config.kws.threshold == Catch::Approx(0.42F));
   REQUIRE(config.revision == initial_revision + 1);
+  REQUIRE(config.activation.idle_timeout_ms == 5000);
+  REQUIRE_FALSE(config.announcements.enabled);
   store.save_overrides(config);
   REQUIRE(std::filesystem::exists(local));
   const auto reloaded = store.load();
   REQUIRE(reloaded.audio.microphone_device == "test-endpoint");
   REQUIRE(reloaded.kws.threshold == Catch::Approx(0.42F));
+  REQUIRE(reloaded.activation.hard_limit_ms == 18000);
+  REQUIRE(reloaded.announcements.tail_guard_ms == 250);
 
   const auto before = config;
   result = store.apply_patch(config, {{"kws", {{"threshold", 2.0}}}});
   REQUIRE_FALSE(result.ok());
   REQUIRE(config.kws.threshold == before.kws.threshold);
+
+  result = store.apply_patch(config, {{"activation", {{"idle_timeout_ms", 11000}}}});
+  REQUIRE_FALSE(result.ok());
   std::filesystem::remove_all(temp);
 }

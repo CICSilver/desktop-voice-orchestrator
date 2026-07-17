@@ -1017,6 +1017,10 @@ class TimelineEngine {
       const auto error = start_grid - active.expected_next_grid;
       if (std::abs(error) > hard_resync_samples_) {
         Reset(PreprocessResetReason::hard_resync);
+        provisional_record_begin = 0;
+        provisional_record_count = 0;
+        provisional_input_samples = 0;
+        provisional_output_samples = 0;
         ++diagnostics_.hard_resyncs;
         result.reset_required = true;
         result.reset_reason = PreprocessResetReason::hard_resync;
@@ -1450,18 +1454,19 @@ class TimelineEngine {
   void update_relative_drift() {
     diagnostics_.microphone_rate_hz = microphone_.clock.rate_hz();
     diagnostics_.render_rate_hz = render_.clock.rate_hz();
-    diagnostics_.drift_estimate_valid =
-        microphone_.clock.valid() && render_.clock.valid() &&
-        diagnostics_.microphone_rate_hz > 0.0 &&
-        diagnostics_.render_rate_hz > 0.0 &&
-        microphone_.clock.nominal_rate_hz() > 0.0 &&
-        render_.clock.nominal_rate_hz() > 0.0;
-    if (diagnostics_.drift_estimate_valid) {
-      const auto microphone_rate_ratio =
-          diagnostics_.microphone_rate_hz /
-          microphone_.clock.nominal_rate_hz();
-      const auto render_rate_ratio =
-          diagnostics_.render_rate_hz / render_.clock.nominal_rate_hz();
+    const auto microphone_nominal_rate_hz =
+        microphone_.clock.nominal_rate_hz();
+    const auto render_nominal_rate_hz = render_.clock.nominal_rate_hz();
+      diagnostics_.drift_estimate_valid =
+          microphone_.clock.valid() && render_.clock.valid() &&
+          diagnostics_.microphone_rate_hz > 0.0 &&
+          diagnostics_.render_rate_hz > 0.0 &&
+          microphone_nominal_rate_hz > 0.0 && render_nominal_rate_hz > 0.0;
+      if (diagnostics_.drift_estimate_valid) {
+        const auto microphone_rate_ratio =
+            diagnostics_.microphone_rate_hz / microphone_nominal_rate_hz;
+        const auto render_rate_ratio =
+            diagnostics_.render_rate_hz / render_nominal_rate_hz;
       diagnostics_.relative_drift_ppm =
           (render_rate_ratio / microphone_rate_ratio - 1.0) * 1'000'000.0;
     } else {

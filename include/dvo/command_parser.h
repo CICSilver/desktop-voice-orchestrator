@@ -15,6 +15,10 @@ namespace dvo {
 struct CommandParseContext {
   std::string runtime_session_id;
   std::string utterance_id;
+  UtteranceOrigin origin{UtteranceOrigin::keyword};
+  std::string activation_id;
+  std::uint32_t turn_index{};
+  std::uint64_t trigger_sample{};
   std::string wake_position;
   std::uint64_t config_revision{};
   std::uint64_t recognition_generation{};

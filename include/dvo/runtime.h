@@ -17,6 +17,7 @@
 #include <nlohmann/json.hpp>
 
 #include "dvo/action_executor.h"
+#include "dvo/announcement.h"
 #include "dvo/command_parser.h"
 #include "dvo/config.h"
 #include "dvo/debug_server.h"
@@ -62,6 +63,8 @@ class VoiceFrontendRuntime {
     StreamingRecognizerState asr_state{StreamingRecognizerState::unavailable};
     std::size_t assembly_outstanding{};
     std::size_t action_queue_depth{};
+    std::size_t announcement_queue_depth{};
+    ActivationSnapshot activation;
     PreprocessDiagnostics aec;
     std::uint64_t debug_dropped{};
     std::uint64_t audio_queue_drops{};
@@ -99,6 +102,20 @@ class VoiceFrontendRuntime {
   void emit_utterance_lifecycle(UtteranceLifecycleEvent event);
   void handle_recognition_result(RecognitionResult result);
   void handle_action_result(const ActionResult& result);
+  void handle_plan_started(const CommandPlan& plan);
+  void handle_announcement_result(const AnnouncementResult& result);
+  void emit_activation_events(std::vector<ActivationTransition> events,
+                              std::string source = {});
+  void emit_activation_state(std::string source = {});
+  void emit_activation_state_if_changed(std::uint64_t timestamp_sample,
+                                        const std::string& source);
+  void abandon_followup(UtteranceOrigin origin,
+                        const std::string& activation_id,
+                        std::uint32_t turn_index,
+                        std::uint64_t at_sample,
+                        std::string reason);
+  [[nodiscard]] bool announcement_capture_blocked(
+      std::uint64_t at_sample) const;
   void stop_async_services();
   void emit_event(std::string type, nlohmann::json payload,
                   std::uint64_t timestamp_sample = 0, std::string source = "live");
@@ -124,7 +141,11 @@ class VoiceFrontendRuntime {
   // Parser instances are immutable. In-flight utterances retain shared snapshots
   // across command-grammar hot updates.
   std::shared_ptr<const CommandParser> command_parser_;
+  std::unique_ptr<AnnouncementDispatcher> announcement_dispatcher_;
   std::unique_ptr<OrderedActionExecutor> action_executor_;
+  mutable std::mutex announcement_state_mutex_;
+  nlohmann::json latest_live_announcement_{nullptr};
+  nlohmann::json latest_replay_announcement_{nullptr};
   mutable std::mutex pipeline_mutex_;
   // HTTP commands mutate replay, recording, and configuration state. They are
   // intentionally serialized independently from recognition snapshots.
@@ -135,6 +156,10 @@ class VoiceFrontendRuntime {
     std::shared_ptr<const CommandParser> parser;
     std::uint64_t config_revision{};
     bool commands_enabled{};
+    UtteranceOrigin origin{UtteranceOrigin::keyword};
+    std::string activation_id;
+    std::uint32_t turn_index{};
+    std::uint64_t trigger_sample{};
   };
   std::uint64_t command_config_revision_{};
   bool commands_enabled_{};
@@ -144,19 +169,27 @@ class VoiceFrontendRuntime {
 
   struct ActiveRecognitionFeed {
     std::uint64_t generation{};
-    std::uint64_t wake_end_sample{};
+    std::uint64_t stream_start_sample{};
+    UtteranceOrigin origin{UtteranceOrigin::keyword};
+    std::string activation_id;
+    std::uint32_t turn_index{};
+    std::uint64_t trigger_sample{};
     std::uint64_t pending_first_sample{};
     std::size_t chunk_samples{kFrameSamples};
     std::vector<float> pending;
   };
   struct PendingRecognitionStart {
     std::uint64_t generation{};
-    std::uint64_t wake_end_sample{};
+    std::uint64_t stream_start_sample{};
+    UtteranceOrigin origin{UtteranceOrigin::keyword};
+    std::string activation_id;
+    std::uint32_t turn_index{};
+    std::uint64_t trigger_sample{};
     std::size_t chunk_samples{kFrameSamples};
     std::uint64_t pending_first_sample{};
     std::vector<float> pending;
     std::uint64_t command_config_revision{};
-    std::size_t left_span_count{};
+    std::size_t backfill_span_count{};
   };
   std::unordered_map<std::string, ActiveRecognitionFeed> active_recognizers_;
   std::unordered_map<std::string, PendingRecognitionStart> pending_recognition_starts_;
@@ -181,6 +214,15 @@ class VoiceFrontendRuntime {
   std::atomic<bool> running_{};
   std::atomic<bool> replay_mode_{};
   std::atomic<bool> telemetry_enabled_{};
+  std::atomic<bool> announcement_playback_active_{};
+  std::atomic<std::uint64_t> announcement_guard_until_sample_{};
+  std::atomic<bool> announcement_kws_reset_pending_{};
+  // Protected by pipeline_mutex_. Backend wall time is diagnostic-only; the
+  // activation extension is derived from this 16 kHz timeline position.
+  std::uint64_t announcement_playback_start_sample_{};
+  bool vad_speech_active_{};
+  bool suppress_current_vad_interval_{};
+  ActivationSnapshot last_published_activation_state_{};
   std::string runtime_session_id_;
   std::mutex replay_callback_mutex_;
 
@@ -209,6 +251,14 @@ class VoiceFrontendRuntime {
   std::atomic<std::uint64_t> assembly_dropped_{};
   std::atomic<std::uint64_t> command_plans_{};
   std::atomic<std::uint64_t> command_rejections_{};
+  std::atomic<std::uint64_t> activations_started_{};
+  std::atomic<std::uint64_t> activations_refreshed_{};
+  std::atomic<std::uint64_t> activations_expired_{};
+  std::atomic<std::uint64_t> activations_cancelled_{};
+  std::atomic<std::uint64_t> followup_turns_{};
+  std::atomic<std::uint64_t> announcements_requested_{};
+  std::atomic<std::uint64_t> announcements_dropped_{};
+  std::atomic<std::uint64_t> announcements_failed_{};
   std::atomic<std::uint64_t> actions_succeeded_{};
   std::atomic<std::uint64_t> actions_failed_{};
   std::atomic<std::uint64_t> telemetry_queue_drops_{};

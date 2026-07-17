@@ -373,7 +373,7 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
           std::size_t count{};
           std::uint32_t sample_rate{config_.sample_rate};
           if constexpr (std::is_same_v<T, RecognitionBegin>) {
-            count = value.left_backfill ? value.left_backfill->size() : 0;
+            count = value.backfill ? value.backfill->size() : 0;
             sample_rate = value.sample_rate;
           } else if constexpr (std::is_same_v<T, RecognitionChunk>) {
             count = value.pcm ? value.pcm->size() : 0;
@@ -529,6 +529,8 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
     std::string utterance_id;
     std::string source{"live"};
     std::uint64_t generation{};
+    bool exact_final_attempt{};
+    std::shared_ptr<const UtteranceCandidate> candidate;
     std::visit(
         [&](const auto& request) {
           utterance_id = request.utterance_id;
@@ -538,10 +540,15 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
                         std::is_same_v<T, RecognitionFinalize>) {
             source = request.source;
           }
+          exact_final_attempt = std::is_same_v<T, RecognitionFinalize>;
+          if constexpr (std::is_same_v<T, RecognitionFinalize>) {
+            candidate = request.candidate;
+          }
         },
         queued.value);
     emit_error(utterance_id, generation, source, status(), 0,
-               latency_since(queued.submitted_at));
+               latency_since(queued.submitted_at), exact_final_attempt,
+               std::move(candidate));
   }
 
   [[nodiscard]] static double latency_since(
@@ -593,9 +600,9 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
       started.latency_ms = latency_since(submitted_at);
       emit(std::move(started));
 
-      if (request.left_backfill && !request.left_backfill->empty()) {
-        feed(request.utterance_id, it->second, request.left_backfill_first_sample,
-             *request.left_backfill, request.sample_rate, submitted_at);
+      if (request.backfill && !request.backfill->empty()) {
+        feed(request.utterance_id, it->second, request.backfill_first_sample,
+             *request.backfill, request.sample_rate, submitted_at);
       }
     } catch (const std::exception& error) {
       active_.erase(request.utterance_id);
@@ -666,6 +673,7 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
       const auto audio_ms = static_cast<double>(request.candidate->pcm.size()) * 1000.0 /
                             static_cast<double>(request.candidate->sample_rate);
       result.rtf = audio_ms > 0.0 ? inference_ms / audio_ms : 0.0;
+      result.exact_final_attempt = true;
       result.exact_final = true;
       result.candidate = request.candidate;
       if (!request.candidate->source_spans.empty()) {
@@ -679,11 +687,12 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
       emit(std::move(result));
     } catch (const std::exception& error) {
       emit_error(request.utterance_id, request.generation, source, error.what(),
-                 final_revision, latency_since(submitted_at));
+                 final_revision, latency_since(submitted_at), true,
+                 request.candidate);
     } catch (...) {
       emit_error(request.utterance_id, request.generation, source,
                  "unknown exact-final ASR error", final_revision,
-                 latency_since(submitted_at));
+                 latency_since(submitted_at), true, request.candidate);
     }
   }
 
@@ -776,7 +785,9 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
 
   void emit_error(const std::string& utterance_id, std::uint64_t generation,
                   const std::string& source, std::string detail,
-                  std::uint64_t revision, double latency_ms) noexcept {
+                  std::uint64_t revision, double latency_ms,
+                  bool exact_final_attempt = false,
+                  std::shared_ptr<const UtteranceCandidate> candidate = {}) noexcept {
     RecognitionResult result;
     result.kind = RecognitionResultKind::error;
     result.utterance_id = utterance_id;
@@ -784,6 +795,12 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
     result.revision = revision;
     result.source = source;
     result.latency_ms = latency_ms;
+    result.exact_final_attempt = exact_final_attempt;
+    result.candidate = std::move(candidate);
+    if (result.candidate && !result.candidate->source_spans.empty()) {
+      result.audio_start_sample = result.candidate->source_spans.front().start;
+      result.audio_end_sample = result.candidate->source_spans.back().end;
+    }
     result.detail = std::move(detail);
     emit(std::move(result));
   }

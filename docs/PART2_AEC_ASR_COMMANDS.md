@@ -22,6 +22,8 @@ mic + loopback -> timeline/AEC3 -> ring + KWS + VAD + segmenter
                       strict rule parser -> ordered executor
                                       |                 |
                                     GSMTC      IAudioEndpointVolume
+                                      |
+                         non-blocking announcement queue
 ```
 
 ASR、Windows 动作、录制、遥测 JSON/WebSocket 各有独立的有界工作队列。周期性
@@ -86,10 +88,48 @@ ASR partial/feed chunk、遥测频率的热更新不会重建或重置 AEC/KWS/V
 播放/暂停请求共享 `commands.action_timeout_ms` 截止时间，超时产生
 `action_failed/action_timeout`；同步 Core Audio 音量调用无法安全抢占，只记录耗时。
 
+## 连续激活与分段
+
+KWS 命中后创建一次 activation。关键词话段保留原有 prefix、suffix、embedded 定位；
+关键词话段结束后，系统在默认 6 秒空闲窗口内继续接受不带唤醒词的 follow-up 话段。
+follow-up 从 VAD 起音开始流式识别，端点后仍以候选完整 PCM 的 `exact-final` 重解码作为
+唯一可执行结果，partial 只用于诊断显示。
+
+`segmentation.endpoint_silence_ms` 默认保持 900 ms。新语音在 900 ms 边界到达时按语音
+优先处理，因而间隔不超过 900 ms 的内容属于同一候选，并生成一次合并计划；只有间隔超过
+900 ms 才关闭前一候选并创建新的 follow-up 候选。前一计划进入全局 FIFO 后，音频采集和
+下一话段识别可以继续进行，但后续计划不能越过前一计划执行。
+
+空闲窗口由成功解析并入队的 follow-up 计划刷新；拒绝、ASR 错误和队列拒绝不续期。
+activation 从首次唤醒起还受默认 20 秒硬上限约束，截止前已经起音的话段可以完成。
+激活期间再次命中 KWS 会取消旧 activation 并建立新 activation。设备/时间线重置、配置热
+更新、replay seek/open、恢复 live 或停止运行时都会取消当前 activation。所有期限使用
+16 kHz 样本时间，保证 replay 速度不会改变分段结果。
+
+连续激活不提供会话式自然语言理解。每个话段仍须独立满足完整白名单语法，系统不会根据
+上一条命令推断 `再小点`、`继续`或代词所指。
+
+## 播报接口
+
+执行器从全局 FIFO 取出一个计划后、首个 `action_started` 之前提交一次结构化
+`AnnouncementRequest`。播报文字只根据已校验动作生成，例如
+`正在执行：暂停音乐，然后降低音量 5%`，不会直接复述 ASR 原文。一个合并计划只播报一次；
+被 900 ms 端点分开的计划分别播报。
+
+`AnnouncementDispatcher` 使用独立有界 FIFO 调用 `IAnnouncementBackend`，不等待播报
+完成才执行动作。当前 `log` 后端只发布 `announcement` 结构化事件，供 Web 命令卡和录制
+审计显示；后端变慢、抛错或队列已满只产生诊断，不取消、阻塞或重排动作。replay/benchmark
+同样保留文字事件，但不得输出真实音频。
+
+接口为后续真实 TTS 后端预留。TTS 播放期间及结束后的默认 200 ms 尾音保护期内，前端仍
+采集音频并运行 AEC，但不创建 KWS/follow-up 候选；空闲期限可按播放时长顺延，但不能突破
+20 秒硬上限。真实后端必须使用进入 loopback/AEC 参考链路的 render endpoint，并报告实际
+endpoint。当前版本没有合成或播放语音。
+
 ## 诊断和验收
 
 调试台展示 raw mic/AEC 输出、AEC状态与延迟/漂移/ERLE、Paraformer partial/final、
-命令计划及逐动作结果。录制 manifest 和 NDJSON 事件保存时间线 epoch/sequence、
+命令计划、连续激活倒计时、文字播报及逐动作结果。录制 manifest 和 NDJSON 事件保存时间线 epoch/sequence、
 模型哈希、AEC/ASR配置和动作审计信息。
 
 `benchmark <session>` 会读取会话原有 `events.ndjson`，并在报告的 `comparison` 中输出：

@@ -27,6 +27,11 @@ struct CandidateAssemblyRequest {
 
 struct CandidateAssemblyResult {
   std::string utterance_id;
+  UtteranceOrigin origin{UtteranceOrigin::keyword};
+  std::string activation_id;
+  std::uint32_t turn_index{};
+  std::uint64_t trigger_sample{};
+  std::uint64_t end_sample{};
   std::optional<UtteranceCandidate> candidate;
   std::string rejection;
   std::uint64_t generation{};
@@ -34,19 +39,27 @@ struct CandidateAssemblyResult {
 
 struct BackfillAssemblyRequest {
   std::string utterance_id;
+  UtteranceOrigin origin{UtteranceOrigin::keyword};
+  std::string activation_id;
+  std::uint32_t turn_index{};
+  std::uint64_t trigger_sample{};
   std::vector<SampleSpan> source_spans;
   std::size_t join_silence_samples{};
   std::size_t trailing_silence_samples{};
-  std::uint64_t wake_end_sample{};
+  std::uint64_t stream_start_sample{};
   std::uint64_t recognition_generation{};
   std::uint64_t generation{};
 };
 
 struct BackfillAssemblyResult {
   std::string utterance_id;
+  UtteranceOrigin origin{UtteranceOrigin::keyword};
+  std::string activation_id;
+  std::uint32_t turn_index{};
+  std::uint64_t trigger_sample{};
   std::vector<float> pcm;
   std::uint64_t first_sample{};
-  std::uint64_t wake_end_sample{};
+  std::uint64_t stream_start_sample{};
   std::uint64_t recognition_generation{};
   bool truncated{};
   std::string rejection;

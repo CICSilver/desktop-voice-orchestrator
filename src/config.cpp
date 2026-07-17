@@ -166,6 +166,12 @@ AppConfig ConfigStore::load() const {
   c.segmentation.embedded_join_silence_ms = read<std::int64_t>(table, "segmentation.embedded_join_silence_ms", 150);
   c.segmentation.assembly_queue_capacity = read<std::int64_t>(table, "segmentation.assembly_queue_capacity", 4);
 
+  c.activation.enabled = read<bool>(table, "activation.enabled", true);
+  c.activation.idle_timeout_ms =
+      read<std::int64_t>(table, "activation.idle_timeout_ms", 6000);
+  c.activation.hard_limit_ms =
+      read<std::int64_t>(table, "activation.hard_limit_ms", 20000);
+
   c.asr.enabled = read<bool>(table, "asr.enabled", true);
   c.asr.implementation = read<std::string>(table, "asr.implementation", "sherpa_online_paraformer");
   c.asr.encoder = resolve(project_root_, read_path(table, "asr.encoder", {}));
@@ -196,6 +202,14 @@ AppConfig ConfigStore::load() const {
   c.commands.connectors = read_strings(
       table, "commands.connectors",
       {"然后", "再", "接着", "并且"});
+
+  c.announcements.enabled = read<bool>(table, "announcements.enabled", true);
+  c.announcements.backend = read<std::string>(table, "announcements.backend", "log");
+  c.announcements.queue_capacity =
+      read<std::int64_t>(table, "announcements.queue_capacity", 32);
+  c.announcements.barge_in = read<bool>(table, "announcements.barge_in", false);
+  c.announcements.tail_guard_ms =
+      read<std::int64_t>(table, "announcements.tail_guard_ms", 200);
 
   c.web.enabled = read<bool>(table, "web.enabled", true);
   c.web.bind = read<std::string>(table, "web.bind", "127.0.0.1");
@@ -274,6 +288,14 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
   range(c.segmentation.assembly_queue_capacity >= 1 &&
             c.segmentation.assembly_queue_capacity <= 64,
         "segmentation.assembly_queue_capacity must be in [1, 64]");
+  range(c.activation.idle_timeout_ms >= 1000 &&
+            c.activation.idle_timeout_ms <= 10000,
+        "activation.idle_timeout_ms must be in [1000, 10000]");
+  range(c.activation.hard_limit_ms >= 10000 &&
+            c.activation.hard_limit_ms <= 60000,
+        "activation.hard_limit_ms must be in [10000, 60000]");
+  range(c.activation.hard_limit_ms >= c.activation.idle_timeout_ms,
+        "activation.hard_limit_ms must be >= activation.idle_timeout_ms");
   range(c.asr.implementation == "sherpa_online_paraformer",
         "asr.implementation must be 'sherpa_online_paraformer'");
   range(c.asr.num_threads >= 1 && c.asr.num_threads <= 16, "asr.num_threads must be in [1, 16]");
@@ -299,6 +321,13 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
         "commands.action_timeout_ms must be in [100, 10000]");
   range(c.commands.queue_capacity >= 1 && c.commands.queue_capacity <= 256,
         "commands.queue_capacity must be in [1, 256]");
+  range(c.announcements.backend == "log",
+        "announcements.backend must be 'log'");
+  range(c.announcements.queue_capacity >= 1 &&
+            c.announcements.queue_capacity <= 256,
+        "announcements.queue_capacity must be in [1, 256]");
+  range(c.announcements.tail_guard_ms <= 1000,
+        "announcements.tail_guard_ms must be in [0, 1000]");
   range(!c.commands.play_phrases.empty() && !c.commands.pause_phrases.empty() &&
             !c.commands.volume_up_phrases.empty() && !c.commands.volume_down_phrases.empty(),
         "commands phrase lists must not be empty");
@@ -371,6 +400,9 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                          {"min_command_speech_ms", c.segmentation.min_command_speech_ms},
                          {"embedded_join_silence_ms", c.segmentation.embedded_join_silence_ms},
                          {"assembly_queue_capacity", c.segmentation.assembly_queue_capacity}}},
+      {"activation", {{"enabled", c.activation.enabled},
+                       {"idle_timeout_ms", c.activation.idle_timeout_ms},
+                       {"hard_limit_ms", c.activation.hard_limit_ms}}},
       {"asr", {{"enabled", c.asr.enabled}, {"emit_partials", c.asr.emit_partials},
                {"provider", c.asr.provider}, {"num_threads", c.asr.num_threads},
                {"feed_chunk_ms", c.asr.feed_chunk_ms},
@@ -389,6 +421,11 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                                    {"volume_up", c.commands.volume_up_phrases},
                                    {"volume_down", c.commands.volume_down_phrases}}},
                      {"connectors", c.commands.connectors}}},
+      {"announcements", {{"enabled", c.announcements.enabled},
+                          {"backend", c.announcements.backend},
+                          {"queue_capacity", c.announcements.queue_capacity},
+                          {"barge_in", c.announcements.barge_in},
+                          {"tail_guard_ms", c.announcements.tail_guard_ms}}},
       {"web", {{"telemetry_hz", c.web.telemetry_hz}}},
       {"cold", {{"microphone_device", c.audio.microphone_device},
                  {"loopback_device", c.audio.loopback_device},
@@ -403,7 +440,9 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                  {"vad_num_threads", c.vad.num_threads}, {"vad_model", c.vad.model.string()},
                  {"asr_provider", c.asr.provider}, {"asr_num_threads", c.asr.num_threads},
                  {"asr_encoder", c.asr.encoder.string()}, {"asr_decoder", c.asr.decoder.string()},
-                 {"asr_tokens", c.asr.tokens.string()}}}
+                 {"asr_tokens", c.asr.tokens.string()},
+                 {"announcements_backend", c.announcements.backend},
+                 {"announcements_queue_capacity", c.announcements.queue_capacity}}}
   };
 }
 
@@ -461,6 +500,9 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                          {"min_command_speech_ms", c.segmentation.min_command_speech_ms},
                          {"embedded_join_silence_ms", c.segmentation.embedded_join_silence_ms},
                          {"assembly_queue_capacity", c.segmentation.assembly_queue_capacity}}},
+      {"activation", {{"enabled", c.activation.enabled},
+                       {"idle_timeout_ms", c.activation.idle_timeout_ms},
+                       {"hard_limit_ms", c.activation.hard_limit_ms}}},
       {"asr", {{"enabled", c.asr.enabled}, {"implementation", c.asr.implementation},
                {"encoder", c.asr.encoder.string()}, {"decoder", c.asr.decoder.string()},
                {"tokens", c.asr.tokens.string()}, {"provider", c.asr.provider},
@@ -481,6 +523,11 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                                   {"volume_up", c.commands.volume_up_phrases},
                                   {"volume_down", c.commands.volume_down_phrases}}},
                     {"connectors", c.commands.connectors}}},
+      {"announcements", {{"enabled", c.announcements.enabled},
+                          {"backend", c.announcements.backend},
+                          {"queue_capacity", c.announcements.queue_capacity},
+                          {"barge_in", c.announcements.barge_in},
+                          {"tail_guard_ms", c.announcements.tail_guard_ms}}},
       {"web", {{"enabled", c.web.enabled}, {"bind", c.web.bind}, {"port", c.web.port},
                {"telemetry_hz", c.web.telemetry_hz}, {"static_root", c.web.static_root.string()}}},
       {"recording", {{"session_root", c.recording.session_root.string()},
@@ -555,6 +602,11 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
       assign_if(*it, "embedded_join_silence_ms", candidate.segmentation.embedded_join_silence_ms);
       assign_if(*it, "assembly_queue_capacity", candidate.segmentation.assembly_queue_capacity);
     }
+    if (const auto it = patch.find("activation"); it != patch.end()) {
+      assign_if(*it, "enabled", candidate.activation.enabled);
+      assign_if(*it, "idle_timeout_ms", candidate.activation.idle_timeout_ms);
+      assign_if(*it, "hard_limit_ms", candidate.activation.hard_limit_ms);
+    }
     if (const auto it = patch.find("asr"); it != patch.end()) {
       assign_if(*it, "enabled", candidate.asr.enabled);
       assign_if(*it, "emit_partials", candidate.asr.emit_partials);
@@ -588,6 +640,13 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
         assign_if(*phrases, "volume_up", candidate.commands.volume_up_phrases);
         assign_if(*phrases, "volume_down", candidate.commands.volume_down_phrases);
       }
+    }
+    if (const auto it = patch.find("announcements"); it != patch.end()) {
+      assign_if(*it, "enabled", candidate.announcements.enabled);
+      assign_if(*it, "backend", candidate.announcements.backend);
+      assign_if(*it, "queue_capacity", candidate.announcements.queue_capacity);
+      assign_if(*it, "barge_in", candidate.announcements.barge_in);
+      assign_if(*it, "tail_guard_ms", candidate.announcements.tail_guard_ms);
     }
     if (const auto it = patch.find("web"); it != patch.end()) {
       assign_if(*it, "telemetry_hz", candidate.web.telemetry_hz);
@@ -647,6 +706,9 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
       << "\nmin_command_speech_ms = " << c.segmentation.min_command_speech_ms
       << "\nembedded_join_silence_ms = " << c.segmentation.embedded_join_silence_ms
       << "\nassembly_queue_capacity = " << c.segmentation.assembly_queue_capacity << "\n\n";
+  out << "[activation]\nenabled = " << (c.activation.enabled ? "true" : "false")
+      << "\nidle_timeout_ms = " << c.activation.idle_timeout_ms
+      << "\nhard_limit_ms = " << c.activation.hard_limit_ms << "\n\n";
   out << "[asr]\nenabled = " << (c.asr.enabled ? "true" : "false")
       << "\nencoder = " << toml_string(c.asr.encoder.generic_string())
       << "\ndecoder = " << toml_string(c.asr.decoder.generic_string())
@@ -666,6 +728,12 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
       << "\npause = " << toml_array(c.commands.pause_phrases)
       << "\nvolume_up = " << toml_array(c.commands.volume_up_phrases)
       << "\nvolume_down = " << toml_array(c.commands.volume_down_phrases) << "\n\n";
+  out << "[announcements]\nenabled = "
+      << (c.announcements.enabled ? "true" : "false")
+      << "\nbackend = " << toml_string(c.announcements.backend)
+      << "\nqueue_capacity = " << c.announcements.queue_capacity
+      << "\nbarge_in = " << (c.announcements.barge_in ? "true" : "false")
+      << "\ntail_guard_ms = " << c.announcements.tail_guard_ms << "\n\n";
   out << "[web]\ntelemetry_hz = " << c.web.telemetry_hz << "\n";
   out.close();
   if (!out) throw std::runtime_error("failed while writing config override file");

@@ -13,6 +13,15 @@ CandidateAssemblyResult assemble_candidate(TimedRingBuffer& ring,
                                             CandidateAssemblyRequest request) {
   CandidateAssemblyResult result;
   result.utterance_id = request.candidate.utterance_id;
+  result.origin = request.candidate.origin;
+  result.activation_id = request.candidate.activation_id;
+  result.turn_index = request.candidate.turn_index;
+  result.trigger_sample = request.candidate.trigger_sample;
+  result.end_sample = !request.candidate.source_spans.empty()
+                          ? request.candidate.source_spans.back().end
+                          : (request.candidate.wake_span
+                                 ? request.candidate.wake_span->end
+                                 : request.candidate.trigger_sample);
   result.generation = request.generation;
 
   auto candidate = std::move(request.candidate);
@@ -39,7 +48,7 @@ CandidateAssemblyResult assemble_candidate(TimedRingBuffer& ring,
   std::vector<SampleSpan> actual_spans;
   actual_spans.reserve(candidate.source_spans.size());
   for (const auto span : candidate.source_spans) {
-    if (span.overlaps(candidate.wake_span)) {
+    if (candidate.wake_span && span.overlaps(*candidate.wake_span)) {
       result.rejection = "internal error: source span overlaps wake span";
       return result;
     }
@@ -67,7 +76,11 @@ BackfillAssemblyResult assemble_backfill(TimedRingBuffer& ring,
                                          BackfillAssemblyRequest request) {
   BackfillAssemblyResult result;
   result.utterance_id = std::move(request.utterance_id);
-  result.wake_end_sample = request.wake_end_sample;
+  result.origin = request.origin;
+  result.activation_id = std::move(request.activation_id);
+  result.turn_index = request.turn_index;
+  result.trigger_sample = request.trigger_sample;
+  result.stream_start_sample = request.stream_start_sample;
   result.recognition_generation = request.recognition_generation;
   result.generation = request.generation;
 
@@ -227,13 +240,26 @@ AudioAssemblyResult CandidateAssembler::cancelled_result(
         if constexpr (std::is_same_v<Request, CandidateAssemblyRequest>) {
           CandidateAssemblyResult result;
           result.utterance_id = value.candidate.utterance_id;
+          result.origin = value.candidate.origin;
+          result.activation_id = value.candidate.activation_id;
+          result.turn_index = value.candidate.turn_index;
+          result.trigger_sample = value.candidate.trigger_sample;
+          result.end_sample = !value.candidate.source_spans.empty()
+                                  ? value.candidate.source_spans.back().end
+                                  : (value.candidate.wake_span
+                                         ? value.candidate.wake_span->end
+                                         : value.candidate.trigger_sample);
           result.rejection = "candidate assembly cancelled by pipeline reset";
           result.generation = value.generation;
           return result;
         } else {
           BackfillAssemblyResult result;
           result.utterance_id = value.utterance_id;
-          result.wake_end_sample = value.wake_end_sample;
+          result.origin = value.origin;
+          result.activation_id = value.activation_id;
+          result.turn_index = value.turn_index;
+          result.trigger_sample = value.trigger_sample;
+          result.stream_start_sample = value.stream_start_sample;
           result.recognition_generation = value.recognition_generation;
           result.rejection = "backfill assembly cancelled by pipeline reset";
           result.generation = value.generation;

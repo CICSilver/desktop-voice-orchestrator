@@ -441,6 +441,10 @@ CommandParseResult CommandParser::parse(std::string_view text,
                     std::to_string(context.config_revision) + ":" + kCommandParserVersion;
   plan.runtime_session_id = context.runtime_session_id;
   plan.utterance_id = context.utterance_id;
+  plan.origin = context.origin;
+  plan.activation_id = context.activation_id;
+  plan.turn_index = context.turn_index;
+  plan.trigger_sample = context.trigger_sample;
   plan.wake_position = context.wake_position;
   plan.raw_text = std::string(text);
   plan.parser_version = kCommandParserVersion;

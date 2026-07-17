@@ -40,8 +40,11 @@ namespace {
 
 struct OrderedActionExecutor::Impl {
   Impl(std::shared_ptr<IActionBackend> value, ActionExecutorConfig settings,
-       ResultCallback callback)
-      : backend(std::move(value)), config(settings), results(std::move(callback)) {
+       ResultCallback callback, PlanStartedCallback started_callback)
+      : backend(std::move(value)),
+        config(settings),
+        results(std::move(callback)),
+        plan_started(std::move(started_callback)) {
     if (!backend) throw std::invalid_argument("action backend is required");
     if (config.queue_capacity == 0) throw std::invalid_argument("queue capacity must be positive");
     if (config.ledger_capacity == 0) throw std::invalid_argument("ledger capacity must be positive");
@@ -90,6 +93,7 @@ struct OrderedActionExecutor::Impl {
         in_flight = true;
       }
 
+      publish_plan_started(plan);
       execute_plan(plan, stop_token);
 
       {
@@ -116,6 +120,10 @@ struct OrderedActionExecutor::Impl {
       ActionResult result;
       result.command_id = plan.command_id;
       result.utterance_id = plan.utterance_id;
+      result.origin = plan.origin;
+      result.activation_id = plan.activation_id;
+      result.turn_index = plan.turn_index;
+      result.trigger_sample = plan.trigger_sample;
       result.action_id = action.action_id;
       result.sequence = action.sequence;
       result.type = action.type;
@@ -152,6 +160,10 @@ struct OrderedActionExecutor::Impl {
               result = std::move(backend_result);
               result.command_id = plan.command_id;
               result.utterance_id = plan.utterance_id;
+              result.origin = plan.origin;
+              result.activation_id = plan.activation_id;
+              result.turn_index = plan.turn_index;
+              result.trigger_sample = plan.trigger_sample;
               result.action_id = action.action_id;
               result.sequence = action.sequence;
               result.type = action.type;
@@ -187,6 +199,15 @@ struct OrderedActionExecutor::Impl {
       results(result);
     } catch (...) {
       // Result observers are diagnostic-only and cannot break ordering.
+    }
+  }
+
+  void publish_plan_started(const CommandPlan& plan) const noexcept {
+    if (!plan_started) return;
+    try {
+      plan_started(plan);
+    } catch (...) {
+      // Plan observers are diagnostic-only and cannot break action ordering.
     }
   }
 
@@ -226,6 +247,7 @@ struct OrderedActionExecutor::Impl {
   std::shared_ptr<IActionBackend> backend;
   ActionExecutorConfig config;
   ResultCallback results;
+  PlanStartedCallback plan_started;
   std::mutex stop_mutex;
   mutable std::mutex mutex;
   std::condition_variable wake;
@@ -242,8 +264,10 @@ struct OrderedActionExecutor::Impl {
 
 OrderedActionExecutor::OrderedActionExecutor(std::shared_ptr<IActionBackend> backend,
                                              ActionExecutorConfig config,
-                                             ResultCallback results)
-    : impl_(std::make_unique<Impl>(std::move(backend), config, std::move(results))) {}
+                                             ResultCallback results,
+                                             PlanStartedCallback plan_started)
+    : impl_(std::make_unique<Impl>(std::move(backend), config, std::move(results),
+                                  std::move(plan_started))) {}
 
 OrderedActionExecutor::~OrderedActionExecutor() = default;
 
