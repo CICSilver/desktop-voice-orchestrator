@@ -6,6 +6,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -18,7 +19,8 @@ namespace dvo {
 class ReplayController {
  public:
   using PacketCallback = std::function<void(AudioPacket)>;
-  explicit ReplayController(PacketCallback callback);
+  using StateCallback = std::function<void()>;
+  explicit ReplayController(PacketCallback callback, StateCallback state_callback = {});
   ~ReplayController();
 
   void open(const std::filesystem::path& session);
@@ -52,6 +54,7 @@ class ReplayController {
   void load_timeline();
 
   PacketCallback callback_;
+  StateCallback state_callback_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::jthread thread_;
@@ -60,6 +63,7 @@ class ReplayController {
   std::size_t cursor_{};
   bool playing_{};
   bool dispatching_{};
+  std::string last_error_;
   double speed_{1.0};
   std::optional<std::size_t> seek_target_;
   bool resume_after_seek_{};

@@ -331,7 +331,10 @@ void VoiceFrontendRuntime::start_replay(const std::filesystem::path& session, bo
   }
   start_processing();
   replay_ = std::make_unique<ReplayController>(
-      [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); });
+      [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); },
+      [this] {
+        if (replay_) emit_event("replay_state", replay_->state(), 0, "replay");
+      });
   replay_->open(session);
   replay_->set_speed(speed);
   replay_->play();
@@ -2291,7 +2294,10 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     replay_mode_.store(true, std::memory_order_release);
     start_processing();
     if (!replay_) replay_ = std::make_unique<ReplayController>(
-        [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); });
+        [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); },
+        [this] {
+          if (replay_) emit_event("replay_state", replay_->state(), 0, "replay");
+        });
     replay_->open(session);
     emit_event("runtime_mode", {{"mode", "replay"}, {"session", session.string()}}, 0, "replay");
     emit_event("replay_state", replay_->state(), 0, "replay");

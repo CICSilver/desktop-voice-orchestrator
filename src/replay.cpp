@@ -10,7 +10,8 @@
 
 namespace dvo {
 
-ReplayController::ReplayController(PacketCallback callback) : callback_(std::move(callback)) {
+ReplayController::ReplayController(PacketCallback callback, StateCallback state_callback)
+    : callback_(std::move(callback)), state_callback_(std::move(state_callback)) {
   thread_ = std::jthread([this](std::stop_token stop) { run(stop); });
 }
 
@@ -23,12 +24,18 @@ void ReplayController::open(const std::filesystem::path& session) {
   session_ = session;
   cursor_ = 0;
   seek_target_.reset();
+  last_error_.clear();
   load_timeline();
 }
 
 void ReplayController::play() {
   std::scoped_lock lock(mutex_);
   if (entries_.empty()) throw std::runtime_error("no replay session is open");
+  if (cursor_ >= entries_.size()) {
+    cursor_ = 0;
+    seek_target_.reset();
+  }
+  last_error_.clear();
   playing_ = true;
   cv_.notify_all();
 }
@@ -47,6 +54,7 @@ void ReplayController::seek_seconds(double seconds) {
   resume_after_seek_ = playing_;
   cursor_ = 0;
   seek_target_ = target_cursor;
+  last_error_.clear();
   playing_ = true;  // Recompute state from the beginning at unlimited speed.
   cv_.notify_all();
 }
@@ -65,6 +73,7 @@ void ReplayController::seek_seconds(double seconds, bool resume_after_seek) {
   resume_after_seek_ = resume_after_seek;
   cursor_ = 0;
   seek_target_ = target_cursor;
+  last_error_.clear();
   playing_ = true;
   cv_.notify_all();
 }
@@ -111,7 +120,8 @@ nlohmann::json ReplayController::state() const {
   return {{"session", session_.string()}, {"playing", playing_},
           {"dispatching", dispatching_}, {"speed", speed_},
           {"cursor", cursor_}, {"entries", entries_.size()}, {"seeking", seek_target_.has_value()},
-          {"duration_seconds", duration_seconds}, {"position_seconds", position_seconds}};
+          {"duration_seconds", duration_seconds}, {"position_seconds", position_seconds},
+          {"error", last_error_.empty() ? nlohmann::json(nullptr) : nlohmann::json(last_error_)}};
 }
 
 void ReplayController::load_timeline() {
@@ -119,23 +129,28 @@ void ReplayController::load_timeline() {
   std::ifstream input(session_ / "timeline.ndjson", std::ios::binary);
   if (!input) throw std::runtime_error("session timeline.ndjson is missing");
   std::string line;
+  bool has_microphone{};
+  std::vector<TimelineEntry> loaded;
   while (std::getline(input, line)) {
     if (line.empty()) continue;
     const auto value = nlohmann::json::parse(line);
     const auto kind = value.value("kind", "");
     if (kind != "microphone" && kind != "loopback") continue;
-    entries_.push_back({kind == "microphone" ? AudioStreamKind::microphone : AudioStreamKind::loopback,
-                        value.at("offset_frames").get<std::uint64_t>(),
-                        value.at("frame_count").get<std::uint64_t>(),
-                        value.at("qpc_100ns").get<std::uint64_t>(),
-                        value.value("arrival_qpc_100ns", value.at("qpc_100ns").get<std::uint64_t>()),
-                        value.value("device_position", 0ULL), value.value("stream_epoch", 0ULL),
-                        value.value("sequence", 0ULL), value.value("silent", false),
-                        value.value("discontinuity", false), value.value("timestamp_error", false),
-                        value.value("synthetic", false)});
+    has_microphone = has_microphone || kind == "microphone";
+    loaded.push_back({kind == "microphone" ? AudioStreamKind::microphone : AudioStreamKind::loopback,
+                      value.at("offset_frames").get<std::uint64_t>(),
+                      value.at("frame_count").get<std::uint64_t>(),
+                      value.at("qpc_100ns").get<std::uint64_t>(),
+                      value.value("arrival_qpc_100ns", value.at("qpc_100ns").get<std::uint64_t>()),
+                      value.value("device_position", 0ULL), value.value("stream_epoch", 0ULL),
+                      value.value("sequence", 0ULL), value.value("silent", false),
+                      value.value("discontinuity", false), value.value("timestamp_error", false),
+                      value.value("synthetic", false)});
   }
-  std::stable_sort(entries_.begin(), entries_.end(),
+  if (!has_microphone) throw std::runtime_error("session timeline has no microphone packets");
+  std::stable_sort(loaded.begin(), loaded.end(),
                    [](const auto& a, const auto& b) { return a.qpc_100ns < b.qpc_100ns; });
+  entries_ = std::move(loaded);
 }
 
 void ReplayController::run(std::stop_token stop) {
@@ -193,16 +208,32 @@ void ReplayController::run(std::stop_token stop) {
       packet.timestamp_error = entry.timestamp_error;
       packet.synthetic = entry.synthetic;
       callback_(std::move(packet));
+      bool notify_state{};
       {
         std::scoped_lock lock(mutex_);
         dispatching_ = false;
+        notify_state = !playing_;
         cv_.notify_all();
       }
+      if (notify_state && state_callback_) state_callback_();
+    } catch (const std::exception& error) {
+      {
+        std::scoped_lock lock(mutex_);
+        last_error_ = error.what();
+        playing_ = false;
+        dispatching_ = false;
+        cv_.notify_all();
+      }
+      if (state_callback_) state_callback_();
     } catch (...) {
-      std::scoped_lock lock(mutex_);
-      playing_ = false;
-      dispatching_ = false;
-      cv_.notify_all();
+      {
+        std::scoped_lock lock(mutex_);
+        last_error_ = "unknown replay error";
+        playing_ = false;
+        dispatching_ = false;
+        cv_.notify_all();
+      }
+      if (state_callback_) state_callback_();
     }
   }
 }

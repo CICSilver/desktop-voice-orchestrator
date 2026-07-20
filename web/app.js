@@ -257,9 +257,14 @@ function handle(message) {
     setActiveMode(mode, mode !== state.activeMode);
     addEvent(message);
   } else if (type === 'replay_state') {
-    if (state.activeMode === 'replay') $('source').textContent = payload.playing ? 'REPLAY ▶' : 'REPLAY';
+    if (state.activeMode === 'replay') {
+      $('source').textContent = payload.error ? 'REPLAY !' : (payload.playing ? 'REPLAY ▶' : 'REPLAY');
+    }
     $('replay-seek').max = Math.max(1, Number(payload.duration_seconds || 0));
     $('replay-seek').value = Number(payload.position_seconds || 0);
+    if (payload.error) {
+      $('action-result').textContent = `回放失败：${payload.error}`;
+    }
     addEvent(message);
   } else {
     addEvent(message);
@@ -493,8 +498,13 @@ function draw() {
       if (sample < bounds.start || sample > bounds.end) return;
       const value = frame[source] || frame.processed || {min: 0, max: 0};
       const x = xAt(sample, wave.w);
-      const y1 = wave.h / 2 - (value.max || 0) * wave.h * .44;
-      const y2 = wave.h / 2 - (value.min || 0) * wave.h * .44;
+      let y1 = wave.h / 2 - (value.max || 0) * wave.h * .44;
+      let y2 = wave.h / 2 - (value.min || 0) * wave.h * .44;
+      if (Math.abs(y2 - y1) < 1) {
+        const center = (y1 + y2) / 2;
+        y1 = center - .5;
+        y2 = center + .5;
+      }
       wave.c.moveTo(x, y1);
       wave.c.lineTo(x, y2);
     });
