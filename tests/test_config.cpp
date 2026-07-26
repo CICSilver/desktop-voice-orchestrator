@@ -30,7 +30,8 @@ TEST_CASE("checked-in default configuration is valid") {
   REQUIRE(config.announcements.backend == "log");
   REQUIRE_FALSE(config.announcements.barge_in);
   REQUIRE(config.commands.connectors ==
-          std::vector<std::string>{"然后", "再", "接着", "并且"});
+          std::vector<std::string>{"然后再", "然后", "再", "后", "接着", "并且",
+                                   "以及", "和", "还有"});
   REQUIRE(config.aec.microphone_channel_index == 0);
   REQUIRE(config.aec.auto_delay_enabled);
   REQUIRE(config.aec.auto_delay_min_ms == 0);

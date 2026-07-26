@@ -55,7 +55,7 @@ USB 音箱 WASAPI Loopback ─┐
                                       └──────> 话段状态机 <────────┘
                                                     │
                                 prefix / suffix / embedded / follow-up
-                                      （输出 PCM 已剔除唤醒区间）
+                                     （输出连续整句 PCM，文本层剥离唤醒词）
                                                     │
                                          Online Paraformer worker
                                                     │

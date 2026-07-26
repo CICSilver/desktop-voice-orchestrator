@@ -126,11 +126,65 @@ TEST_CASE("Commands can be adjacent or separated by explicit connectors") {
   }
 }
 
+TEST_CASE("Wake text, plus separators and one-character ASR omissions remain executable") {
+  const dvo::CommandParser parser;
+  auto wake_context = context("continuous-wake");
+  wake_context.origin = dvo::UtteranceOrigin::keyword;
+  wake_context.wake_word = "@小助手";
+
+  const auto continuous = parser.parse("小助手播放音乐", wake_context);
+  REQUIRE(continuous.ok());
+  REQUIRE(continuous.plan->actions.size() == 1);
+  CHECK(continuous.plan->actions[0].type == dvo::ActionType::media_play);
+  CHECK(continuous.plan->raw_text == "小助手播放音乐");
+  CHECK(continuous.plan->normalized_text == "播放音乐");
+
+  auto followup_wake_context = wake_context;
+  followup_wake_context.origin = dvo::UtteranceOrigin::followup;
+  const auto repeated_wake =
+      parser.parse("小助手播放音乐", followup_wake_context);
+  REQUIRE(repeated_wake.ok());
+  REQUIRE(repeated_wake.plan->actions.size() == 1);
+  CHECK(repeated_wake.plan->actions[0].type == dvo::ActionType::media_play);
+  CHECK(repeated_wake.plan->normalized_text == "播放音乐");
+
+  const auto tolerant = parser.parse("小助手，播放音+暂停音", wake_context);
+  REQUIRE(tolerant.ok());
+  REQUIRE(tolerant.plan->actions.size() == 2);
+  CHECK(tolerant.plan->actions[0].type == dvo::ActionType::media_play);
+  CHECK(tolerant.plan->actions[1].type == dvo::ActionType::media_pause);
+  CHECK(tolerant.plan->normalized_text == "播放音乐;暂停音乐");
+
+  const auto salvaged = parser.parse("小助手然后后再暂停音", wake_context);
+  REQUIRE(salvaged.ok());
+  REQUIRE(salvaged.plan->actions.size() == 1);
+  CHECK(salvaged.plan->actions[0].type == dvo::ActionType::media_pause);
+
+  const auto truncated_second =
+      parser.parse("小助手播放音乐然后再暂", wake_context);
+  REQUIRE(truncated_second.ok());
+  REQUIRE(truncated_second.plan->actions.size() == 2);
+  CHECK(truncated_second.plan->actions[0].type == dvo::ActionType::media_play);
+  CHECK(truncated_second.plan->actions[1].type == dvo::ActionType::media_pause);
+  CHECK(truncated_second.plan->normalized_text == "播放音乐;暂停音乐");
+}
+
+TEST_CASE("Natural multi-command connectors are accepted") {
+  const dvo::CommandParser parser;
+  for (const auto* text : {"播放音乐然后再暂停音乐", "播放音乐以及暂停音乐",
+                           "播放音乐和暂停音乐", "播放音乐还有暂停音乐"}) {
+    CAPTURE(text);
+    const auto result = parser.parse(text, context("natural-connectors"));
+    REQUIRE(result.ok());
+    REQUIRE(result.plan->actions.size() == 2);
+  }
+}
+
 TEST_CASE("Parser rejects the whole sentence when any residual text is unknown") {
   const dvo::CommandParser parser;
   for (const auto* text : {"帮我播放音乐", "播放音乐吧", "播放音乐然后未知命令",
                            "播放音乐暂停音乐谢谢", "播放，音乐", "增加音量五",
-                           "播放音乐然后再暂停音乐", "播放音乐以及暂停音乐"}) {
+                           "播放音乐并暂停音乐"}) {
     CAPTURE(text);
     const auto result = parser.parse(text, context());
     CHECK_FALSE(result.ok());

@@ -51,12 +51,37 @@ TEST_CASE("pinned sherpa model detects an official reference keyword") {
   feed(wave->samples, static_cast<std::size_t>(wave->num_samples));
   std::array<float, 8000> tail{};
   feed(tail.data(), tail.size());
-  SherpaOnnxFreeWave(wave);
 
   REQUIRE(detected.has_value());
   REQUIRE(detected->keyword == "LIGHT_UP");
   REQUIRE_FALSE(detected->tokens.empty());
   REQUIRE(detected->wake_span.start < detected->wake_span.end);
   REQUIRE(detected->wake_span.end <= detected->detected_at_sample + dvo::kProcessingSampleRate);
+  CHECK(detected->detected_at_sample - detected->wake_span.end <=
+        dvo::kProcessingSampleRate);
+
+  const auto second_origin = offset;
+  detected.reset();
+  feed(tail.data(), tail.size());
+  feed(wave->samples, static_cast<std::size_t>(wave->num_samples));
+  feed(tail.data(), tail.size());
+  REQUIRE(detected.has_value());
+  CHECK(detected->wake_span.start >= second_origin);
+  CHECK(detected->wake_span.end <= detected->detected_at_sample);
+  CHECK(detected->detected_at_sample - detected->wake_span.end <=
+        dvo::kProcessingSampleRate);
+
+  constexpr std::uint64_t reset_origin = 5'000'000;
+  kws->reset(reset_origin);
+  offset = reset_origin;
+  detected.reset();
+  feed(wave->samples, static_cast<std::size_t>(wave->num_samples));
+  feed(tail.data(), tail.size());
+  SherpaOnnxFreeWave(wave);
+  REQUIRE(detected.has_value());
+  CHECK(detected->wake_span.start >= reset_origin);
+  CHECK(detected->wake_span.end <= detected->detected_at_sample);
+  CHECK(detected->detected_at_sample - detected->wake_span.end <=
+        dvo::kProcessingSampleRate);
 #endif
 }

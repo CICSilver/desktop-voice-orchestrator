@@ -304,27 +304,18 @@ std::optional<CandidateAssemblyRequest> UtteranceSegmenter::plan_keyword(
                            : (has_left ? WakePosition::suffix
                                        : WakePosition::prefix);
 
-  if (has_left) {
-    candidate.source_spans.push_back(
-        {saturating_sub(envelope_start, samples(config_.pre_roll_ms)),
-         hit.wake_span.start});
-  }
-  if (has_right) {
-    candidate.source_spans.push_back(
-        {hit.wake_span.end,
-         saturating_add(envelope_end, samples(config_.post_roll_ms))});
-  }
+  // Preserve the original acoustic continuity for one-breath utterances.
+  // Removing the wake interval would splice two unrelated waveform edges (and
+  // previously inserted artificial silence), which causes Online Paraformer
+  // to drop the first command after the wake word. The parser removes the
+  // confirmed wake text after exact-final decoding instead.
+  candidate.source_spans.push_back(
+      {saturating_sub(envelope_start, samples(config_.pre_roll_ms)),
+       saturating_add(envelope_end, samples(config_.post_roll_ms))});
 
-  for (const auto span : candidate.source_spans) {
-    if (candidate.wake_span && span.overlaps(*candidate.wake_span)) {
-      rejection = "internal error: source span overlaps wake span";
-      return std::nullopt;
-    }
-  }
   CandidateAssemblyRequest request;
   request.candidate = std::move(candidate);
-  request.join_silence_samples =
-      static_cast<std::size_t>(samples(config_.embedded_join_silence_ms));
+  request.join_silence_samples = 0;
   return request;
 }
 
@@ -384,6 +375,10 @@ std::optional<CandidateAssemblyRequest> UtteranceSegmenter::plan_followup(
   candidate.turn_index = pending.turn_index;
   candidate.trigger_sample = pending.trigger_sample;
   candidate.position = std::nullopt;
+  // Retain the wake word that opened the active conversation. A repeated wake
+  // phrase may be decoded by ASR even when KWS routes the turn as a follow-up;
+  // the command parser can then remove it before matching command rules.
+  candidate.keyword = last_keyword_;
   candidate.wake_span = std::nullopt;
   candidate.source_spans.push_back(
       {saturating_sub(envelope_start, samples(config_.pre_roll_ms)),
@@ -416,13 +411,11 @@ std::vector<SampleSpan> UtteranceSegmenter::keyword_backfill_spans(
     envelope_start =
         std::max(search_start, std::min(envelope_start, span.start));
   }
-  if (hit.wake_span.start <= envelope_start ||
-      hit.wake_span.start - envelope_start <
-          samples(config_.min_command_speech_ms)) {
-    return {};
-  }
-  return {{saturating_sub(envelope_start, samples(config_.pre_roll_ms)),
-           hit.wake_span.start}};
+  const auto start =
+      saturating_sub(envelope_start, samples(config_.pre_roll_ms));
+  return start < hit.wake_span.end
+             ? std::vector<SampleSpan>{{start, hit.wake_span.end}}
+             : std::vector<SampleSpan>{};
 }
 
 UtteranceStart UtteranceSegmenter::make_start(

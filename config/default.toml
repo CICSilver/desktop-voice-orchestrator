@@ -99,7 +99,9 @@ max_speech_ms = 18000
 # 热：KWS token区间两侧额外剔除范围。
 wake_guard_ms = 100
 pre_roll_ms = 150
-post_roll_ms = 150
+# Keep the complete VAD endpoint decision window in exact-final ASR so weak
+# command tails are not lost after appearing in streaming partials.
+post_roll_ms = 900
 endpoint_silence_ms = 900
 max_candidate_ms = 18000
 min_command_speech_ms = 250
@@ -131,7 +133,7 @@ queue_capacity = 512
 max_pending_audio_ms = 60000
 # 热：部分文本只用于调试展示，永不执行命令。
 emit_partials = true
-# 固定：候选完成后，用精确剔除唤醒词的PCM重新解码一次作为权威结果。
+# 固定：候选完成后，用包含完整连续话语的PCM重新解码一次作为权威结果；解析前再剥离唤醒词文本。
 exact_final_redecode = true
 
 [commands]
@@ -147,10 +149,10 @@ action_timeout_ms = 2000
 # 冷：有界动作队列容量；修改后重启生效。
 queue_capacity = 32
 # 热：多命令连接词；命令也允许直接相邻或以常见标点分隔。
-connectors = ["然后", "再", "接着", "并且"]
+connectors = ["然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"]
 
 [commands.phrases]
-# 热：规则为严格全串匹配，不做模糊同义词推断。
+# 热：配置项仍定义动作语义；解析器允许唯一的一字漏识别纠正。
 play = ["播放音乐"]
 pause = ["暂停音乐"]
 volume_up = ["增加音量"]

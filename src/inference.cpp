@@ -131,8 +131,7 @@ class SherpaKws final : public IKeywordSpotter {
     c.keywords_file = keywords_.c_str();
     spotter_ = SherpaOnnxCreateKeywordSpotter(&c);
     if (!spotter_) throw std::runtime_error("SherpaOnnxCreateKeywordSpotter failed");
-    stream_ = SherpaOnnxCreateKeywordStream(spotter_);
-    if (!stream_) throw std::runtime_error("SherpaOnnxCreateKeywordStream failed");
+    stream_ = create_stream();
   }
 
   ~SherpaKws() override {
@@ -141,7 +140,6 @@ class SherpaKws final : public IKeywordSpotter {
   }
 
   std::optional<KwsHit> accept(const NormalizedFrame& frame) override {
-    if (!origin_) origin_ = frame.first_sample;
     SherpaOnnxOnlineStreamAcceptWaveform(stream_, kProcessingSampleRate,
                                          frame.samples.data(), static_cast<std::int32_t>(frame.samples.size()));
     while (SherpaOnnxIsKeywordStreamReady(spotter_, stream_)) {
@@ -157,36 +155,74 @@ class SherpaKws final : public IKeywordSpotter {
       value.detected_at_sample = frame.first_sample + frame.samples.size();
       value.tokens.reserve(static_cast<std::size_t>(result->count));
       value.token_samples.reserve(static_cast<std::size_t>(result->count));
+      std::vector<std::uint64_t> segment_token_samples;
+      segment_token_samples.reserve(static_cast<std::size_t>(result->count));
       for (std::int32_t i = 0; i < result->count; ++i) {
         value.tokens.emplace_back(result->tokens_arr[i] ? result->tokens_arr[i] : "");
         const auto seconds = result->start_time + result->timestamps[i];
-        value.token_samples.push_back(*origin_ + static_cast<std::uint64_t>(
+        segment_token_samples.push_back(static_cast<std::uint64_t>(
             std::max(0.0F, seconds) * static_cast<float>(kProcessingSampleRate)));
       }
-      value.wake_span.start = value.token_samples.front();
-      value.wake_span.end = value.token_samples.back() + 640;  // KWS timestamps use a 40 ms output stride.
+
+      // KeywordResult timestamps are relative to sherpa's current decoded
+      // segment, not necessarily to the lifetime of OnlineStream. Preserve
+      // their relative spacing and anchor the end of the keyword immediately
+      // before the trailing blank that caused this trigger. This maps every
+      // hit onto our absolute sample clock even after long idle periods.
+      constexpr std::uint64_t output_stride = 640;
+      const auto trailing_blank_samples =
+          static_cast<std::uint64_t>(std::max(0, config_.num_trailing_blanks)) *
+          output_stride;
+      const auto anchored_end =
+          value.detected_at_sample > trailing_blank_samples
+              ? value.detected_at_sample - trailing_blank_samples
+              : value.detected_at_sample;
+      const auto segment_start = segment_token_samples.front();
+      const auto segment_end = segment_token_samples.back() + output_stride;
+      const auto keyword_duration = segment_end - segment_start;
+      const auto anchored_start = anchored_end > keyword_duration
+                                      ? anchored_end - keyword_duration
+                                      : std::uint64_t{};
+      for (const auto sample : segment_token_samples) {
+        value.token_samples.push_back(anchored_start + sample - segment_start);
+      }
+      value.wake_span.start = anchored_start;
+      value.wake_span.end = anchored_end;
       hit = std::move(value);
-      SherpaOnnxResetKeywordStream(spotter_, stream_);
-      origin_ = frame.first_sample + frame.samples.size();
     }
     SherpaOnnxDestroyKeywordResult(result);
+    if (hit) {
+      // A fresh stream also discards any decoder state from the completed hit.
+      replace_stream();
+    }
     return hit;
   }
 
-  void reset(std::uint64_t next_sample) override {
-    SherpaOnnxResetKeywordStream(spotter_, stream_);
-    origin_ = next_sample;
+  void reset(std::uint64_t) override {
+    replace_stream();
   }
 
   [[nodiscard]] bool available() const override { return true; }
   [[nodiscard]] std::string status() const override { return "sherpa-onnx KWS ready"; }
 
  private:
+  [[nodiscard]] const SherpaOnnxOnlineStream* create_stream() const {
+    const auto* stream = SherpaOnnxCreateKeywordStream(spotter_);
+    if (!stream) throw std::runtime_error("SherpaOnnxCreateKeywordStream failed");
+    return stream;
+  }
+
+  void replace_stream() {
+    const auto* replacement = create_stream();
+    const auto* previous = stream_;
+    stream_ = replacement;
+    if (previous) SherpaOnnxDestroyOnlineStream(previous);
+  }
+
   KwsConfig config_;
   std::string encoder_, decoder_, joiner_, tokens_, keywords_, provider_;
   const SherpaOnnxKeywordSpotter* spotter_{};
   const SherpaOnnxOnlineStream* stream_{};
-  std::optional<std::uint64_t> origin_;
 };
 
 #endif

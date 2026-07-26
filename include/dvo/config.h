@@ -84,7 +84,7 @@ struct VadConfig {
 struct SegmentationConfig {
   std::uint32_t wake_guard_ms{100};
   std::uint32_t pre_roll_ms{150};
-  std::uint32_t post_roll_ms{150};
+  std::uint32_t post_roll_ms{900};
   std::uint32_t endpoint_silence_ms{900};
   std::uint32_t max_candidate_ms{18000};
   std::uint32_t min_command_speech_ms{250};
@@ -125,7 +125,7 @@ struct CommandsConfig {
   std::vector<std::string> pause_phrases{"暂停音乐"};
   std::vector<std::string> volume_up_phrases{"增加音量"};
   std::vector<std::string> volume_down_phrases{"降低音量"};
-  std::vector<std::string> connectors{"然后", "再", "接着", "并且"};
+  std::vector<std::string> connectors{"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"};
 };
 
 struct AnnouncementsConfig {

@@ -159,7 +159,7 @@ AppConfig ConfigStore::load() const {
 
   c.segmentation.wake_guard_ms = read<std::int64_t>(table, "segmentation.wake_guard_ms", 100);
   c.segmentation.pre_roll_ms = read<std::int64_t>(table, "segmentation.pre_roll_ms", 150);
-  c.segmentation.post_roll_ms = read<std::int64_t>(table, "segmentation.post_roll_ms", 150);
+  c.segmentation.post_roll_ms = read<std::int64_t>(table, "segmentation.post_roll_ms", 900);
   c.segmentation.endpoint_silence_ms = read<std::int64_t>(table, "segmentation.endpoint_silence_ms", 900);
   c.segmentation.max_candidate_ms = read<std::int64_t>(table, "segmentation.max_candidate_ms", 18000);
   c.segmentation.min_command_speech_ms = read<std::int64_t>(table, "segmentation.min_command_speech_ms", 250);
@@ -201,7 +201,7 @@ AppConfig ConfigStore::load() const {
   c.commands.volume_down_phrases = read_strings(table, "commands.phrases.volume_down", {"降低音量"});
   c.commands.connectors = read_strings(
       table, "commands.connectors",
-      {"然后", "再", "接着", "并且"});
+      {"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"});
 
   c.announcements.enabled = read<bool>(table, "announcements.enabled", true);
   c.announcements.backend = read<std::string>(table, "announcements.backend", "log");
@@ -308,7 +308,7 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
   range(c.asr.max_pending_audio_ms >= 1000 && c.asr.max_pending_audio_ms <= 300000,
         "asr.max_pending_audio_ms must be in [1000, 300000]");
   range(c.asr.exact_final_redecode,
-        "asr.exact_final_redecode must remain true: only exact wake-word-free PCM may execute commands");
+        "asr.exact_final_redecode must remain true: only exact candidate PCM may execute commands");
   range(c.commands.default_volume_step_percent >= 1 &&
             c.commands.default_volume_step_percent <= c.commands.max_spoken_volume_step_percent,
         "commands.default_volume_step_percent must be within the spoken volume range");

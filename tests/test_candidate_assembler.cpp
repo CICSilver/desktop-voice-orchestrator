@@ -52,6 +52,19 @@ TEST_CASE("candidate assembly slices outside the segmenter and inserts join sile
   CHECK(result.candidate->pcm[303] == 600.0F);
 }
 
+TEST_CASE("candidate assembly permits continuous source audio across the wake span") {
+  dvo::TimedRingBuffer ring(2000);
+  ring.push(0, std::vector<float>(1000, 0.25F));
+
+  auto result = dvo::assemble_candidate(
+      ring, request("continuous", {{200, 800}}));
+  REQUIRE(result.candidate.has_value());
+  CHECK(result.rejection.empty());
+  CHECK(result.candidate->source_spans ==
+        std::vector<dvo::SampleSpan>{{200, 800}});
+  CHECK(result.candidate->pcm.size() == 600);
+}
+
 TEST_CASE("candidate assembler bounds all outstanding work until completion is consumed") {
   dvo::TimedRingBuffer ring(2000);
   ring.push(0, std::vector<float>(1000, 0.25F));

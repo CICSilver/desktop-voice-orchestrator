@@ -820,7 +820,10 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
   if (auto hit = kws_->accept(frame)) {
     const auto guard = static_cast<std::uint64_t>(config_.segmentation.wake_guard_ms) * kProcessingSampleRate / 1000;
     hit->wake_span.start = hit->wake_span.start > guard ? hit->wake_span.start - guard : 0;
-    hit->wake_span.end += guard;
+    // Do not extend the wake interval into following speech. In a one-breath
+    // "wake word + command" utterance, even a 100 ms tail guard can remove the
+    // initial consonant of the command. Residual wake text is stripped by the
+    // command parser instead of sacrificing command audio.
     kws_hits_.fetch_add(1, std::memory_order_relaxed);
     emit_event("kws_hit", kws_json(*hit), hit->detected_at_sample,
                replay_mode_ ? "replay" : "live");
@@ -1179,11 +1182,7 @@ void VoiceFrontendRuntime::begin_recognition(const UtteranceStart& start) {
   request.turn_index = start.turn_index;
   request.trigger_sample = start.trigger_sample;
   request.source_spans = start.backfill_spans;
-  request.trailing_silence_samples =
-      start.origin == UtteranceOrigin::keyword
-          ? static_cast<std::size_t>(config_.segmentation.embedded_join_silence_ms) *
-                kProcessingSampleRate / 1000
-          : 0;
+  request.trailing_silence_samples = 0;
   request.stream_start_sample = start.stream_start_sample;
   request.recognition_generation = generation;
   if (!candidate_assembler_ || !candidate_assembler_->try_submit(std::move(request))) {
@@ -1669,6 +1668,7 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
   context.wake_position = result.candidate->position
                               ? to_string(*result.candidate->position)
                               : "";
+  context.wake_word = result.candidate->keyword;
   context.config_revision = command_snapshot->config_revision;
   context.recognition_generation = result.generation;
   context.final_revision = result.revision;

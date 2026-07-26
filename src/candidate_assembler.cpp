@@ -48,10 +48,6 @@ CandidateAssemblyResult assemble_candidate(TimedRingBuffer& ring,
   std::vector<SampleSpan> actual_spans;
   actual_spans.reserve(candidate.source_spans.size());
   for (const auto span : candidate.source_spans) {
-    if (candidate.wake_span && span.overlaps(*candidate.wake_span)) {
-      result.rejection = "internal error: source span overlaps wake span";
-      return result;
-    }
     auto slice = ring.slice_cooperative(span);
     candidate.truncated = candidate.truncated || slice.truncated_left ||
                           slice.truncated_right;

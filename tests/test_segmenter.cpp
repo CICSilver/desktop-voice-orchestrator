@@ -42,35 +42,32 @@ dvo::SegmenterResult run(dvo::VadInterval speech, dvo::SampleSpan wake) {
 
 }  // namespace
 
-TEST_CASE("segmenter emits prefix candidate without the wake interval") {
+TEST_CASE("segmenter preserves continuous prefix candidate audio including the wake interval") {
   const auto result = run({{1000, 7000}}, {1000, 2500});
   REQUIRE(result.candidates.size() == 1);
   const auto& candidate = result.candidates.front();
   REQUIRE(candidate.position == dvo::WakePosition::prefix);
-  REQUIRE(candidate.source_spans == std::vector<dvo::SampleSpan>{{2500, 7000}});
+  REQUIRE(candidate.source_spans == std::vector<dvo::SampleSpan>{{1000, 7000}});
   REQUIRE(candidate.wake_span.has_value());
-  REQUIRE_FALSE(candidate.source_spans.front().overlaps(*candidate.wake_span));
+  REQUIRE(candidate.source_spans.front().overlaps(*candidate.wake_span));
 }
 
 TEST_CASE("segmenter emits suffix candidate") {
   const auto result = run({{1000, 7000}}, {5500, 7000});
   REQUIRE(result.candidates.size() == 1);
   REQUIRE(result.candidates.front().position == dvo::WakePosition::suffix);
-  REQUIRE(result.candidates.front().source_spans == std::vector<dvo::SampleSpan>{{1000, 5500}});
+  REQUIRE(result.candidates.front().source_spans == std::vector<dvo::SampleSpan>{{1000, 7000}});
 }
 
-TEST_CASE("segmenter emits embedded candidate with join silence") {
+TEST_CASE("segmenter emits one continuous embedded candidate") {
   const auto result = run({{1000, 9000}}, {4000, 5500});
   REQUIRE(result.candidates.size() == 1);
   const auto& candidate = result.candidates.front();
   REQUIRE(candidate.position == dvo::WakePosition::embedded);
-  REQUIRE(candidate.source_spans.size() == 2);
-  REQUIRE(candidate.pcm.size() == (3000 + 3500 + 2400));
-  REQUIRE(std::all_of(candidate.pcm.begin() + 3000, candidate.pcm.begin() + 5400,
-                      [](float value) { return value == 0.0F; }));
+  REQUIRE(candidate.source_spans == std::vector<dvo::SampleSpan>{{1000, 9000}});
+  REQUIRE(candidate.pcm.size() == 8000);
   REQUIRE(candidate.wake_span.has_value());
-  REQUIRE_FALSE(candidate.source_spans[0].overlaps(*candidate.wake_span));
-  REQUIRE_FALSE(candidate.source_spans[1].overlaps(*candidate.wake_span));
+  REQUIRE(candidate.source_spans.front().overlaps(*candidate.wake_span));
 }
 
 TEST_CASE("segmenter rejects wake-only speech") {
@@ -92,11 +89,11 @@ TEST_CASE("runtime segmenter path plans spans without copying candidate PCM") {
   REQUIRE(result.assemblies.size() == 1);
   CHECK(result.assemblies.front().candidate.pcm.empty());
   CHECK(result.assemblies.front().candidate.source_spans ==
-        std::vector<dvo::SampleSpan>{{1000, 4000}, {5500, 9000}});
-  CHECK(result.assemblies.front().join_silence_samples == 2400);
+        std::vector<dvo::SampleSpan>{{1000, 9000}});
+  CHECK(result.assemblies.front().join_silence_samples == 0);
 }
 
-TEST_CASE("provisional ASR backfill includes active VAD speech before the wake") {
+TEST_CASE("provisional ASR backfill preserves speech through the wake interval") {
   dvo::TimedRingBuffer ring(16000 * 10);
   ring.push(0, audio(16000 * 10));
   dvo::UtteranceSegmenter segmenter(config(), ring);
@@ -110,9 +107,9 @@ TEST_CASE("provisional ASR backfill includes active VAD speech before the wake")
 
   REQUIRE(start.has_value());
   CHECK(start->backfill_spans ==
-        std::vector<dvo::SampleSpan>{{500, 4000}});
+        std::vector<dvo::SampleSpan>{{500, 5500}});
   REQUIRE(start->wake_span.has_value());
-  CHECK_FALSE(start->backfill_spans.front().overlaps(*start->wake_span));
+  CHECK(start->backfill_spans.front().overlaps(*start->wake_span));
 }
 
 TEST_CASE("segmenter recovers trust after a discontinuity reset") {
@@ -221,6 +218,8 @@ TEST_CASE("activation splits speech that starts after the endpoint") {
   REQUIRE(second.candidates.size() == 1);
   CHECK(second.candidates.front().origin == dvo::UtteranceOrigin::followup);
   CHECK(second.candidates.front().turn_index == 1);
+  CHECK(second.candidates.front().keyword ==
+        first.candidates.front().keyword);
   CHECK_FALSE(second.candidates.front().wake_span.has_value());
   CHECK_FALSE(second.candidates.front().position.has_value());
   REQUIRE_FALSE(second.candidates.front().source_spans.empty());

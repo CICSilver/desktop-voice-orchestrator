@@ -33,6 +33,7 @@ struct ParsedAction {
 
 struct PhraseRule {
   std::string phrase;
+  std::vector<std::string> omission_variants;
   ActionType type{ActionType::media_play};
   bool volume_increase{};
 };
@@ -50,6 +51,7 @@ struct PhraseRule {
     case U'.':
     case U'!':
     case U'?':
+    case U'+':
     case U';':
     case U':':
     case U'，':
@@ -195,12 +197,12 @@ void append_utf8(std::string& output, char32_t cp) {
   return {parse_integer_token(text.substr(offset, end - offset)), end};
 }
 
-[[nodiscard]] ParsedAction parse_volume(std::string_view text, std::size_t offset,
+[[nodiscard]] ParsedAction parse_volume(std::string_view text, std::size_t matched_end,
                                         std::string_view base, bool increase,
                                         int default_delta, int maximum_delta) {
   ParsedAction result;
   result.type = ActionType::master_volume_adjust;
-  result.end = offset + base.size();
+  result.end = matched_end;
   auto amount = default_delta;
   bool explicit_amount = false;
 
@@ -242,14 +244,82 @@ void append_utf8(std::string& output, char32_t cp) {
 
 [[nodiscard]] ParsedAction parse_action(std::string_view text, std::size_t offset,
                                         int default_delta, int maximum_delta,
-                                        const std::vector<PhraseRule>& rules) {
-  for (const auto& rule : rules) {
-    if (!starts_with_at(text, offset, rule.phrase)) continue;
+                                        const std::vector<PhraseRule>& rules,
+                                        bool allow_trailing_prefix) {
+  const auto parsed_rule = [&](const PhraseRule& rule, std::size_t end) {
     if (rule.type == ActionType::master_volume_adjust) {
-      return parse_volume(text, offset, rule.phrase, rule.volume_increase,
+      return parse_volume(text, end, rule.phrase, rule.volume_increase,
                           default_delta, maximum_delta);
     }
-    return {rule.type, {}, rule.phrase, offset + rule.phrase.size(), {}};
+    return ParsedAction{rule.type, {}, rule.phrase, end, {}};
+  };
+
+  for (const auto& rule : rules) {
+    if (!starts_with_at(text, offset, rule.phrase)) continue;
+    return parsed_rule(rule, offset + rule.phrase.size());
+  }
+
+  // ASR commonly drops one Chinese character at an utterance boundary. Admit
+  // only an exact one-codepoint omission of a configured phrase, and only when
+  // the resulting action is unambiguous. This is deliberately narrower than
+  // general edit-distance matching so wake-gated speech cannot become an
+  // unrelated command by guesswork.
+  const PhraseRule* fuzzy_rule{};
+  std::size_t fuzzy_size{};
+  bool ambiguous{};
+  for (const auto& rule : rules) {
+    for (const auto& variant : rule.omission_variants) {
+      if (!starts_with_at(text, offset, variant)) continue;
+      if (variant.size() < fuzzy_size) continue;
+      if (variant.size() > fuzzy_size) {
+        fuzzy_rule = &rule;
+        fuzzy_size = variant.size();
+        ambiguous = false;
+        continue;
+      }
+      if (fuzzy_rule &&
+          (fuzzy_rule->type != rule.type ||
+           fuzzy_rule->volume_increase != rule.volume_increase)) {
+        ambiguous = true;
+      }
+    }
+  }
+  if (ambiguous) {
+    return {ActionType::media_play, {}, {}, offset,
+            CommandParseError{"ambiguous_text",
+                              "one-character ASR correction matches multiple commands",
+                              offset}};
+  }
+  if (fuzzy_rule) return parsed_rule(*fuzzy_rule, offset + fuzzy_size);
+
+  // Exact-final decoding can regress relative to the last streaming partial
+  // when the utterance tail is weak. After at least one complete action and a
+  // connector, accept an end-of-utterance prefix only when every matching
+  // configured phrase has the same semantic action. For example,
+  // "播放音乐然后再暂" deterministically completes to "暂停音乐", while
+  // arbitrary residual text remains rejected.
+  if (allow_trailing_prefix && offset < text.size()) {
+    const auto remainder = text.substr(offset);
+    const PhraseRule* prefix_rule{};
+    bool prefix_ambiguous{};
+    for (const auto& rule : rules) {
+      if (!rule.phrase.starts_with(remainder)) continue;
+      if (!prefix_rule) {
+        prefix_rule = &rule;
+        continue;
+      }
+      if (prefix_rule->type != rule.type ||
+          prefix_rule->volume_increase != rule.volume_increase) {
+        prefix_ambiguous = true;
+      }
+    }
+    if (prefix_ambiguous) {
+      return {ActionType::media_play, {}, {}, offset,
+              CommandParseError{"ambiguous_text",
+                                "trailing command prefix matches multiple actions",
+                                offset}};
+    }
+    if (prefix_rule) return parsed_rule(*prefix_rule, text.size());
   }
   return {ActionType::media_play, {}, {}, offset,
           CommandParseError{"unknown_text", "text contains an unknown or incomplete command", offset}};
@@ -283,6 +353,28 @@ void append_utf8(std::string& output, char32_t cp) {
   return normalized.value;
 }
 
+[[nodiscard]] std::vector<std::string> omission_variants(std::string_view phrase) {
+  std::vector<std::size_t> boundaries{0};
+  for (std::size_t offset = 0; offset < phrase.size();) {
+    const auto decoded = decode_one(phrase, offset);
+    if (!decoded) return {};
+    offset += decoded->second;
+    boundaries.push_back(offset);
+  }
+  if (boundaries.size() <= 2) return {};
+
+  std::vector<std::string> variants;
+  std::unordered_set<std::string> unique;
+  for (std::size_t i = 0; i + 1 < boundaries.size(); ++i) {
+    auto variant = std::string(phrase.substr(0, boundaries[i]));
+    variant.append(phrase.substr(boundaries[i + 1]));
+    if (!variant.empty() && unique.insert(variant).second) {
+      variants.push_back(std::move(variant));
+    }
+  }
+  return variants;
+}
+
 void append_rules(const std::vector<std::string>& phrases, std::string_view category,
                   ActionType type, bool volume_increase,
                   std::vector<PhraseRule>& output,
@@ -297,7 +389,8 @@ void append_rules(const std::vector<std::string>& phrases, std::string_view cate
       throw std::invalid_argument("command phrase '" + normalized + "' is duplicated in " +
                                   owner->second + " and " + std::string(category));
     }
-    output.push_back({std::move(normalized), type, volume_increase});
+    auto variants = omission_variants(normalized);
+    output.push_back({std::move(normalized), std::move(variants), type, volume_increase});
   }
 }
 
@@ -367,8 +460,35 @@ CommandParseResult CommandParser::parse(std::string_view text,
   if (context.runtime_session_id.empty()) {
     return failure("invalid_context", "runtime_session_id is required", 0);
   }
-  const auto normalized = normalize(text);
+  auto normalized = normalize(text);
   if (normalized.error) return {{}, normalized.error};
+  // KWS can occasionally miss a repeated wake word while an activation is
+  // already armed, causing the utterance to arrive through the follow-up
+  // path. Strip the activation's confirmed wake word in either origin so an
+  // otherwise exact command is not rejected solely because of that routing.
+  if (!context.wake_word.empty()) {
+    auto wake = normalize(context.wake_word);
+    if (!wake.error) {
+      while (!wake.value.empty() && wake.value.front() == '@') {
+        wake.value.erase(wake.value.begin());
+      }
+      if (!wake.value.empty()) {
+        const auto position = normalized.value.find(wake.value);
+        if (position != std::string::npos) {
+          auto erase_start = position;
+          auto erase_size = wake.value.size();
+          if (erase_start > 0 && normalized.value[erase_start - 1] == ';') {
+            --erase_start;
+            ++erase_size;
+          } else if (erase_start + erase_size < normalized.value.size() &&
+                     normalized.value[erase_start + erase_size] == ';') {
+            ++erase_size;
+          }
+          normalized.value.erase(erase_start, erase_size);
+        }
+      }
+    }
+  }
   if (normalized.value.empty()) {
     return failure("empty_text", "ASR text does not contain a command", 0);
   }
@@ -376,6 +496,18 @@ CommandParseResult CommandParser::parse(std::string_view text,
     return failure("empty_clause", "command text must not start with a separator", 0);
   }
   std::size_t position{};
+
+  // If ASR loses the first action of a multi-command utterance, do not reject
+  // a later action merely because its connector is now at the beginning. A
+  // chain also tolerates boundary duplications such as "然后后再".
+  while (const auto connector_end = consume_connector(normalized.value, position,
+                                                        impl_->connectors)) {
+    position = *connector_end;
+    if (position == normalized.value.size()) {
+      return failure("trailing_connector", "a connector must be followed by a command",
+                     position);
+    }
+  }
 
   struct ActionDraft {
     ActionType type;
@@ -387,7 +519,8 @@ CommandParseResult CommandParser::parse(std::string_view text,
   while (position < normalized.value.size()) {
     const auto parsed = parse_action(normalized.value, position,
                                      default_volume_delta_percent_,
-                                     maximum_volume_delta_percent_, impl_->rules);
+                                     maximum_volume_delta_percent_, impl_->rules,
+                                     !drafts.empty());
     if (parsed.error) return {{}, parsed.error};
     drafts.push_back({parsed.type, parsed.delta, parsed.canonical});
     if (drafts.size() > max_actions_per_utterance_) {
@@ -408,8 +541,8 @@ CommandParseResult CommandParser::parse(std::string_view text,
     }
 
     bool had_connector = false;
-    if (const auto connector_end = consume_connector(normalized.value, position,
-                                                       impl_->connectors)) {
+    while (const auto connector_end = consume_connector(normalized.value, position,
+                                                          impl_->connectors)) {
       had_connector = true;
       position = *connector_end;
       if (position < normalized.value.size() && normalized.value[position] == ';') {
