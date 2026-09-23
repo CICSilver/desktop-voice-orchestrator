@@ -195,7 +195,8 @@ AppConfig ConfigStore::load() const {
       read<std::int64_t>(table, "commands.max_actions_per_utterance", 8);
   c.commands.action_timeout_ms = read<std::int64_t>(table, "commands.action_timeout_ms", 2000);
   c.commands.queue_capacity = read<std::int64_t>(table, "commands.queue_capacity", 32);
-  c.commands.play_phrases = read_strings(table, "commands.phrases.play", {"播放音乐"});
+  c.commands.play_phrases =
+      read_strings(table, "commands.phrases.play", {"播放音乐", "打开音乐"});
   c.commands.pause_phrases = read_strings(table, "commands.phrases.pause", {"暂停音乐"});
   c.commands.volume_up_phrases = read_strings(table, "commands.phrases.volume_up", {"增加音量"});
   c.commands.volume_down_phrases = read_strings(table, "commands.phrases.volume_down", {"降低音量"});

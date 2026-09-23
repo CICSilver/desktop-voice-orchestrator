@@ -12,7 +12,10 @@
     <div class="status-cluster">
       <span id="connection" class="pill offline">离线</span>
       <span id="source" class="pill">LIVE</span>
-      <span id="recording" class="record-indicator"><i></i> 未录制</span>
+      <span id="recording" class="record-indicator" role="status" aria-live="polite">
+        <i></i><span id="recording-label">未录制</span>
+        <strong id="recording-elapsed" hidden>00:00</strong>
+      </span>
     </div>
   </header>
 
@@ -21,12 +24,26 @@
       <div class="control-group"><label>波形</label><select id="wave-source">
         <option value="compare">原始麦克风 + AEC对比</option><option value="processed" selected>AEC处理后</option><option value="microphone">原始麦克风</option><option value="loopback">Loopback</option>
       </select></div>
-      <button id="record-start" class="primary">开始录制</button><button id="record-stop">停止录制</button>
+      <div class="record-controls">
+        <button id="record-start" class="primary">开始录制</button>
+        <button id="record-stop" disabled>停止录制</button>
+        <span id="recording-session" class="session-caption">尚未创建录音</span>
+      </div>
       <div class="divider"></div>
-      <select id="sessions"><option value="">选择回放会话</option></select>
-      <button id="replay-open">载入</button><button id="replay-play">播放</button><button id="replay-pause">暂停</button>
-      <select id="replay-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="0">不限速</option></select>
+      <select id="sessions"><option value="">选择有效录音</option></select>
+      <select id="replay-track" aria-label="试听音轨">
+        <option value="processed" selected>AEC处理后</option>
+        <option value="microphone">原始麦克风</option>
+        <option value="loopback">Loopback</option>
+      </select>
+      <button id="replay-open">载入回放</button>
+      <button id="replay-play">播放并分析</button>
+      <button id="replay-pause">暂停</button>
+      <select id="replay-speed"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="0">仅分析</option></select>
       <input id="replay-seek" type="range" min="0" max="100" value="0" aria-label="回放位置">
+      <span id="replay-audio-state" class="pill">未载入</span>
+      <audio id="replay-audio" preload="metadata"></audio>
+      <output id="control-message" class="control-message" role="status" aria-live="polite"></output>
     </section>
 
     <section class="timeline panel">
@@ -74,6 +91,25 @@
         <p id="command-plan" class="transcript final">尚无命令计划</p>
         <p class="announcement-line"><span>文字播报</span><strong id="announcement-text">尚无播报</strong></p>
         <p id="action-result" class="action-result">live模式实际执行；回放与基准强制dry-run。</p>
+      </article>
+      <article class="panel status-card parse-card">
+        <div class="panel-heading"><div><p class="section-label">PARSER</p><h2>回放解析调试</h2></div><span id="parse-state" class="pill">仅回放可用</span></div>
+        <form id="replay-parse-form" class="parse-form">
+          <label class="parse-text-label">识别文本
+            <input id="replay-parse-text" type="text" maxlength="4096" placeholder="输入或等待回放识别文本">
+          </label>
+          <label>唤醒词（可选）
+            <input id="replay-parse-wake" type="text" maxlength="256" placeholder="例如：小助手">
+          </label>
+          <button id="replay-parse-run" type="submit" disabled>仅解析，不执行</button>
+        </form>
+        <dl class="parse-result">
+          <div><dt>原始文本</dt><dd id="parse-input">—</dd></div>
+          <div><dt>规范化</dt><dd id="parse-normalized">—</dd></div>
+          <div><dt>动作序列</dt><dd id="parse-actions">—</dd></div>
+          <div><dt>诊断</dt><dd id="parse-error">等待回放或手动输入</dd></div>
+        </dl>
+        <p id="parse-meta" class="action-result">只调用当前规则解析器，强制 dry-run，不提交系统动作。</p>
       </article>
     </section>
 

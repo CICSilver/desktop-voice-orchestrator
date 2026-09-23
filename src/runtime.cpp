@@ -3,6 +3,7 @@
 #include "dvo/benchmark_report.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -14,6 +15,7 @@
 
 #include "dvo/json_utils.h"
 #include "dvo/hash.h"
+#include "dvo/wav_file.h"
 #include "dvo/windows_action_backend.h"
 
 namespace dvo {
@@ -127,6 +129,55 @@ nlohmann::json command_plan_json(const CommandPlan& plan) {
   return value;
 }
 
+nlohmann::json parse_debug_base(std::string_view input_text,
+                                const CommandParseContext& context,
+                                std::string_view kind,
+                                std::string_view stage) {
+  return {{"schema_version", 1},
+          {"kind", kind},
+          {"stage", stage},
+          {"matched", false},
+          {"input_text", input_text},
+          {"utterance_id", context.utterance_id},
+          {"origin", to_string(context.origin)},
+          {"wake_word", context.wake_word},
+          {"config_revision", context.config_revision},
+          {"recognition_generation", context.recognition_generation},
+          {"final_revision", context.final_revision},
+          {"timestamp_sample", context.timestamp_sample},
+          {"source", to_string(context.source)},
+          {"execution_mode", to_string(context.execution_mode)},
+          {"parser_version", kCommandParserVersion}};
+}
+
+nlohmann::json parse_debug_success(std::string_view input_text,
+                                   const CommandParseContext& context,
+                                   const CommandPlan& plan,
+                                   std::string_view kind) {
+  auto value = parse_debug_base(input_text, context, kind, "parser");
+  value["matched"] = true;
+  value["normalized_text"] = plan.normalized_text;
+  value["plan"] = command_plan_json(plan);
+  value["error"] = nullptr;
+  return value;
+}
+
+nlohmann::json parse_debug_failure(std::string_view input_text,
+                                   const CommandParseContext& context,
+                                   std::string_view kind,
+                                   std::string_view stage,
+                                   std::string code,
+                                   std::string message,
+                                   std::size_t byte_offset = 0) {
+  auto value = parse_debug_base(input_text, context, kind, stage);
+  value["normalized_text"] = "";
+  value["plan"] = nullptr;
+  value["error"] = {{"code", std::move(code)},
+                    {"message", std::move(message)},
+                    {"byte_offset", byte_offset}};
+  return value;
+}
+
 nlohmann::json action_result_json(const ActionResult& result) {
   auto value = nlohmann::json{
       {"schema_version", result.schema_version},
@@ -218,6 +269,76 @@ nlohmann::json preprocess_json(const PreprocessDiagnostics& diagnostics) {
   return value;
 }
 
+bool valid_session_name(std::string_view name) {
+  return !name.empty() && name.size() <= 128 &&
+         std::all_of(name.begin(), name.end(), [](unsigned char character) {
+           return std::isalnum(character) != 0 || character == '-' ||
+                  character == '_';
+         });
+}
+
+std::optional<nlohmann::json> inspect_session_directory(
+    const std::filesystem::path& session) {
+  std::error_code error;
+  const auto manifest_path = session / "manifest.json";
+  const auto timeline_path = session / "timeline.ndjson";
+  if (!std::filesystem::is_regular_file(manifest_path, error) ||
+      !std::filesystem::is_regular_file(timeline_path, error) ||
+      std::filesystem::file_size(timeline_path, error) == 0 || error) {
+    return std::nullopt;
+  }
+
+  nlohmann::json manifest;
+  try {
+    std::ifstream input(manifest_path, std::ios::binary);
+    if (!input) return std::nullopt;
+    manifest = nlohmann::json::parse(input);
+  } catch (...) {
+    return std::nullopt;
+  }
+
+  auto streams = nlohmann::json::object();
+  double preferred_duration{};
+  std::string default_stream;
+  const auto add_stream = [&](std::string_view name,
+                              std::string_view filename) {
+    try {
+      FloatWavReader reader(session / filename);
+      const auto format = reader.format();
+      const auto frames = reader.frame_count();
+      if (format.sample_rate == 0 || frames == 0) return;
+      const auto duration =
+          static_cast<double>(frames) / static_cast<double>(format.sample_rate);
+      streams[std::string(name)] = {
+          {"present", true},       {"frames", frames},
+          {"sample_rate", format.sample_rate},
+          {"channels", format.channels},
+          {"duration_seconds", duration}};
+      if (default_stream.empty() || name == "processed") {
+        default_stream = std::string(name);
+        preferred_duration = duration;
+      }
+    } catch (...) {
+      // A malformed or unsupported stream is excluded without hiding other
+      // usable tracks in the same session.
+    }
+  };
+  add_stream("microphone", "mic.wav");
+  add_stream("loopback", "loopback.wav");
+  add_stream("processed", "processed.wav");
+
+  // Analysis replay requires raw microphone packets. Audible playback can use
+  // any stream, but sessions without microphone audio are not valid captures.
+  if (!streams.contains("microphone")) return std::nullopt;
+  return nlohmann::json{
+      {"name", session.filename().string()},
+      {"path", session.string()},
+      {"complete", manifest.value("complete", false)},
+      {"default_stream", default_stream},
+      {"duration_seconds", preferred_duration},
+      {"streams", std::move(streams)}};
+}
+
 }  // namespace
 
 VoiceFrontendRuntime::VoiceFrontendRuntime(AppConfig config, ConfigStore store)
@@ -234,6 +355,7 @@ void VoiceFrontendRuntime::initialize_pipeline() {
   runtime_session_id_ = make_runtime_session_id();
   const auto capacity = static_cast<std::size_t>(config_.ring.duration_ms) * kProcessingSampleRate / 1000;
   ring_ = std::make_unique<TimedRingBuffer>(capacity);
+  microphone_ring_ = std::make_unique<TimedRingBuffer>(capacity);
   const auto timeline = make_preprocessor_timeline_config(config_.aec);
   if (config_.preprocess.aec_enabled && config_.aec.enabled &&
       config_.preprocess.implementation == "webrtc_aec3") {
@@ -241,12 +363,20 @@ void VoiceFrontendRuntime::initialize_pipeline() {
   } else {
     preprocessor_ = std::make_unique<BypassPreprocessor>(config_.audio, timeline);
   }
+  // Preserve a microphone-only KWS path beside the AEC path. Fallback hits
+  // are later gated by processed VAD speech so render-only audio cannot
+  // self-wake the assistant.
+  keyword_preprocessor_ =
+      std::make_unique<BypassPreprocessor>(config_.audio, timeline);
   vad_ = create_vad(config_.vad);
   kws_ = create_keyword_spotter(config_.kws);
+  microphone_kws_ = create_keyword_spotter(config_.kws);
   segmenter_ = std::make_unique<UtteranceSegmenter>(
       config_.segmentation, config_.activation, *ring_);
   candidate_assembler_ = std::make_unique<CandidateAssembler>(
       *ring_, config_.segmentation.assembly_queue_capacity);
+  microphone_candidate_assembler_ = std::make_unique<CandidateAssembler>(
+      *microphone_ring_, config_.segmentation.assembly_queue_capacity);
   StreamingRecognizerConfig asr_config;
   asr_config.enabled = config_.asr.enabled;
   asr_config.encoder = config_.asr.encoder;
@@ -301,12 +431,18 @@ void VoiceFrontendRuntime::initialize_pipeline() {
   announcement_playback_start_sample_ = 0;
   vad_speech_active_ = false;
   suppress_current_vad_interval_ = false;
+  pending_microphone_keywords_.clear();
+  last_runtime_keyword_.clear();
+  last_runtime_keyword_sample_ = 0;
+  microphone_candidate_fallback_after_sample_ = 0;
+  microphone_audio_activations_.clear();
   last_published_activation_state_ = {};
   reset_audio_queues();
   telemetry_queue_ = std::make_unique<SpscQueue<TelemetrySample>>(128);
   telemetry_queue_drops_.store(0, std::memory_order_release);
   telemetry_enabled_.store(false, std::memory_order_release);
   next_telemetry_sample_ = 0;
+  view_sample_origin_.reset();
 }
 
 void VoiceFrontendRuntime::reset_audio_queues() {
@@ -326,7 +462,12 @@ void VoiceFrontendRuntime::start_live(bool enable_web) {
   initialize_pipeline();
   running_.store(true, std::memory_order_release);
   if (enable_web && config_.web.enabled) {
-    debug_.start(config_.web, [this](const auto& command) { return handle_command(command); });
+    debug_.start(
+        config_.web,
+        [this](const auto& command) { return handle_command(command); },
+        [this](const auto& request) {
+          return session_audio_resource(request);
+        });
     telemetry_enabled_.store(true, std::memory_order_release);
   }
   start_processing();
@@ -348,12 +489,20 @@ void VoiceFrontendRuntime::start_replay(const std::filesystem::path& session, bo
   initialize_pipeline();
   running_.store(true, std::memory_order_release);
   if (enable_web && config_.web.enabled) {
-    debug_.start(config_.web, [this](const auto& command) { return handle_command(command); });
+    debug_.start(
+        config_.web,
+        [this](const auto& command) { return handle_command(command); },
+        [this](const auto& request) {
+          return session_audio_resource(request);
+        });
     telemetry_enabled_.store(true, std::memory_order_release);
   }
   start_processing();
   replay_ = std::make_unique<ReplayController>(
-      [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); });
+      [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); },
+      [this](nlohmann::json state) {
+        emit_event("replay_state", std::move(state), 0, "replay");
+      });
   replay_->open(session);
   replay_->set_speed(speed);
   replay_->play();
@@ -396,7 +545,9 @@ nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& 
   bool pipeline_idle{};
   while (replay_finished && running() && remaining().count() > 0) {
     if (microphone_queue_->size() != 0 || loopback_queue_->size() != 0 ||
-        (candidate_assembler_ && candidate_assembler_->outstanding() != 0)) {
+        (candidate_assembler_ && candidate_assembler_->outstanding() != 0) ||
+        (microphone_candidate_assembler_ &&
+         microphone_candidate_assembler_->outstanding() != 0)) {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
       continue;
     }
@@ -410,7 +561,9 @@ nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& 
     pipeline_idle = microphone_queue_->size() == 0 &&
                     loopback_queue_->size() == 0 &&
                     (!candidate_assembler_ ||
-                     candidate_assembler_->outstanding() == 0);
+                     candidate_assembler_->outstanding() == 0) &&
+                    (!microphone_candidate_assembler_ ||
+                     microphone_candidate_assembler_->outstanding() == 0);
     break;
   }
 
@@ -492,6 +645,7 @@ void VoiceFrontendRuntime::publish_telemetry(TelemetrySample sample) {
   emit_event(
       "telemetry",
       {{"sample", sample.sample},
+       {"view_sample", sample.view_sample},
        {"microphone", summary_json(sample.microphone)},
        {"loopback", summary_json(sample.loopback)},
        {"processed", summary_json(sample.processed)},
@@ -567,6 +721,10 @@ void VoiceFrontendRuntime::stop() {
 void VoiceFrontendRuntime::stop_async_services() {
   if (candidate_assembler_) candidate_assembler_->stop();
   candidate_assembler_.reset();
+  if (microphone_candidate_assembler_) {
+    microphone_candidate_assembler_->stop();
+  }
+  microphone_candidate_assembler_.reset();
   const auto generation = recognition_generation_.load(std::memory_order_acquire);
   if (asr_) asr_->cancel_generation(generation);
   active_recognizers_.clear();
@@ -677,7 +835,11 @@ void VoiceFrontendRuntime::processing_loop(std::stop_token stop) {
         emit_event("audio_timeline_reset",
                    {{"stream", "loopback"}, {"reason", to_string(pushed.reset_reason)}});
         report_audio_queue_boundary("loopback", pushed.reset_reason);
-        reset_pipeline(true, false);
+        // A render-only gap invalidates AEC/ring candidate continuity, but the
+        // microphone sample clock is still trustworthy. Keeping the keyword
+        // decoder warm avoids starting a fresh KWS stream on the render/AEC
+        // transient produced when media playback changes state.
+        reset_pipeline(true, false, false);
         pipeline_reset_for_packet = true;
       }
       drain_preprocessor_frames(pipeline_reset_for_packet);
@@ -706,6 +868,14 @@ void VoiceFrontendRuntime::process_microphone(AudioPacket packet) {
   latest_microphone_summary_ = summarize(packet.samples);
   if (recorder_.active()) recorder_.try_enqueue(packet);
   std::scoped_lock lock(pipeline_mutex_);
+  const auto keyword_pushed = keyword_preprocessor_->PushPacket(packet);
+  if (keyword_pushed.reset_required || packet.discontinuity ||
+      packet.timestamp_error) {
+    microphone_kws_->reset(ring_ ? ring_->tail() : 0);
+    pending_microphone_keywords_.clear();
+  }
+  drain_keyword_preprocessor_frames();
+
   const auto pushed = preprocessor_->PushPacket(packet);
   bool pipeline_reset_for_packet{};
   if (pushed.reset_required || packet.discontinuity || packet.timestamp_error) {
@@ -718,6 +888,23 @@ void VoiceFrontendRuntime::process_microphone(AudioPacket packet) {
   drain_preprocessor_frames(pipeline_reset_for_packet);
 }
 
+void VoiceFrontendRuntime::drain_keyword_preprocessor_frames() {
+  NormalizedFrame frame;
+  while (keyword_preprocessor_->TryPopFrame(frame)) {
+    if (frame.discontinuity) continue;
+    if (microphone_ring_) {
+      microphone_ring_->push(frame.first_sample, frame.samples);
+    }
+    if (auto hit = microphone_kws_->accept(frame)) {
+      pending_microphone_keywords_.push_back(std::move(*hit));
+      constexpr std::size_t maximum_pending_hits = 8;
+      if (pending_microphone_keywords_.size() > maximum_pending_hits) {
+        pending_microphone_keywords_.pop_front();
+      }
+    }
+  }
+}
+
 void VoiceFrontendRuntime::drain_preprocessor_frames(
     bool pipeline_reset_for_packet) {
   NormalizedFrame frame;
@@ -728,6 +915,11 @@ void VoiceFrontendRuntime::drain_preprocessor_frames(
       // generation for this packet, so do not advance it a second time.
       if (recorder_.active()) recorder_.try_enqueue(frame);
       if (!pipeline_reset_for_packet) {
+        // A processed-only gap is the signature of the AEC failure observed
+        // when media render changes state. Preserve the independent microphone
+        // ring so a later microphone-only wake can use uncorrupted candidate
+        // PCM for its authoritative exact-final decode.
+        microphone_candidate_fallback_after_sample_ = frame.first_sample;
         emit_event("audio_timeline_reset",
                    {{"stream", "processed"},
                     {"reason", "normalized_frame_discontinuity"}},
@@ -735,7 +927,10 @@ void VoiceFrontendRuntime::drain_preprocessor_frames(
                    replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
         report_audio_queue_boundary("processed",
                                     PreprocessResetReason::discontinuity);
-        reset_pipeline(true, false);
+        // A processed-only boundary can be emitted after a render reset. The
+        // microphone path already performs a full keyword reset when its own
+        // clock is discontinuous, so do not clear KWS a second time here.
+        reset_pipeline(true, false, false);
         pipeline_reset_for_packet = true;
       }
       continue;
@@ -770,6 +965,7 @@ void VoiceFrontendRuntime::report_audio_queue_boundary(
 void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
                                          const SignalSummary& microphone,
                                          const SignalSummary& loopback) {
+  if (!view_sample_origin_) view_sample_origin_ = frame.first_sample;
   ring_->push(frame.first_sample, frame.samples);
   processed_frames_.fetch_add(1, std::memory_order_relaxed);
   if (recorder_.active()) recorder_.try_enqueue(frame);
@@ -800,6 +996,10 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
       announcement_kws_reset_pending_.exchange(false,
                                                 std::memory_order_acq_rel)) {
     kws_->reset(frame_end);
+    microphone_kws_->reset(frame_end);
+    pending_microphone_keywords_.clear();
+    last_runtime_keyword_.clear();
+    last_runtime_keyword_sample_ = 0;
   }
   if (capture_blocked && vad_started) {
     suppress_current_vad_interval_ = true;
@@ -817,33 +1017,18 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
     suppress_current_vad_interval_ = false;
   }
 
+  const bool processed_speech_present =
+      vad_update.speech || !vad_update.completed.empty();
   if (auto hit = kws_->accept(frame)) {
-    const auto guard = static_cast<std::uint64_t>(config_.segmentation.wake_guard_ms) * kProcessingSampleRate / 1000;
-    hit->wake_span.start = hit->wake_span.start > guard ? hit->wake_span.start - guard : 0;
-    // Do not extend the wake interval into following speech. In a one-breath
-    // "wake word + command" utterance, even a 100 ms tail guard can remove the
-    // initial consonant of the command. Residual wake text is stripped by the
-    // command parser instead of sacrificing command audio.
-    kws_hits_.fetch_add(1, std::memory_order_relaxed);
-    emit_event("kws_hit", kws_json(*hit), hit->detected_at_sample,
-               replay_mode_ ? "replay" : "live");
-    if (capture_blocked || suppress_current_vad_interval_) {
-      emit_event("kws_suppressed",
-                 {{"reason", "announcement_playback_guard"},
-                  {"keyword", hit->keyword}},
-                 hit->detected_at_sample,
-                 replay_mode_ ? "replay" : "live");
-    } else {
-      const bool rearming = segmenter_->activation().active();
-      if (auto start = segmenter_->add_kws_hit(std::move(*hit))) {
-        emit_activation_events(segmenter_->take_activation_events());
-        if (rearming) {
-          if (candidate_assembler_) candidate_assembler_->cancel_pending();
-          cancel_recognition_generation("keyword activation rearmed");
-        }
-        begin_recognition(*start);
-      }
-    }
+    process_keyword_hit(std::move(*hit), capture_blocked,
+                        processed_speech_present, "aec");
+  }
+  while (!pending_microphone_keywords_.empty() &&
+         pending_microphone_keywords_.front().detected_at_sample <= frame_end) {
+    auto hit = std::move(pending_microphone_keywords_.front());
+    pending_microphone_keywords_.pop_front();
+    process_keyword_hit(std::move(hit), capture_blocked,
+                        processed_speech_present, "microphone_fallback");
   }
 
   feed_recognizers(frame);
@@ -856,14 +1041,21 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
     const auto activation_id = request.candidate.activation_id;
     const auto turn_index = request.candidate.turn_index;
     const auto trigger_sample = request.candidate.trigger_sample;
-    if (candidate_assembler_ && candidate_assembler_->try_submit(std::move(request))) {
+    const bool use_microphone_audio =
+        microphone_audio_activations_.contains(activation_id);
+    auto* assembler = use_microphone_audio
+                          ? microphone_candidate_assembler_.get()
+                          : candidate_assembler_.get();
+    if (assembler && assembler->try_submit(std::move(request))) {
       emit_event("candidate_assembly_queued",
                  {{"utterance_id", utterance_id},
                   {"origin", to_string(origin)},
                    {"activation_id", activation_id},
                    {"turn_index", turn_index},
                    {"trigger_sample", trigger_sample},
-                  {"outstanding", candidate_assembler_->outstanding()}},
+                  {"recognition_audio_source",
+                   use_microphone_audio ? "microphone" : "aec"},
+                  {"outstanding", assembler->outstanding()}},
                  frame.first_sample, replay_mode_ ? "replay" : "live");
     } else {
       constexpr auto reason = "candidate assembly queue is full";
@@ -904,6 +1096,7 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
       frame.first_sample >= next_telemetry_sample_) {
     TelemetrySample telemetry;
     telemetry.sample = frame.first_sample;
+    telemetry.view_sample = frame.first_sample - *view_sample_origin_;
     telemetry.microphone = microphone;
     telemetry.loopback = loopback;
     telemetry.processed = summarize(frame);
@@ -938,23 +1131,101 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
   }
 }
 
-bool VoiceFrontendRuntime::drain_audio_assemblies() {
-  if (!candidate_assembler_) return false;
-  bool drained{};
-  AudioAssemblyResult result;
-  while (candidate_assembler_->try_pop(result)) {
-    drained = true;
-    std::visit(
-        [this](auto value) {
-          using Result = std::decay_t<decltype(value)>;
-          if constexpr (std::is_same_v<Result, BackfillAssemblyResult>) {
-            complete_backfill(std::move(value));
-          } else {
-            complete_candidate(std::move(value));
-          }
-        },
-        std::move(result));
+void VoiceFrontendRuntime::process_keyword_hit(
+    KwsHit hit, bool capture_blocked, bool processed_speech_present,
+    std::string_view detector) {
+  const auto debounce_samples =
+      static_cast<std::uint64_t>(kProcessingSampleRate) / 2;
+  if (!last_runtime_keyword_.empty() &&
+      last_runtime_keyword_ == hit.keyword &&
+      hit.detected_at_sample <
+          last_runtime_keyword_sample_ + debounce_samples) {
+    return;
   }
+  if (detector == "microphone_fallback" && !processed_speech_present) {
+    emit_event("kws_suppressed",
+               {{"reason", "microphone_fallback_without_processed_speech"},
+                {"keyword", hit.keyword},
+                {"detector", detector}},
+               hit.detected_at_sample,
+               replay_mode_ ? "replay" : "live");
+    return;
+  }
+
+  last_runtime_keyword_ = hit.keyword;
+  last_runtime_keyword_sample_ = hit.detected_at_sample;
+  const auto guard =
+      static_cast<std::uint64_t>(config_.segmentation.wake_guard_ms) *
+      kProcessingSampleRate / 1000;
+  hit.wake_span.start =
+      hit.wake_span.start > guard ? hit.wake_span.start - guard : 0;
+  // Do not extend the wake interval into following speech. In a one-breath
+  // "wake word + command" utterance, even a 100 ms tail guard can remove the
+  // initial consonant of the command. Residual wake text is stripped by the
+  // command parser instead of sacrificing command audio.
+  auto payload = kws_json(hit);
+  payload["detector"] = detector;
+  kws_hits_.fetch_add(1, std::memory_order_relaxed);
+  emit_event("kws_hit", std::move(payload), hit.detected_at_sample,
+             replay_mode_ ? "replay" : "live");
+  if (capture_blocked || suppress_current_vad_interval_) {
+    emit_event("kws_suppressed",
+               {{"reason", "announcement_playback_guard"},
+                {"keyword", hit.keyword},
+                {"detector", detector}},
+               hit.detected_at_sample,
+               replay_mode_ ? "replay" : "live");
+    return;
+  }
+
+  const bool rearming = segmenter_->activation().active();
+  const bool use_microphone_audio =
+      detector == "microphone_fallback" &&
+      microphone_candidate_fallback_after_sample_ != 0 &&
+      hit.detected_at_sample >= microphone_candidate_fallback_after_sample_;
+  if (auto start = segmenter_->add_kws_hit(std::move(hit))) {
+    if (use_microphone_audio) {
+      microphone_audio_activations_.insert(start->activation_id);
+      emit_event("recognition_audio_fallback",
+                 {{"activation_id", start->activation_id},
+                  {"reason", "aec_processed_stream_discontinuity"},
+                  {"audio_source", "microphone"}},
+                 start->trigger_sample,
+                 replay_mode_ ? "replay" : "live");
+    }
+    emit_activation_events(segmenter_->take_activation_events());
+    if (rearming) {
+      if (candidate_assembler_) candidate_assembler_->cancel_pending();
+      if (microphone_candidate_assembler_) {
+        microphone_candidate_assembler_->cancel_pending();
+      }
+      cancel_recognition_generation("keyword activation rearmed");
+    }
+    begin_recognition(*start);
+  }
+}
+
+bool VoiceFrontendRuntime::drain_audio_assemblies() {
+  bool drained{};
+  const auto drain = [this, &drained](CandidateAssembler* assembler) {
+    if (!assembler) return;
+    AudioAssemblyResult result;
+    while (assembler->try_pop(result)) {
+      drained = true;
+      std::visit(
+          [this](auto value) {
+            using Result = std::decay_t<decltype(value)>;
+            if constexpr (std::is_same_v<Result, BackfillAssemblyResult>) {
+              complete_backfill(std::move(value));
+            } else {
+              complete_candidate(std::move(value));
+            }
+          },
+          std::move(result));
+    }
+  };
+  drain(candidate_assembler_.get());
+  drain(microphone_candidate_assembler_.get());
   return drained;
 }
 
@@ -1627,7 +1898,41 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
   if (result.kind != RecognitionResultKind::final) return;
   asr_finals_.fetch_add(1, std::memory_order_relaxed);
 
+  CommandParseContext context;
+  context.runtime_session_id = runtime_session_id_;
+  context.utterance_id = result.utterance_id;
+  context.origin = origin;
+  context.activation_id = activation_id;
+  context.turn_index = turn_index;
+  context.trigger_sample = trigger_sample;
+  context.wake_position =
+      result.candidate && result.candidate->position
+          ? to_string(*result.candidate->position)
+          : "";
+  context.wake_word = result.candidate ? result.candidate->keyword : "";
+  context.config_revision =
+      command_snapshot ? command_snapshot->config_revision : 0;
+  context.recognition_generation = result.generation;
+  context.final_revision = result.revision;
+  context.timestamp_sample =
+      result.candidate ? candidate_end_sample(*result.candidate)
+                       : result.audio_end_sample;
+  context.source =
+      source == "live" ? ExecutionSource::live : ExecutionSource::replay;
+  context.execution_mode =
+      source == "live" ? ExecutionMode::live : ExecutionMode::dry_run;
+
+  std::string parse_stage{"precondition"};
+  bool parse_debug_emitted{};
   const auto reject = [&](std::string reason) {
+    if (!parse_debug_emitted && source == "replay") {
+      emit_event("parse_debug",
+                 parse_debug_failure(result.hypothesis.text, context,
+                                     "automatic", parse_stage,
+                                     "precondition_failed", reason),
+                 result.audio_end_sample, source);
+      parse_debug_emitted = true;
+    }
     command_rejections_.fetch_add(1, std::memory_order_relaxed);
     auto rejection = nlohmann::json{{"utterance_id", result.utterance_id},
                                     {"origin", to_string(origin)},
@@ -1648,40 +1953,56 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
                          : result.audio_end_sample,
                      std::move(reason));
   };
-  if (!result.exact_final || !result.candidate) return reject("result is not an exact final decode");
+  parse_stage = "exact_final";
+  if (!result.exact_final || !result.candidate) {
+    return reject("result is not an exact final decode");
+  }
+  parse_stage = "parser_snapshot";
   if (!command_snapshot || !command_snapshot->parser) {
     return reject("command parser snapshot is unavailable");
   }
-  if (!command_snapshot->commands_enabled) return reject("command execution is disabled");
+  if (!command_snapshot->commands_enabled && source != "replay") {
+    return reject("command execution is disabled");
+  }
+  parse_stage = "candidate";
   if (result.candidate->truncated || result.candidate->timed_out ||
       result.candidate->discontinuity) {
     return reject("candidate is truncated, timed out, or discontinuous");
   }
 
-  CommandParseContext context;
-  context.runtime_session_id = runtime_session_id_;
-  context.utterance_id = result.utterance_id;
-  context.origin = result.candidate->origin;
-  context.activation_id = result.candidate->activation_id;
-  context.turn_index = result.candidate->turn_index;
-  context.trigger_sample = result.candidate->trigger_sample;
-  context.wake_position = result.candidate->position
-                              ? to_string(*result.candidate->position)
-                              : "";
-  context.wake_word = result.candidate->keyword;
-  context.config_revision = command_snapshot->config_revision;
-  context.recognition_generation = result.generation;
-  context.final_revision = result.revision;
-  context.timestamp_sample = candidate_end_sample(*result.candidate);
-  context.source = source == "live" ? ExecutionSource::live : ExecutionSource::replay;
-  context.execution_mode = source == "live" ? ExecutionMode::live : ExecutionMode::dry_run;
+  parse_stage = "parser";
   auto parsed = command_snapshot->parser->parse(result.hypothesis.text, context);
   if (!parsed.ok()) {
+    const auto code =
+        parsed.error ? parsed.error->code : "rule_not_matched";
+    const auto message =
+        parsed.error ? parsed.error->message
+                     : "text did not match a command rule";
+    const auto byte_offset =
+        parsed.error ? parsed.error->byte_offset : std::size_t{};
+    if (source == "replay") {
+      emit_event("parse_debug",
+                 parse_debug_failure(result.hypothesis.text, context,
+                                     "automatic", parse_stage, code, message,
+                                     byte_offset),
+                 result.audio_end_sample, source);
+      parse_debug_emitted = true;
+    }
     return reject(parsed.error ? parsed.error->code + ": " + parsed.error->message
                                : "text did not match a command rule");
   }
 
+  if (source == "replay") {
+    emit_event("parse_debug",
+               parse_debug_success(result.hypothesis.text, context,
+                                   *parsed.plan, "automatic"),
+               result.audio_end_sample, source);
+    parse_debug_emitted = true;
+  }
   auto plan = std::move(*parsed.plan);
+  if (!command_snapshot->commands_enabled) {
+    return reject("command execution is disabled");
+  }
   SubmitResult submitted;
   bool activation_eligible = true;
   {
@@ -1917,9 +2238,11 @@ void VoiceFrontendRuntime::emit_activation_events(
         break;
       case ActivationTransitionKind::expired:
         activations_expired_.fetch_add(1, std::memory_order_relaxed);
+        microphone_audio_activations_.erase(event.activation_id);
         break;
       case ActivationTransitionKind::cancelled:
         activations_cancelled_.fetch_add(1, std::memory_order_relaxed);
+        microphone_audio_activations_.erase(event.activation_id);
         break;
     }
     const bool active = event.kind == ActivationTransitionKind::started ||
@@ -2009,13 +2332,30 @@ bool VoiceFrontendRuntime::announcement_capture_blocked(
   return guard_until != 0 && at_sample < guard_until;
 }
 
-void VoiceFrontendRuntime::reset_pipeline(bool discontinuity, bool reset_preprocessor) {
+void VoiceFrontendRuntime::reset_pipeline(bool discontinuity,
+                                          bool reset_preprocessor,
+                                          bool reset_keyword) {
   if (candidate_assembler_) candidate_assembler_->cancel_pending();
+  if (microphone_candidate_assembler_) {
+    microphone_candidate_assembler_->cancel_pending();
+  }
   const auto next = ring_ ? ring_->tail() : 0;
   if (ring_) ring_->reset(next);
   if (preprocessor_ && discontinuity && reset_preprocessor) preprocessor_->reset();
+  if (keyword_preprocessor_ && reset_keyword) keyword_preprocessor_->reset();
   if (vad_) vad_->reset();
-  if (kws_) kws_->reset(next);
+  if (reset_keyword) {
+    if (microphone_ring_) {
+      microphone_ring_->reset(microphone_ring_->tail());
+    }
+    if (kws_) kws_->reset(next);
+    if (microphone_kws_) microphone_kws_->reset(next);
+    pending_microphone_keywords_.clear();
+    last_runtime_keyword_.clear();
+    last_runtime_keyword_sample_ = 0;
+    microphone_candidate_fallback_after_sample_ = 0;
+    microphone_audio_activations_.clear();
+  }
   if (segmenter_) {
     segmenter_->reset(discontinuity);
     emit_activation_events(segmenter_->take_activation_events());
@@ -2096,7 +2436,11 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     }
     emit_event("config_state", {{"config", config_store_.to_public_json(config_)}});
     emit_event("sessions", session_list());
-    emit_event("recording_state", {{"active", recorder_.active()}, {"session", recorder_.session_path().string()}});
+    emit_event("recording_state",
+               {{"active", recorder_.active()},
+                {"session", recorder_.session_path().string()},
+                {"started_at_ms", recorder_.started_at_unix_ms()},
+                {"incomplete", recorder_.incomplete()}});
     emit_event("runtime_mode", {{"mode", mode}});
     emit_event("activation_state", activation_state, activation_sample, mode);
     emit_event("runtime_state", {{"mode", mode},
@@ -2108,7 +2452,70 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
             {"activation_state", std::move(activation_state)},
             {"latest_announcement", std::move(latest_announcement)}};
   }
+  if (action == "replay.parse_debug") {
+    if (!replay_mode_.load(std::memory_order_acquire)) {
+      return {{"ok", false},
+              {"error", "parse debugging is available only in replay mode"}};
+    }
+    const auto text = command.value("text", "");
+    const auto wake_word = command.value("wake_word", "");
+    if (text.size() > 4096 || wake_word.size() > 256) {
+      return {{"ok", false}, {"error", "parse debug input is too long"}};
+    }
+
+    std::shared_ptr<const CommandParser> parser;
+    std::uint64_t config_revision{};
+    bool commands_enabled{};
+    {
+      std::scoped_lock command_lock(command_mutex_);
+      parser = command_parser_;
+      config_revision = command_config_revision_;
+      commands_enabled = commands_enabled_;
+    }
+    if (!parser) {
+      return {{"ok", false}, {"error", "command parser is unavailable"}};
+    }
+
+    CommandParseContext context;
+    context.runtime_session_id = runtime_session_id_;
+    context.utterance_id =
+        "replay-parse-debug-" +
+        std::to_string(replay_parse_debug_sequence_.fetch_add(
+            1, std::memory_order_relaxed));
+    context.origin = wake_word.empty() ? UtteranceOrigin::followup
+                                       : UtteranceOrigin::keyword;
+    context.wake_position = wake_word.empty() ? "" : "manual";
+    context.wake_word = wake_word;
+    context.config_revision = config_revision;
+    context.recognition_generation =
+        recognition_generation_.load(std::memory_order_acquire);
+    context.final_revision = 1;
+    context.source = ExecutionSource::replay;
+    context.execution_mode = ExecutionMode::dry_run;
+
+    const auto parsed = parser->parse(text, context);
+    auto debug =
+        parsed.ok()
+            ? parse_debug_success(text, context, *parsed.plan, "manual")
+            : parse_debug_failure(
+                  text, context, "manual", "parser",
+                  parsed.error ? parsed.error->code : "rule_not_matched",
+                  parsed.error ? parsed.error->message
+                               : "text did not match a command rule",
+                  parsed.error ? parsed.error->byte_offset : std::size_t{});
+    debug["commands_enabled"] = commands_enabled;
+    debug["safe_only"] = true;
+    emit_event("parse_debug", debug, 0, "replay");
+    return {{"ok", true}, {"parse", std::move(debug)}};
+  }
   if (action == "recording.start") {
+    if (replay_mode_.load(std::memory_order_acquire)) {
+      return {{"ok", false},
+              {"error", "return to live mode before starting a recording"}};
+    }
+    if (recorder_.active()) {
+      return {{"ok", false}, {"error", "recording is already active"}};
+    }
     const auto model_file = [](const std::filesystem::path& path) {
       nlohmann::json value{{"path", path.string()}, {"present", std::filesystem::is_regular_file(path)}};
       if (value["present"].get<bool>()) value["sha256"] = sha256_file(path);
@@ -2139,13 +2546,23 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         {"initial_metrics", metrics_json()},
         {"kws_status", kws_->status()}, {"vad_status", vad_->status()}};
     const auto path = recorder_.start(config_.recording, manifest);
-    emit_event("recording_state", {{"active", true}, {"session", path.string()}});
+    emit_event("recording_state",
+               {{"active", true},
+                {"session", path.string()},
+                {"started_at_ms", recorder_.started_at_unix_ms()},
+                {"incomplete", false}});
     return {{"ok", true}, {"session", path.string()}};
   }
   if (action == "recording.stop") {
+    if (!recorder_.active()) {
+      return {{"ok", false}, {"error", "recording is not active"}};
+    }
     recorder_.stop(metrics_json());
-    emit_event("recording_state", {{"active", false}, {"session", recorder_.session_path().string()},
-                                    {"incomplete", recorder_.incomplete()}});
+    emit_event("recording_state",
+               {{"active", false},
+                {"session", recorder_.session_path().string()},
+                {"started_at_ms", recorder_.started_at_unix_ms()},
+                {"incomplete", recorder_.incomplete()}});
     emit_event("sessions", session_list());
     return {{"ok", true}};
   }
@@ -2313,6 +2730,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
                                   segmentation_changed || activation_changed;
 
     std::unique_ptr<IAudioPreprocessor> new_preprocessor;
+    std::unique_ptr<IAudioPreprocessor> new_keyword_preprocessor;
     if (aec_changed) {
       const auto timeline = make_preprocessor_timeline_config(active.aec);
       new_preprocessor = active.preprocess.aec_enabled && active.aec.enabled &&
@@ -2321,9 +2739,13 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
                                    std::make_unique<WebRtcAec3Preprocessor>(active.audio, timeline))
                              : std::unique_ptr<IAudioPreprocessor>(
                                    std::make_unique<BypassPreprocessor>(active.audio, timeline));
+      new_keyword_preprocessor =
+          std::make_unique<BypassPreprocessor>(active.audio, timeline);
     }
     auto new_vad = vad_changed ? create_vad(active.vad) : nullptr;
     auto new_kws = kws_changed ? create_keyword_spotter(active.kws) : nullptr;
+    auto new_microphone_kws =
+        kws_changed ? create_keyword_spotter(active.kws) : nullptr;
     std::shared_ptr<const CommandParser> new_parser;
     if (parser_changed) {
       new_parser = std::make_shared<const CommandParser>(
@@ -2362,8 +2784,14 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
       }
       if (pipeline_changed) {
         if (new_preprocessor) preprocessor_ = std::move(new_preprocessor);
+        if (new_keyword_preprocessor) {
+          keyword_preprocessor_ = std::move(new_keyword_preprocessor);
+        }
         if (new_vad) vad_ = std::move(new_vad);
         if (new_kws) kws_ = std::move(new_kws);
+        if (new_microphone_kws) {
+          microphone_kws_ = std::move(new_microphone_kws);
+        }
         cancelled_candidates = segmenter_->pending_count();
         segmenter_->reconfigure(config_.segmentation, config_.activation);
         emit_activation_events(segmenter_->take_activation_events());
@@ -2371,8 +2799,20 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
             ring_ ? ring_->tail() : 0,
             replay_mode_.load(std::memory_order_acquire) ? "replay" : "live");
         if (candidate_assembler_) candidate_assembler_->cancel_pending();
+        if (microphone_candidate_assembler_) {
+          microphone_candidate_assembler_->cancel_pending();
+        }
         const auto next = ring_->tail();
+        if (microphone_ring_) {
+          microphone_ring_->reset(microphone_ring_->tail());
+        }
         kws_->reset(next);
+        microphone_kws_->reset(next);
+        pending_microphone_keywords_.clear();
+        last_runtime_keyword_.clear();
+        last_runtime_keyword_sample_ = 0;
+        microphone_candidate_fallback_after_sample_ = 0;
+        microphone_audio_activations_.clear();
         vad_->reset();
         vad_speech_active_ = false;
         suppress_current_vad_interval_ = false;
@@ -2398,8 +2838,29 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
             {"saved", save}, {"restart_required", restart_required}};
   }
   if (action == "replay.open") {
-    const auto session = std::filesystem::path(command.value("session", ""));
-    if (session.empty()) throw std::invalid_argument("session is required");
+    if (recorder_.active()) {
+      return {{"ok", false},
+              {"error", "stop the active recording before opening replay"}};
+    }
+    auto requested = std::filesystem::path(command.value("session", ""));
+    if (requested.empty()) throw std::invalid_argument("session is required");
+    std::filesystem::path session_root;
+    {
+      std::scoped_lock config_lock(config_mutex_);
+      session_root = config_.recording.session_root;
+    }
+    std::error_code path_error;
+    const auto canonical_root =
+        std::filesystem::weakly_canonical(session_root, path_error);
+    if (path_error) throw std::invalid_argument("recording root is unavailable");
+    auto session = requested.is_absolute() ? requested : session_root / requested;
+    session = std::filesystem::weakly_canonical(session, path_error);
+    if (path_error || session.parent_path() != canonical_root ||
+        !valid_session_name(session.filename().string()) ||
+        !inspect_session_directory(session)) {
+      return {{"ok", false},
+              {"error", "selected session has no replayable audio"}};
+    }
     stop_captures();
     if (replay_) {
       replay_->stop();
@@ -2413,15 +2874,23 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     reset_audio_queues();
     {
       std::scoped_lock lock(pipeline_mutex_);
+      view_sample_origin_.reset();
+      next_telemetry_sample_ = 0;
       reset_pipeline(true);
     }
     replay_mode_.store(true, std::memory_order_release);
     start_processing();
-    if (!replay_) replay_ = std::make_unique<ReplayController>(
-        [this](AudioPacket packet) { enqueue_replay_packet(std::move(packet)); });
+    if (!replay_) {
+      replay_ = std::make_unique<ReplayController>(
+          [this](AudioPacket packet) {
+            enqueue_replay_packet(std::move(packet));
+          },
+          [this](nlohmann::json state) {
+            emit_event("replay_state", std::move(state), 0, "replay");
+          });
+    }
     replay_->open(session);
     emit_event("runtime_mode", {{"mode", "replay"}, {"session", session.string()}}, 0, "replay");
-    emit_event("replay_state", replay_->state(), 0, "replay");
     return {{"ok", true}};
   }
   if (action == "live.resume") {
@@ -2441,6 +2910,8 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     reset_audio_queues();
     {
       std::scoped_lock lock(pipeline_mutex_);
+      view_sample_origin_.reset();
+      next_telemetry_sample_ = 0;
       reset_pipeline(true);
     }
     start_processing();
@@ -2448,9 +2919,18 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     emit_event("runtime_mode", {{"mode", "live"}});
     return {{"ok", true}};
   }
-  if (action == "replay.play" && replay_) { replay_->play(); emit_event("replay_state", replay_->state(), 0, "replay"); return {{"ok", true}}; }
-  if (action == "replay.pause" && replay_) { replay_->pause(); emit_event("replay_state", replay_->state(), 0, "replay"); return {{"ok", true}}; }
-  if (action == "replay.speed" && replay_) { replay_->set_speed(command.value("speed", 1.0)); emit_event("replay_state", replay_->state(), 0, "replay"); return {{"ok", true}}; }
+  if (action == "replay.play" && replay_) {
+    replay_->play();
+    return {{"ok", true}};
+  }
+  if (action == "replay.pause" && replay_) {
+    replay_->pause();
+    return {{"ok", true}};
+  }
+  if (action == "replay.speed" && replay_) {
+    replay_->set_speed(command.value("speed", 1.0));
+    return {{"ok", true}};
+  }
   if (action == "replay.seek" && replay_) {
     const auto before = replay_->state();
     const bool resume_after_seek = before.value("playing", false);
@@ -2466,28 +2946,89 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
       reset_audio_queues();
       {
         std::scoped_lock pipeline_lock(pipeline_mutex_);
+        view_sample_origin_.reset();
+        next_telemetry_sample_ = 0;
         reset_pipeline(true);
       }
       replay_->seek_seconds(command.value("seconds", 0.0), resume_after_seek);
       start_processing();
     }
-    emit_event("replay_state", replay_->state(), 0, "replay");
     return {{"ok", true}};
   }
   return {{"ok", false}, {"error", "unknown or unavailable action: " + action}};
 }
 
 nlohmann::json VoiceFrontendRuntime::session_list() const {
-  nlohmann::json sessions = nlohmann::json::array();
+  std::filesystem::path session_root;
+  {
+    std::scoped_lock config_lock(config_mutex_);
+    session_root = config_.recording.session_root;
+  }
+  std::vector<nlohmann::json> valid_sessions;
+  std::uint64_t excluded_sessions{};
   std::error_code error;
-  if (std::filesystem::is_directory(config_.recording.session_root, error)) {
-    for (const auto& entry : std::filesystem::directory_iterator(config_.recording.session_root, error)) {
-      if (entry.is_directory() && std::filesystem::exists(entry.path() / "manifest.json")) {
-        sessions.push_back({{"name", entry.path().filename().string()}, {"path", entry.path().string()}});
+  if (std::filesystem::is_directory(session_root, error)) {
+    for (const auto& entry :
+         std::filesystem::directory_iterator(session_root, error)) {
+      if (error) break;
+      if (!entry.is_directory(error)) continue;
+      if (auto session = inspect_session_directory(entry.path())) {
+        valid_sessions.push_back(std::move(*session));
+      } else {
+        ++excluded_sessions;
       }
     }
   }
-  return {{"sessions", sessions}};
+  std::ranges::sort(valid_sessions, std::greater{},
+                    [](const nlohmann::json& session) {
+                      return session.value("name", "");
+                    });
+  auto sessions = nlohmann::json::array();
+  for (auto& session : valid_sessions) {
+    sessions.push_back(std::move(session));
+  }
+  return {{"sessions", std::move(sessions)},
+          {"excluded_sessions", excluded_sessions}};
+}
+
+std::optional<DebugServer::FileResource>
+VoiceFrontendRuntime::session_audio_resource(
+    const nlohmann::json& request) const {
+  const auto session_name = request.value("session", "");
+  const auto stream = request.value("stream", "processed");
+  if (!valid_session_name(session_name)) return std::nullopt;
+
+  std::string filename;
+  if (stream == "processed") {
+    filename = "processed.wav";
+  } else if (stream == "microphone") {
+    filename = "mic.wav";
+  } else if (stream == "loopback") {
+    filename = "loopback.wav";
+  } else {
+    return std::nullopt;
+  }
+
+  std::filesystem::path session_root;
+  {
+    std::scoped_lock config_lock(config_mutex_);
+    session_root = config_.recording.session_root;
+  }
+  std::error_code error;
+  const auto canonical_root =
+      std::filesystem::weakly_canonical(session_root, error);
+  if (error) return std::nullopt;
+  const auto session = std::filesystem::weakly_canonical(
+      session_root / session_name, error);
+  if (error || session.parent_path() != canonical_root) return std::nullopt;
+  const auto info = inspect_session_directory(session);
+  if (!info || !(*info)["streams"].contains(stream)) return std::nullopt;
+
+  const auto audio = session / filename;
+  if (!std::filesystem::is_regular_file(audio, error) || error) {
+    return std::nullopt;
+  }
+  return DebugServer::FileResource{audio, "audio/wav"};
 }
 
 nlohmann::json VoiceFrontendRuntime::metrics_json() const {
@@ -2501,9 +3042,11 @@ nlohmann::json VoiceFrontendRuntime::metrics_json() const {
           {"asr_partials", asr_partials_.load()}, {"asr_finals", asr_finals_.load()},
           {"asr_dropped", asr_dropped_.load()},
           {"assembly_dropped", assembly_dropped_.load()},
-          {"assembly_outstanding", candidate_assembler_
-                                       ? candidate_assembler_->outstanding()
-                                       : 0},
+          {"assembly_outstanding",
+           (candidate_assembler_ ? candidate_assembler_->outstanding() : 0) +
+               (microphone_candidate_assembler_
+                    ? microphone_candidate_assembler_->outstanding()
+                    : 0)},
           {"command_plans", command_plans_.load()},
           {"command_rejections", command_rejections_.load()},
           {"activations_started", activations_started_.load()},

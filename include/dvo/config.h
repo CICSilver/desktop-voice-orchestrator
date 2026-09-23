@@ -121,7 +121,7 @@ struct CommandsConfig {
   std::uint32_t max_actions_per_utterance{8};
   std::uint32_t action_timeout_ms{2000};
   std::uint32_t queue_capacity{32};
-  std::vector<std::string> play_phrases{"播放音乐"};
+  std::vector<std::string> play_phrases{"播放音乐", "打开音乐"};
   std::vector<std::string> pause_phrases{"暂停音乐"};
   std::vector<std::string> volume_up_phrases{"增加音量"};
   std::vector<std::string> volume_down_phrases{"降低音量"};

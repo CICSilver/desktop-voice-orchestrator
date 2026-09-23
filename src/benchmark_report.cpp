@@ -85,6 +85,21 @@ std::uint64_t unsigned_value(const nlohmann::json& value,
                    : 0;
 }
 
+nlohmann::json nullable_value(const nlohmann::json& value,
+                              std::string_view key) {
+  const auto found = value.find(key);
+  return found == value.end() || found->is_null() ? nlohmann::json(nullptr)
+                                                  : *found;
+}
+
+std::string string_value(const nlohmann::json& value,
+                         std::string_view key) {
+  const auto found = value.find(key);
+  return found != value.end() && found->is_string()
+             ? found->get<std::string>()
+             : std::string{};
+}
+
 std::vector<std::uint64_t> candidate_boundaries(const nlohmann::json& payload) {
   std::vector<std::uint64_t> result;
   const auto append_span = [&result](const nlohmann::json& span) {
@@ -110,7 +125,7 @@ std::vector<nlohmann::json> unique_candidates(
     if (type_of(event) != "candidate") continue;
     const auto& payload = payload_of(event);
     const auto id = payload.value("utterance_id", "");
-    const auto key = id + ":" + payload.value("position", "") + ":" +
+    const auto key = id + ":" + string_value(payload, "position") + ":" +
                      payload.value("wake_span", nlohmann::json::object()).dump() +
                      ":" + payload.value("source_spans", nlohmann::json::array()).dump();
     if (seen.insert(key).second) result.push_back(payload);
@@ -227,7 +242,8 @@ nlohmann::json command_plans(const std::vector<nlohmann::json>& events) {
         actions.push_back({{"sequence", action.value("sequence", 0)},
                            {"type", action.value("type", "")},
                            {"volume_delta_percent",
-                            action.value("volume_delta_percent", 0)}});
+                            nullable_value(action,
+                                           "volume_delta_percent")}});
       }
     }
     result.push_back({{"utterance_id", payload.value("utterance_id", "")},
@@ -280,7 +296,8 @@ nlohmann::json dry_run_actions(const std::vector<nlohmann::json>& events) {
                        {"type", payload.value("type", "")},
                        {"status", status},
                        {"requested_volume_delta_percent",
-                        payload.value("requested_volume_delta_percent", 0)},
+                        nullable_value(payload,
+                                       "requested_volume_delta_percent")},
                        {"message", payload.value("message", "")}});
   }
   return {{"terminal_count", terminal_count},

@@ -22,7 +22,8 @@ TEST_CASE("checked-in default configuration is valid") {
   const auto config = store.load();
   REQUIRE(config.audio.target_sample_rate == 16000);
   REQUIRE(config.ring.duration_ms == 20000);
-  REQUIRE(config.commands.play_phrases == std::vector<std::string>{"播放音乐"});
+  REQUIRE(config.commands.play_phrases ==
+          std::vector<std::string>{"播放音乐", "打开音乐"});
   REQUIRE(config.commands.action_timeout_ms == 2000);
   REQUIRE(config.activation.enabled);
   REQUIRE(config.activation.idle_timeout_ms == 6000);

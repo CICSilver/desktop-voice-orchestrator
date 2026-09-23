@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -80,10 +81,15 @@ TEST_CASE("recording session stores all three streams and timeline") {
   std::mutex replay_mutex;
   std::condition_variable replay_cv;
   std::vector<dvo::AudioPacket> replayed;
+  std::vector<nlohmann::json> replay_states;
   {
     dvo::ReplayController replay([&](dvo::AudioPacket packet) {
       std::scoped_lock lock(replay_mutex);
       replayed.push_back(std::move(packet));
+      replay_cv.notify_all();
+    }, [&](nlohmann::json state) {
+      std::scoped_lock lock(replay_mutex);
+      replay_states.push_back(std::move(state));
       replay_cv.notify_all();
     });
     replay.open(session);
@@ -99,6 +105,11 @@ TEST_CASE("recording session stores all three streams and timeline") {
   REQUIRE(replayed[1].stream == dvo::AudioStreamKind::loopback);
   REQUIRE(replayed[0].samples.front() == Catch::Approx(0.25F));
   REQUIRE(replayed[1].samples.front() == Catch::Approx(-0.1F));
+  REQUIRE_FALSE(replay_states.empty());
+  CHECK(std::ranges::any_of(replay_states, [](const nlohmann::json& state) {
+    return state.value("finished", false) &&
+           !state.value("playing", true);
+  }));
 
   std::mutex blocked_mutex;
   std::condition_variable blocked_cv;

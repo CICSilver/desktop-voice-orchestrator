@@ -6,6 +6,7 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -18,7 +19,9 @@ namespace dvo {
 class ReplayController {
  public:
   using PacketCallback = std::function<void(AudioPacket)>;
-  explicit ReplayController(PacketCallback callback);
+  using StateCallback = std::function<void(nlohmann::json)>;
+  explicit ReplayController(PacketCallback callback,
+                            StateCallback state_callback = {});
   ~ReplayController();
 
   void open(const std::filesystem::path& session);
@@ -50,8 +53,11 @@ class ReplayController {
 
   void run(std::stop_token stop);
   void load_timeline();
+  [[nodiscard]] nlohmann::json state_locked() const;
+  void publish_state(nlohmann::json state) const;
 
   PacketCallback callback_;
+  StateCallback state_callback_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::jthread thread_;
@@ -61,6 +67,8 @@ class ReplayController {
   bool playing_{};
   bool dispatching_{};
   double speed_{1.0};
+  std::string last_error_;
+  std::uint64_t next_progress_qpc_100ns_{};
   std::optional<std::size_t> seek_target_;
   bool resume_after_seek_{};
 };

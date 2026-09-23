@@ -170,6 +170,52 @@ TEST_CASE("debug command endpoint is token protected") {
   server.stop();
 }
 
+TEST_CASE("session audio endpoint is token protected and serves only handler resources") {
+  StaticRoot root;
+  const auto audio = root.path / "audio.wav";
+  std::ofstream(audio, std::ios::binary | std::ios::trunc) << "RIFF-test-audio";
+  dvo::DebugServer server;
+  server.start(web_config(root.path), {},
+               [audio](const nlohmann::json& request)
+                   -> std::optional<dvo::DebugServer::FileResource> {
+                 if (request.value("session", "") != "session-1" ||
+                     request.value("stream", "") != "processed") {
+                   return std::nullopt;
+                 }
+                 return dvo::DebugServer::FileResource{audio, "audio/wav"};
+               });
+  const auto port = port_of(server);
+
+  const auto request = [&](std::string target) {
+    asio::io_context io;
+    tcp::resolver resolver(io);
+    beast::tcp_stream stream(io);
+    stream.expires_after(std::chrono::seconds(3));
+    stream.connect(resolver.resolve("127.0.0.1", std::to_string(port)));
+    http::request<http::empty_body> value{http::verb::get,
+                                         std::move(target), 11};
+    value.set(http::field::host, "127.0.0.1");
+    http::write(stream, value);
+    beast::flat_buffer buffer;
+    http::response<http::string_body> response;
+    http::read(stream, buffer, response);
+    return response;
+  };
+
+  CHECK(request("/api/session-audio?session=session-1&stream=processed")
+            .result() == http::status::unauthorized);
+  const auto accepted =
+      request("/api/session-audio?token=" + server.token() +
+              "&session=session-1&stream=processed");
+  CHECK(accepted.result() == http::status::ok);
+  CHECK(accepted[http::field::content_type] == "audio/wav");
+  CHECK(accepted.body() == "RIFF-test-audio");
+  CHECK(request("/api/session-audio?token=" + server.token() +
+                "&session=missing&stream=processed")
+            .result() == http::status::not_found);
+  server.stop();
+}
+
 TEST_CASE("slow WebSocket clients use a bounded drop queue") {
   StaticRoot root;
   dvo::DebugServer server(4096);

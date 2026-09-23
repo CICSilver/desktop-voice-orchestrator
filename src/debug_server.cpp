@@ -101,6 +101,7 @@ void add_security_headers(http::response<Body>& response) {
 struct DebugServer::SharedState {
   WebConfig config;
   CommandHandler commands;
+  FileHandler files;
   std::string token;
   std::string session_id;
   std::atomic<bool> stopping{};
@@ -122,7 +123,8 @@ DebugServer::DebugServer(std::size_t capacity) : outbound_(capacity) {}
 
 DebugServer::~DebugServer() { stop(); }
 
-void DebugServer::start(const WebConfig& config, CommandHandler commands) {
+void DebugServer::start(const WebConfig& config, CommandHandler commands,
+                        FileHandler files) {
   std::scoped_lock lifecycle_lock(lifecycle_mutex_);
   stop();
   {
@@ -137,6 +139,7 @@ void DebugServer::start(const WebConfig& config, CommandHandler commands) {
   auto state = std::make_shared<SharedState>();
   state->config = config;
   state->commands = std::move(commands);
+  state->files = std::move(files);
   state->token = random_token();
   state->session_id = random_token();
   {
@@ -252,7 +255,9 @@ void DebugServer::broker_loop(std::stop_token stop) {
         outbound.type == "asr_error" || outbound.type == "action_failed") level = "error";
     else if (outbound.type == "candidate_rejected" || outbound.type == "candidate_cancelled" ||
              outbound.type == "telemetry_dropped" || outbound.type == "asr_overloaded" ||
-             outbound.type == "command_rejected") level = "warn";
+             outbound.type == "command_rejected" ||
+             (outbound.type == "parse_debug" &&
+              !outbound.payload.value("matched", false))) level = "warn";
     const auto envelope = nlohmann::json{{"schema_version", 1},
                                          {"seq", ++state->sequence},
                                          {"session_id", state->session_id},
@@ -408,6 +413,84 @@ void DebugServer::accept_loop(std::stop_token stop) {
             response.set(http::field::content_type, "application/json");
             response.body() = output.dump();
             response.prepare_payload();
+            add_security_headers(response);
+            http::write(socket, response);
+            return;
+          }
+
+          if (request.method() == http::verb::get &&
+              request_path == "/api/session-audio") {
+            std::optional<FileResource> resource;
+            std::string resource_error;
+            bool admitted{};
+            {
+              std::scoped_lock commands_lock(state->commands_mutex);
+              if (!state->stopping.load(std::memory_order_acquire)) {
+                ++state->active_commands;
+                admitted = true;
+              }
+            }
+            if (!admitted) {
+              resource_error = "debug server is stopping";
+            } else {
+              try {
+                const auto query = nlohmann::json{
+                    {"session", query_value(request.target(), "session")},
+                    {"stream", query_value(request.target(), "stream")}};
+                resource = state->files ? state->files(query) : std::nullopt;
+                if (!resource) resource_error = "audio resource not found";
+              } catch (const std::exception& e) {
+                resource_error = e.what();
+              } catch (...) {
+                resource_error = "audio resource handler failed";
+              }
+              {
+                std::scoped_lock commands_lock(state->commands_mutex);
+                --state->active_commands;
+                state->commands_cv.notify_all();
+              }
+            }
+            if (!resource) {
+              http::response<http::string_body> response{
+                  resource_error == "audio resource not found"
+                      ? http::status::not_found
+                      : http::status::service_unavailable,
+                  request.version()};
+              response.set(http::field::content_type,
+                           "application/json; charset=utf-8");
+              response.body() =
+                  nlohmann::json{{"ok", false}, {"error", resource_error}}
+                      .dump();
+              response.prepare_payload();
+              add_security_headers(response);
+              http::write(socket, response);
+              return;
+            }
+
+            beast::error_code file_error;
+            http::file_body::value_type body;
+            body.open(resource->path.string().c_str(), beast::file_mode::scan,
+                      file_error);
+            if (file_error) {
+              http::response<http::string_body> response{
+                  http::status::not_found, request.version()};
+              response.set(http::field::content_type,
+                           "application/json; charset=utf-8");
+              response.body() =
+                  nlohmann::json{{"ok", false},
+                                 {"error", "audio file could not be opened"}}
+                      .dump();
+              response.prepare_payload();
+              add_security_headers(response);
+              http::write(socket, response);
+              return;
+            }
+            const auto size = body.size();
+            http::response<http::file_body> response{
+                std::piecewise_construct, std::make_tuple(std::move(body)),
+                std::make_tuple(http::status::ok, request.version())};
+            response.set(http::field::content_type, resource->content_type);
+            response.content_length(size);
             add_security_headers(response);
             http::write(socket, response);
             return;

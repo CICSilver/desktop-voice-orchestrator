@@ -10,7 +10,15 @@ const state = {
   source: 'processed',
   activeMode: 'live',
   recordingActive: null,
+  recordingPending: false,
+  recordingStartedAtMs: 0,
+  recordingSession: '',
+  sessions: new Map(),
+  loadedSession: null,
+  timelineOrigin: {live: null, replay: null},
   latestSample: {live: null, replay: null},
+  replayPlaying: false,
+  audioFinished: false,
   activation: {
     live: {active: false, status: '未激活'},
     replay: {active: false, status: '未激活'}
@@ -27,6 +35,113 @@ const state = {
   }
 };
 const $ = (id) => document.getElementById(id);
+const replayAudio = $('replay-audio');
+
+function showControlMessage(message = '', level = '') {
+  const output = $('control-message');
+  output.textContent = message;
+  output.className = `control-message ${level}`.trim();
+}
+
+function sessionName(path = '') {
+  return String(path).split(/[\\/]/).filter(Boolean).at(-1) || '';
+}
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.floor(Number(seconds) || 0));
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const remainder = total % 60;
+  return hours
+    ? `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`
+    : `${String(minutes).padStart(2, '0')}:${String(remainder).padStart(2, '0')}`;
+}
+
+function parseActionLabel(action) {
+  if (action.type === 'media.play') return '播放';
+  if (action.type === 'media.pause') return '暂停';
+  if (action.type === 'audio.volume.adjust') {
+    const delta = Number(action.volume_delta_percent || 0);
+    return `音量${delta >= 0 ? '+' : ''}${delta}%`;
+  }
+  return action.type || '未知动作';
+}
+
+function resetParseDebug(message = '等待回放或手动输入') {
+  $('parse-state').textContent = state.activeMode === 'replay' ? '等待解析' : '仅回放可用';
+  $('parse-state').className = 'pill';
+  $('parse-input').textContent = '—';
+  $('parse-normalized').textContent = '—';
+  $('parse-actions').textContent = '—';
+  $('parse-error').textContent = message;
+  $('parse-error').className = '';
+  $('parse-meta').textContent = '只调用当前规则解析器，强制 dry-run，不提交系统动作。';
+}
+
+function renderParseDebug(payload) {
+  const matched = Boolean(payload.matched);
+  const plan = payload.plan || {};
+  const actions = plan.actions || [];
+  const error = payload.error || null;
+  const kind = payload.kind === 'automatic' ? '自动' : '手动';
+  $('parse-state').textContent = matched ? `${kind}解析成功` : `${kind}解析拒绝`;
+  $('parse-state').className = `pill ${matched ? 'online' : 'offline'}`;
+  $('parse-input').textContent = payload.input_text || '（空文本）';
+  $('parse-normalized').textContent = payload.normalized_text || '—';
+  $('parse-actions').textContent = actions.length
+    ? actions.map(parseActionLabel).join(' → ')
+    : '—';
+  $('parse-error').textContent = error
+    ? `${error.code || 'parse_error'} @ byte ${Number(error.byte_offset || 0)}：${error.message || '解析失败'}`
+    : '规则完整匹配';
+  $('parse-error').className = matched ? 'success' : 'error';
+  $('parse-meta').textContent =
+    `${kind} · ${payload.execution_mode || 'dry_run'} · ${payload.parser_version || 'parser'} · rev ${payload.config_revision ?? '—'}`;
+}
+
+function updateRecordingControls() {
+  const active = state.recordingActive === true;
+  const pending = state.recordingPending;
+  const indicator = $('recording');
+  indicator.classList.toggle('active', active);
+  indicator.classList.toggle('pending', pending);
+  $('recording-label').textContent = pending
+    ? (active ? '正在停止…' : '正在启动…')
+    : (active ? '录音中' : '未录制');
+  const elapsed = $('recording-elapsed');
+  elapsed.hidden = !active;
+  elapsed.textContent = formatDuration((Date.now() - state.recordingStartedAtMs) / 1000);
+  $('recording-session').textContent = state.recordingSession
+    ? sessionName(state.recordingSession)
+    : '尚未创建录音';
+  $('recording-session').title = state.recordingSession || '';
+  $('record-start').disabled = pending || active || state.activeMode !== 'live';
+  $('record-stop').disabled = pending || !active;
+}
+
+function timelineSample(value, mode) {
+  const numeric = Number(value || 0);
+  const origin = state.timelineOrigin[mode];
+  return origin == null ? numeric : Math.max(0, numeric - origin);
+}
+
+function normalizeSpan(span, mode) {
+  if (!span || typeof span !== 'object') return span;
+  return {
+    ...span,
+    start: timelineSample(span.start, mode),
+    end: timelineSample(span.end, mode)
+  };
+}
+
+function normalizeCandidate(candidate, mode) {
+  return {
+    ...candidate,
+    trigger_sample: timelineSample(candidate.trigger_sample, mode),
+    wake_span: normalizeSpan(candidate.wake_span, mode),
+    source_spans: (candidate.source_spans || []).map(span => normalizeSpan(span, mode))
+  };
+}
 
 function modeOf(message) {
   return (message.source || message.payload?.source) === 'replay' ? 'replay' : 'live';
@@ -40,6 +155,7 @@ function candidateEndSample(candidate) {
 
 function resetModeStatus(mode) {
   state.latestSample[mode] = null;
+  state.timelineOrigin[mode] = null;
   state.activation[mode] = {active: false, status: '未激活'};
   state.announcement[mode] = null;
   if (mode === state.activeMode) renderCommandStatus();
@@ -129,9 +245,14 @@ async function command(action, payload = {}) {
       body: JSON.stringify({action, ...payload})
     });
     const result = await response.json();
-    if (!result.ok) addEvent({type: 'command_error', payload: {message: result.error || 'unknown error'}, seq: '—'});
+    if (!result.ok) {
+      const message = result.error || 'unknown error';
+      showControlMessage(message, 'error');
+      addEvent({type: 'command_error', level: 'error', payload: {message}, seq: '—'});
+    }
     return result;
   } catch (error) {
+    showControlMessage(String(error), 'error');
     addEvent({type: 'command_error', level: 'error', payload: {message: String(error)}, seq: '—'});
     return {ok: false, error: String(error)};
   }
@@ -158,30 +279,43 @@ function handle(message) {
   if (type === 'telemetry') {
     const messageMode = modeOf(message);
     if (messageMode !== state.activeMode) return;
+    if (payload.view_sample != null && state.timelineOrigin[messageMode] == null) {
+      state.timelineOrigin[messageMode] =
+        Number(payload.sample || 0) - Number(payload.view_sample || 0);
+    }
     state.latestSample[messageMode] = Number(payload.sample || 0);
     state.telemetry.push(payload);
     state.vad.push(!!payload.vad);
     while (state.telemetry.length > state.maxPoints) state.telemetry.shift();
     while (state.vad.length > state.maxPoints) state.vad.shift();
 
-    const cutoff = Number(payload.sample || 0) - 20 * SAMPLE_RATE;
+    const cutoff = sampleOf(payload) - 20 * SAMPLE_RATE;
     state.wakes = state.wakes.filter(hit => Number(hit.wake_span?.end ?? hit.at ?? 0) >= cutoff);
     state.candidates = state.candidates.filter(item => candidateEndSample(item) >= cutoff);
     $('rms').textContent = Number(payload[state.source]?.rms ?? payload.processed?.rms ?? 0).toFixed(3);
     $('queue-depth').textContent = payload.queue_depth ?? 0;
     $('drops').textContent = payload.telemetry_dropped ?? 0;
     if (payload.aec) updateAec(payload.aec);
-    if (message.source === 'replay') $('replay-seek').value = Number(payload.sample || 0) / SAMPLE_RATE;
     renderCommandStatus();
     syncViewControls();
   } else if (type === 'kws_hit') {
-    if ((message.source === 'replay' ? 'replay' : 'live') === state.activeMode) {
-      state.wakes.push({at: message.timestamp_sample, ...payload});
+    const messageMode = modeOf(message);
+    if (messageMode === state.activeMode) {
+      state.wakes.push({
+        at: timelineSample(message.timestamp_sample, messageMode),
+        ...payload,
+        detected_at_sample: timelineSample(payload.detected_at_sample, messageMode),
+        wake_span: normalizeSpan(payload.wake_span, messageMode)
+      });
+      if (messageMode === 'replay' && payload.keyword && !$('replay-parse-wake').value) {
+        $('replay-parse-wake').value = String(payload.keyword).replace(/^@/, '');
+      }
     }
     addEvent(message);
   } else if (type === 'candidate') {
-    if ((message.source === 'replay' ? 'replay' : 'live') === state.activeMode) {
-      state.candidates.push(payload);
+    const messageMode = modeOf(message);
+    if (messageMode === state.activeMode) {
+      state.candidates.push(normalizeCandidate(payload, messageMode));
     }
     addEvent(message);
   } else if (type === 'aec_status' || type === 'aec_stats') {
@@ -198,6 +332,14 @@ function handle(message) {
     $('asr-latency').textContent = Number.isFinite(Number(payload.latency_ms)) ? `${Number(payload.latency_ms).toFixed(0)} ms` : '—';
     $('asr-rtf').textContent = Number.isFinite(Number(payload.rtf)) ? Number(payload.rtf).toFixed(3) : '—';
     $('asr-revision').textContent = payload.revision ?? '—';
+    if (final && modeOf(message) === 'replay' && payload.text) {
+      $('replay-parse-text').value = payload.text;
+    }
+    addEvent(message);
+  } else if (type === 'parse_debug') {
+    if (modeOf(message) === 'replay' && state.activeMode === 'replay') {
+      renderParseDebug(payload);
+    }
     addEvent(message);
   } else if (type === 'command_plan' || type === 'command_rejected') {
     $('command-plan').textContent = type === 'command_rejected'
@@ -240,27 +382,79 @@ function handle(message) {
     const active = !!payload.active;
     const previous = state.recordingActive;
     state.recordingActive = active;
-    $('recording').classList.toggle('active', active);
-    $('recording').lastChild.textContent = active ? ` 录制中 · ${payload.session || ''}` : ' 未录制';
+    state.recordingPending = false;
+    state.recordingSession = payload.session || state.recordingSession;
+    state.recordingStartedAtMs = Number(payload.started_at_ms || 0) ||
+      state.recordingStartedAtMs || Date.now();
+    $('recording').classList.toggle('incomplete', !active && !!payload.incomplete);
+    updateRecordingControls();
 
     if (active) resumeLiveView();
     else if (previous === true && !state.view.frozen) freezeView('录制停止');
+    if (previous === true && !active) {
+      showControlMessage(
+        payload.incomplete ? '录音已停止，但会话被标记为不完整' : '录音已保存，可从回放列表载入',
+        payload.incomplete ? 'warn' : 'success');
+    }
     addEvent(message);
   } else if (type === 'sessions') {
     const select = $('sessions');
     const current = select.value;
-    select.innerHTML = '<option value="">选择回放会话</option>';
-    for (const session of payload.sessions || []) select.add(new Option(session.name, session.path));
+    state.sessions.clear();
+    select.innerHTML = '<option value="">选择有效录音</option>';
+    for (const session of payload.sessions || []) {
+      state.sessions.set(session.path, session);
+      const duration = Number(session.duration_seconds || 0).toFixed(1);
+      const suffix = session.complete ? '' : ' · 不完整';
+      select.add(new Option(`${session.name} · ${duration}s${suffix}`, session.path));
+    }
     select.value = current;
+    if (!select.value) state.loadedSession = null;
+    const excluded = Number(payload.excluded_sessions || 0);
+    if (excluded > 0) {
+      showControlMessage(`已隐藏 ${excluded} 个空白或未正常完成的录音会话`, 'warn');
+    }
   } else if (type === 'runtime_mode') {
     const mode = payload.mode === 'replay' ? 'replay' : 'live';
     setActiveMode(mode, mode !== state.activeMode);
     addEvent(message);
   } else if (type === 'replay_state') {
-    if (state.activeMode === 'replay') $('source').textContent = payload.playing ? 'REPLAY ▶' : 'REPLAY';
+    const replayTransition =
+      Boolean(payload.playing) !== state.replayPlaying ||
+      Boolean(payload.finished) ||
+      Boolean(payload.error);
+    state.replayPlaying = Boolean(payload.playing);
+    if (state.activeMode === 'replay') {
+      $('source').textContent = payload.playing ? 'REPLAY ▶' : 'REPLAY';
+    }
     $('replay-seek').max = Math.max(1, Number(payload.duration_seconds || 0));
-    $('replay-seek').value = Number(payload.position_seconds || 0);
-    addEvent(message);
+    const audioControlsPosition =
+      Boolean(state.loadedSession && replayAudio.currentSrc) &&
+      Number($('replay-speed').value) !== 0;
+    if (!audioControlsPosition) {
+      $('replay-seek').value = Number(payload.position_seconds || 0);
+    }
+    if (payload.error) {
+      $('replay-audio-state').textContent = '回放失败';
+      $('replay-audio-state').className = 'pill error';
+      showControlMessage(payload.error, 'error');
+    } else if (payload.finished) {
+      $('replay-audio-state').textContent = '播放完成';
+      $('replay-audio-state').className = 'pill';
+      showControlMessage('录音回放完成', 'success');
+    } else if (payload.playing) {
+      $('replay-audio-state').textContent = Number(payload.speed) === 0
+        ? '仅分析'
+        : '播放中';
+      $('replay-audio-state').className = 'pill playing';
+      if (state.audioFinished && Number(payload.speed) !== 0) {
+        $('replay-audio-state').textContent = '试听完成 · 分析中';
+      }
+    } else if (state.loadedSession) {
+      $('replay-audio-state').textContent = '已暂停';
+      $('replay-audio-state').className = 'pill';
+    }
+    if (replayTransition) addEvent(message);
   } else {
     addEvent(message);
   }
@@ -347,6 +541,11 @@ function setActiveMode(mode, clear = false) {
   for (const id of ['replay-play', 'replay-pause', 'replay-speed', 'replay-seek']) {
     $(id).disabled = mode !== 'replay';
   }
+  for (const id of ['replay-parse-text', 'replay-parse-wake', 'replay-parse-run']) {
+    $(id).disabled = mode !== 'replay';
+  }
+  if (clear || changed) resetParseDebug();
+  updateRecordingControls();
   syncViewControls();
   renderCommandStatus();
 }
@@ -361,7 +560,7 @@ function snapshotCurrentView() {
 }
 
 function sampleOf(frame) {
-  return Number(frame?.sample || 0);
+  return Number(frame?.view_sample ?? frame?.sample ?? 0);
 }
 
 function viewLimits(data) {
@@ -421,6 +620,9 @@ function syncViewControls() {
   const scrubber = $('view-scrubber');
   scrubber.disabled = !bounds;
   if (!bounds) {
+    scrubber.min = 0;
+    scrubber.max = 0;
+    scrubber.value = 0;
     $('view-range').textContent = '等待音频…';
     return;
   }
@@ -622,35 +824,186 @@ function installTimelineDrag(element) {
   });
 }
 
+function configureReplayTracks(session) {
+  const selector = $('replay-track');
+  for (const option of selector.options) {
+    option.disabled = !session?.streams?.[option.value]?.present;
+  }
+  const preferred = session?.default_stream || 'processed';
+  if (session?.streams?.[preferred]?.present) selector.value = preferred;
+  if (selector.selectedOptions[0]?.disabled) {
+    const available = Array.from(selector.options).find(option => !option.disabled);
+    if (available) selector.value = available.value;
+  }
+}
+
+function loadReplayAudio(session, preserveTime = false) {
+  if (!session) return false;
+  state.audioFinished = false;
+  configureReplayTracks(session);
+  const stream = $('replay-track').value;
+  if (!session.streams?.[stream]?.present) {
+    showControlMessage('该录音不包含所选音轨', 'error');
+    return false;
+  }
+  const previousTime = preserveTime ? replayAudio.currentTime : 0;
+  replayAudio.pause();
+  replayAudio.src = `/api/session-audio?token=${encodeURIComponent(token)}` +
+    `&session=${encodeURIComponent(session.name)}` +
+    `&stream=${encodeURIComponent(stream)}`;
+  replayAudio.load();
+  if (previousTime > 0) {
+    replayAudio.addEventListener('loadedmetadata', () => {
+      replayAudio.currentTime = Math.min(previousTime, replayAudio.duration || previousTime);
+    }, {once: true});
+  }
+  $('replay-audio-state').textContent = '正在载入';
+  $('replay-audio-state').className = 'pill';
+  return true;
+}
+
+replayAudio.addEventListener('loadedmetadata', () => {
+  const duration = Number(replayAudio.duration || 0);
+  if (Number.isFinite(duration) && duration > 0) {
+    $('replay-seek').max = duration;
+    $('replay-audio-state').textContent = `可播放 · ${duration.toFixed(1)}s`;
+    $('replay-audio-state').className = 'pill';
+    showControlMessage('录音已载入，点击“播放并分析”即可试听并查看波形', 'success');
+  }
+});
+replayAudio.addEventListener('timeupdate', () => {
+  if (!replayAudio.paused && Number($('replay-speed').value) !== 0) {
+    $('replay-seek').value = replayAudio.currentTime;
+  }
+});
+replayAudio.addEventListener('ended', () => {
+  state.audioFinished = true;
+  $('source').textContent = 'REPLAY';
+  $('replay-audio-state').textContent = '播放完成';
+  $('replay-audio-state').className = 'pill';
+  if (state.replayPlaying) {
+    $('replay-audio-state').textContent = '试听完成 · 分析中';
+    $('replay-audio-state').className = 'pill playing';
+  }
+});
+replayAudio.addEventListener('error', () => {
+  $('replay-audio-state').textContent = '音频不可播放';
+  $('replay-audio-state').className = 'pill error';
+  showControlMessage('浏览器无法读取该录音音轨，请尝试原始麦克风音轨', 'error');
+});
+
 $('wave-source').onchange = (event) => state.source = event.target.value;
 $('clear-events').onclick = () => $('events').innerHTML = '';
-$('record-start').onclick = () => command('recording.start');
+$('record-start').onclick = async () => {
+  if (state.recordingPending || state.recordingActive) return;
+  state.recordingPending = true;
+  updateRecordingControls();
+  showControlMessage('正在启动录音…');
+  const result = await command('recording.start');
+  if (!result.ok) {
+    state.recordingPending = false;
+    updateRecordingControls();
+    return;
+  }
+  showControlMessage('录音已开始，红色状态灯和计时器会持续显示', 'success');
+};
 $('record-stop').onclick = async () => {
+  if (state.recordingPending || state.recordingActive !== true) return;
   const wasFollowing = !state.view.frozen;
   if (state.recordingActive === true) freezeView('录制停止');
+  state.recordingPending = true;
+  updateRecordingControls();
+  showControlMessage('正在停止并保存录音…');
   const result = await command('recording.stop');
-  if (!result.ok && wasFollowing) resumeLiveView();
+  if (!result.ok) {
+    state.recordingPending = false;
+    updateRecordingControls();
+    if (wasFollowing) resumeLiveView();
+  }
 };
 $('replay-open').onclick = async () => {
-  const session = $('sessions').value;
-  if (!session) {
+  const sessionPath = $('sessions').value;
+  const session = state.sessions.get(sessionPath);
+  if (!sessionPath || !session) {
+    showControlMessage('请先选择有效录音会话', 'error');
     addEvent({type: 'command_error', level: 'error', payload: {message: '请先选择回放会话'}, seq: '—'});
     return;
   }
   const previousMode = state.activeMode;
+  const previousSession = state.loadedSession;
+  state.loadedSession = session;
   setActiveMode('replay', true);
-  const result = await command('replay.open', {session});
-  if (!result.ok) setActiveMode(previousMode, true);
+  const result = await command('replay.open', {session: sessionPath});
+  if (!result.ok) {
+    state.loadedSession = previousSession;
+    setActiveMode(previousMode, true);
+    return;
+  }
+  clearTimelineData();
+  resetModeStatus('replay');
+  resetParseDebug();
+  syncViewControls();
+  loadReplayAudio(session);
 };
-$('replay-play').onclick = () => command('replay.play');
-$('replay-pause').onclick = () => command('replay.pause');
-$('replay-speed').onchange = () => command('replay.speed', {speed: Number($('replay-speed').value)});
+$('replay-play').onclick = async () => {
+  if (!state.loadedSession) {
+    showControlMessage('请先载入录音会话', 'error');
+    return;
+  }
+  state.audioFinished = false;
+  const speed = Number($('replay-speed').value);
+  if (speed !== 0) {
+    if (replayAudio.ended) replayAudio.currentTime = 0;
+    replayAudio.playbackRate = speed;
+    try {
+      await replayAudio.play();
+    } catch (error) {
+      showControlMessage(`音频播放失败：${String(error)}`, 'error');
+      return;
+    }
+  } else {
+    replayAudio.pause();
+    showControlMessage('不限速模式只运行分析，不输出声音', 'warn');
+  }
+  const result = await command('replay.play');
+  if (!result.ok) replayAudio.pause();
+};
+$('replay-pause').onclick = async () => {
+  replayAudio.pause();
+  await command('replay.pause');
+};
+$('replay-speed').onchange = async () => {
+  const speed = Number($('replay-speed').value);
+  if (speed !== 0) replayAudio.playbackRate = speed;
+  else replayAudio.pause();
+  await command('replay.speed', {speed});
+};
 $('replay-seek').onchange = () => {
   const seconds = Number($('replay-seek').value);
+  if (replayAudio.src && Number.isFinite(replayAudio.duration)) {
+    replayAudio.currentTime = Math.min(seconds, replayAudio.duration);
+  }
   clearTimelineData();
   resetModeStatus('replay');
   syncViewControls();
   command('replay.seek', {seconds});
+};
+$('replay-track').onchange = () => {
+  if (state.loadedSession) loadReplayAudio(state.loadedSession, true);
+};
+$('replay-parse-form').onsubmit = async (event) => {
+  event.preventDefault();
+  if (state.activeMode !== 'replay') {
+    showControlMessage('请先载入录音并进入回放模式', 'error');
+    return;
+  }
+  $('parse-state').textContent = '正在解析';
+  $('parse-state').className = 'pill';
+  const result = await command('replay.parse_debug', {
+    text: $('replay-parse-text').value,
+    wake_word: $('replay-parse-wake').value
+  });
+  if (result.ok && result.parse) renderParseDebug(result.parse);
 };
 $('config-form').onsubmit = (event) => {
   event.preventDefault();
@@ -660,6 +1013,7 @@ $('config-save').onclick = () => command('config.apply', {patch: configPatch(), 
 $('config-reset').onclick = () => state.config && loadConfig(state.config);
 $('view-live').onclick = async () => {
   if (state.activeMode === 'replay') {
+    replayAudio.pause();
     const result = await command('live.resume');
     if (result.ok && state.activeMode !== 'live') setActiveMode('live', true);
     return;
@@ -684,3 +1038,4 @@ syncViewControls();
 setActiveMode('live');
 connect();
 draw();
+setInterval(updateRecordingControls, 500);

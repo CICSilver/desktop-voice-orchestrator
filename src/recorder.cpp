@@ -52,6 +52,10 @@ std::filesystem::path SessionRecorder::start(const RecordingConfig& config,
   std::scoped_lock lock(state_mutex_);
   if (active_ || closing_) throw std::runtime_error("a recording session is already active");
   session_path_ = config.session_root / session_name();
+  started_at_unix_ms_ =
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::system_clock::now().time_since_epoch())
+          .count();
   std::filesystem::create_directories(session_path_ / "candidates");
   timeline_.open(session_path_ / "timeline.ndjson", std::ios::binary | std::ios::trunc);
   events_.open(session_path_ / "events.ndjson", std::ios::binary | std::ios::trunc);
@@ -102,6 +106,11 @@ bool SessionRecorder::try_enqueue(RecordItem item) {
 std::filesystem::path SessionRecorder::session_path() const {
   std::scoped_lock lock(state_mutex_);
   return session_path_;
+}
+
+std::int64_t SessionRecorder::started_at_unix_ms() const {
+  std::scoped_lock lock(state_mutex_);
+  return started_at_unix_ms_;
 }
 
 void SessionRecorder::run() {

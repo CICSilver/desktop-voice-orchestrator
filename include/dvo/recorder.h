@@ -35,6 +35,7 @@ class SessionRecorder {
   [[nodiscard]] bool active() const { return active_.load(std::memory_order_acquire); }
   [[nodiscard]] bool incomplete() const { return incomplete_.load(std::memory_order_acquire); }
   [[nodiscard]] std::filesystem::path session_path() const;
+  [[nodiscard]] std::int64_t started_at_unix_ms() const;
 
  private:
   struct StreamStats {
@@ -67,6 +68,7 @@ class SessionRecorder {
   mutable std::mutex state_mutex_;
   std::condition_variable state_cv_;
   std::filesystem::path session_path_;
+  std::int64_t started_at_unix_ms_{};
   nlohmann::json manifest_;
   nlohmann::json action_results_{nlohmann::json::array()};
   nlohmann::json capture_events_{nlohmann::json::array()};

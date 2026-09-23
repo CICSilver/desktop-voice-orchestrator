@@ -10,71 +10,119 @@
 
 namespace dvo {
 
-ReplayController::ReplayController(PacketCallback callback) : callback_(std::move(callback)) {
+ReplayController::ReplayController(PacketCallback callback,
+                                   StateCallback state_callback)
+    : callback_(std::move(callback)),
+      state_callback_(std::move(state_callback)) {
   thread_ = std::jthread([this](std::stop_token stop) { run(stop); });
 }
 
 ReplayController::~ReplayController() { stop(); }
 
 void ReplayController::open(const std::filesystem::path& session) {
-  std::scoped_lock lock(mutex_);
-  playing_ = false;
-  dispatching_ = false;
-  session_ = session;
-  cursor_ = 0;
-  seek_target_.reset();
-  load_timeline();
+  nlohmann::json snapshot;
+  {
+    std::scoped_lock lock(mutex_);
+    playing_ = false;
+    dispatching_ = false;
+    session_ = session;
+    cursor_ = 0;
+    seek_target_.reset();
+    last_error_.clear();
+    next_progress_qpc_100ns_ = 0;
+    load_timeline();
+    if (entries_.empty()) {
+      throw std::runtime_error(
+          "session does not contain replayable microphone or loopback audio");
+    }
+    snapshot = state_locked();
+  }
+  publish_state(std::move(snapshot));
 }
 
 void ReplayController::play() {
-  std::scoped_lock lock(mutex_);
-  if (entries_.empty()) throw std::runtime_error("no replay session is open");
-  playing_ = true;
-  cv_.notify_all();
+  nlohmann::json snapshot;
+  {
+    std::scoped_lock lock(mutex_);
+    if (entries_.empty()) throw std::runtime_error("no replay session is open");
+    if (cursor_ >= entries_.size()) {
+      cursor_ = 0;
+      next_progress_qpc_100ns_ = 0;
+    }
+    last_error_.clear();
+    playing_ = true;
+    cv_.notify_all();
+    snapshot = state_locked();
+  }
+  publish_state(std::move(snapshot));
 }
 
 void ReplayController::pause() {
-  std::scoped_lock lock(mutex_);
-  playing_ = false;
+  nlohmann::json snapshot;
+  {
+    std::scoped_lock lock(mutex_);
+    playing_ = false;
+    snapshot = state_locked();
+  }
+  publish_state(std::move(snapshot));
 }
 
 void ReplayController::seek_seconds(double seconds) {
-  std::scoped_lock lock(mutex_);
-  if (entries_.empty()) return;
-  const auto target = entries_.front().qpc_100ns + static_cast<std::uint64_t>(std::max(0.0, seconds) * 10000000.0);
-  const auto target_cursor = static_cast<std::size_t>(std::lower_bound(entries_.begin(), entries_.end(), target,
-      [](const TimelineEntry& entry, std::uint64_t value) { return entry.qpc_100ns < value; }) - entries_.begin());
-  resume_after_seek_ = playing_;
-  cursor_ = 0;
-  seek_target_ = target_cursor;
-  playing_ = true;  // Recompute state from the beginning at unlimited speed.
-  cv_.notify_all();
+  nlohmann::json snapshot;
+  {
+    std::scoped_lock lock(mutex_);
+    if (entries_.empty()) return;
+    const auto target = entries_.front().qpc_100ns + static_cast<std::uint64_t>(std::max(0.0, seconds) * 10000000.0);
+    const auto target_cursor = static_cast<std::size_t>(std::lower_bound(entries_.begin(), entries_.end(), target,
+        [](const TimelineEntry& entry, std::uint64_t value) { return entry.qpc_100ns < value; }) - entries_.begin());
+    resume_after_seek_ = playing_;
+    cursor_ = 0;
+    next_progress_qpc_100ns_ = 0;
+    seek_target_ = target_cursor;
+    last_error_.clear();
+    playing_ = true;  // Recompute state from the beginning at unlimited speed.
+    cv_.notify_all();
+    snapshot = state_locked();
+  }
+  publish_state(std::move(snapshot));
 }
 
 void ReplayController::seek_seconds(double seconds, bool resume_after_seek) {
-  std::scoped_lock lock(mutex_);
-  if (entries_.empty()) return;
-  const auto target = entries_.front().qpc_100ns +
-                      static_cast<std::uint64_t>(std::max(0.0, seconds) * 10000000.0);
-  const auto target_cursor = static_cast<std::size_t>(
-      std::lower_bound(entries_.begin(), entries_.end(), target,
-                       [](const TimelineEntry& entry, std::uint64_t value) {
-                         return entry.qpc_100ns < value;
-                       }) -
-      entries_.begin());
-  resume_after_seek_ = resume_after_seek;
-  cursor_ = 0;
-  seek_target_ = target_cursor;
-  playing_ = true;
-  cv_.notify_all();
+  nlohmann::json snapshot;
+  {
+    std::scoped_lock lock(mutex_);
+    if (entries_.empty()) return;
+    const auto target = entries_.front().qpc_100ns +
+                        static_cast<std::uint64_t>(std::max(0.0, seconds) * 10000000.0);
+    const auto target_cursor = static_cast<std::size_t>(
+        std::lower_bound(entries_.begin(), entries_.end(), target,
+                         [](const TimelineEntry& entry, std::uint64_t value) {
+                           return entry.qpc_100ns < value;
+                         }) -
+        entries_.begin());
+    resume_after_seek_ = resume_after_seek;
+    cursor_ = 0;
+    next_progress_qpc_100ns_ = 0;
+    seek_target_ = target_cursor;
+    last_error_.clear();
+    playing_ = true;
+    cv_.notify_all();
+    snapshot = state_locked();
+  }
+  publish_state(std::move(snapshot));
 }
 
 void ReplayController::set_speed(double speed) {
   if (speed != 0.0 && speed != 0.5 && speed != 1.0 && speed != 2.0) {
     throw std::invalid_argument("replay speed must be 0, 0.5, 1 or 2");
   }
-  std::scoped_lock lock(mutex_);
-  speed_ = speed;
+  nlohmann::json snapshot;
+  {
+    std::scoped_lock lock(mutex_);
+    speed_ = speed;
+    snapshot = state_locked();
+  }
+  publish_state(std::move(snapshot));
 }
 
 bool ReplayController::wait_until_finished(std::chrono::milliseconds timeout) {
@@ -99,6 +147,10 @@ void ReplayController::stop() {
 
 nlohmann::json ReplayController::state() const {
   std::scoped_lock lock(mutex_);
+  return state_locked();
+}
+
+nlohmann::json ReplayController::state_locked() const {
   double duration_seconds{};
   double position_seconds{};
   if (!entries_.empty()) {
@@ -108,10 +160,22 @@ nlohmann::json ReplayController::state() const {
     position_seconds = static_cast<double>(entries_[index].qpc_100ns - entries_.front().qpc_100ns) /
                        10000000.0;
   }
+  const bool finished = !entries_.empty() && !playing_ && !dispatching_ &&
+                        cursor_ >= entries_.size();
   return {{"session", session_.string()}, {"playing", playing_},
           {"dispatching", dispatching_}, {"speed", speed_},
           {"cursor", cursor_}, {"entries", entries_.size()}, {"seeking", seek_target_.has_value()},
-          {"duration_seconds", duration_seconds}, {"position_seconds", position_seconds}};
+          {"duration_seconds", duration_seconds}, {"position_seconds", position_seconds},
+          {"finished", finished}, {"error", last_error_}};
+}
+
+void ReplayController::publish_state(nlohmann::json state) const {
+  if (!state_callback_) return;
+  try {
+    state_callback_(std::move(state));
+  } catch (...) {
+    // Diagnostics must never interrupt deterministic replay.
+  }
 }
 
 void ReplayController::load_timeline() {
@@ -193,16 +257,40 @@ void ReplayController::run(std::stop_token stop) {
       packet.timestamp_error = entry.timestamp_error;
       packet.synthetic = entry.synthetic;
       callback_(std::move(packet));
+      std::optional<nlohmann::json> snapshot;
       {
         std::scoped_lock lock(mutex_);
         dispatching_ = false;
+        const bool finished = cursor_ >= entries_.size();
+        if (finished || entry.qpc_100ns >= next_progress_qpc_100ns_) {
+          next_progress_qpc_100ns_ = entry.qpc_100ns + 2'000'000;
+          snapshot = state_locked();
+        }
         cv_.notify_all();
       }
+      if (snapshot) publish_state(std::move(*snapshot));
+    } catch (const std::exception& error) {
+      nlohmann::json snapshot;
+      {
+        std::scoped_lock lock(mutex_);
+        playing_ = false;
+        dispatching_ = false;
+        last_error_ = error.what();
+        snapshot = state_locked();
+        cv_.notify_all();
+      }
+      publish_state(std::move(snapshot));
     } catch (...) {
-      std::scoped_lock lock(mutex_);
-      playing_ = false;
-      dispatching_ = false;
-      cv_.notify_all();
+      nlohmann::json snapshot;
+      {
+        std::scoped_lock lock(mutex_);
+        playing_ = false;
+        dispatching_ = false;
+        last_error_ = "replay failed";
+        snapshot = state_locked();
+        cv_.notify_all();
+      }
+      publish_state(std::move(snapshot));
     }
   }
 }

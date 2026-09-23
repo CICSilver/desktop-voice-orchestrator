@@ -9,8 +9,10 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <variant>
 #include <vector>
 
@@ -51,6 +53,7 @@ class VoiceFrontendRuntime {
   struct SignalSummary { float min{}, max{}, rms{}; };
   struct TelemetrySample {
     std::uint64_t sample{};
+    std::uint64_t view_sample{};
     SignalSummary microphone;
     SignalSummary loopback;
     SignalSummary processed;
@@ -71,7 +74,8 @@ class VoiceFrontendRuntime {
     std::uint64_t audio_reset_backlog_drops{};
   };
   void initialize_pipeline();
-  void reset_pipeline(bool discontinuity, bool reset_preprocessor = true);
+  void reset_pipeline(bool discontinuity, bool reset_preprocessor = true,
+                      bool reset_keyword = true);
   void start_processing();
   void stop_processing();
   void telemetry_loop(std::stop_token stop);
@@ -84,11 +88,15 @@ class VoiceFrontendRuntime {
   [[nodiscard]] bool enqueue_capture_packet(RawCapturedPacket packet);
   void processing_loop(std::stop_token stop);
   void process_microphone(AudioPacket packet);
+  void drain_keyword_preprocessor_frames();
   void drain_preprocessor_frames(bool pipeline_reset_for_packet);
   void report_audio_queue_boundary(const char* trigger_stream,
                                    PreprocessResetReason reason);
   void process_frame(const NormalizedFrame& frame, const SignalSummary& microphone,
                      const SignalSummary& loopback);
+  void process_keyword_hit(KwsHit hit, bool capture_blocked,
+                           bool processed_speech_present,
+                           std::string_view detector);
   [[nodiscard]] bool drain_audio_assemblies();
   void complete_backfill(BackfillAssemblyResult result);
   void complete_candidate(CandidateAssemblyResult result);
@@ -123,6 +131,8 @@ class VoiceFrontendRuntime {
   void drain_capture_events();
   [[nodiscard]] nlohmann::json handle_command(const nlohmann::json& command);
   [[nodiscard]] nlohmann::json session_list() const;
+  [[nodiscard]] std::optional<DebugServer::FileResource>
+  session_audio_resource(const nlohmann::json& request) const;
   [[nodiscard]] nlohmann::json metrics_json() const;
   [[nodiscard]] PreprocessDiagnostics preprocess_diagnostics_snapshot() const;
   [[nodiscard]] static SignalSummary summarize(std::span<const float> values);
@@ -132,11 +142,15 @@ class VoiceFrontendRuntime {
   AppConfig config_;
   ConfigStore config_store_;
   std::unique_ptr<TimedRingBuffer> ring_;
+  std::unique_ptr<TimedRingBuffer> microphone_ring_;
   std::unique_ptr<IAudioPreprocessor> preprocessor_;
+  std::unique_ptr<IAudioPreprocessor> keyword_preprocessor_;
   std::unique_ptr<IVadDetector> vad_;
   std::unique_ptr<IKeywordSpotter> kws_;
+  std::unique_ptr<IKeywordSpotter> microphone_kws_;
   std::unique_ptr<UtteranceSegmenter> segmenter_;
   std::unique_ptr<CandidateAssembler> candidate_assembler_;
+  std::unique_ptr<CandidateAssembler> microphone_candidate_assembler_;
   std::unique_ptr<IStreamingRecognizer> asr_;
   // Parser instances are immutable. In-flight utterances retain shared snapshots
   // across command-grammar hot updates.
@@ -194,6 +208,7 @@ class VoiceFrontendRuntime {
   std::unordered_map<std::string, ActiveRecognitionFeed> active_recognizers_;
   std::unordered_map<std::string, PendingRecognitionStart> pending_recognition_starts_;
   std::atomic<std::uint64_t> recognition_generation_{1};
+  std::atomic<std::uint64_t> replay_parse_debug_sequence_{1};
 
   using AudioIngressPacket = std::variant<AudioPacket, RawCapturedPacket>;
   std::unique_ptr<SpscQueue<AudioIngressPacket>> microphone_queue_;
@@ -222,6 +237,11 @@ class VoiceFrontendRuntime {
   std::uint64_t announcement_playback_start_sample_{};
   bool vad_speech_active_{};
   bool suppress_current_vad_interval_{};
+  std::deque<KwsHit> pending_microphone_keywords_;
+  std::string last_runtime_keyword_;
+  std::uint64_t last_runtime_keyword_sample_{};
+  std::uint64_t microphone_candidate_fallback_after_sample_{};
+  std::unordered_set<std::string> microphone_audio_activations_;
   ActivationSnapshot last_published_activation_state_{};
   std::string runtime_session_id_;
   std::mutex replay_callback_mutex_;
@@ -265,6 +285,9 @@ class VoiceFrontendRuntime {
   StreamingRecognizerState last_published_asr_state_{
       StreamingRecognizerState::unavailable};
   std::uint64_t next_telemetry_sample_{};
+  // The processing clock intentionally survives device resets. UI timelines
+  // are relative to the current live/replay view and use this separate origin.
+  std::optional<std::uint64_t> view_sample_origin_;
 };
 
 }  // namespace dvo

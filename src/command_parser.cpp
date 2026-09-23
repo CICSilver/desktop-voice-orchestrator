@@ -151,6 +151,39 @@ void append_utf8(std::string& output, char32_t cp) {
   return offset <= value.size() && value.substr(offset).starts_with(prefix);
 }
 
+void strip_polite_prefix(std::string& value) {
+  static constexpr std::array<std::string_view, 4> prefixes{
+      "麻烦帮我", "请帮我", "帮我", "请"};
+  for (const auto prefix : prefixes) {
+    if (!value.starts_with(prefix)) continue;
+    value.erase(0, prefix.size());
+    if (!value.empty() && value.front() == ';') value.erase(0, 1);
+    return;
+  }
+}
+
+[[nodiscard]] bool contains_rule(const std::vector<PhraseRule>& rules,
+                                 std::string_view phrase,
+                                 ActionType type) {
+  return std::ranges::any_of(rules, [&](const PhraseRule& rule) {
+    return rule.type == type && rule.phrase == phrase;
+  });
+}
+
+void correct_wake_confirmed_asr_confusions(
+    std::string& value, const std::vector<PhraseRule>& rules,
+    bool wake_confirmed_in_text) {
+  if (!wake_confirmed_in_text) return;
+
+  // These substitutions are deliberately sentence-wide and wake-confirmed:
+  // they cannot turn arbitrary follow-up speech into a command, and they are
+  // enabled only when the canonical pause phrase remains configured.
+  if (contains_rule(rules, "暂停音乐", ActionType::media_pause) &&
+      (value == "再连音乐" || value == "再听音乐")) {
+    value = "暂停音乐";
+  }
+}
+
 [[nodiscard]] bool is_numeric_codepoint(char32_t cp) {
   return (cp >= U'0' && cp <= U'9') || cp == U'零' || cp == U'一' || cp == U'二' ||
          cp == U'两' || cp == U'三' || cp == U'四' || cp == U'五' || cp == U'六' ||
@@ -466,6 +499,7 @@ CommandParseResult CommandParser::parse(std::string_view text,
   // already armed, causing the utterance to arrive through the follow-up
   // path. Strip the activation's confirmed wake word in either origin so an
   // otherwise exact command is not rejected solely because of that routing.
+  bool wake_confirmed_in_text{};
   if (!context.wake_word.empty()) {
     auto wake = normalize(context.wake_word);
     if (!wake.error) {
@@ -475,6 +509,7 @@ CommandParseResult CommandParser::parse(std::string_view text,
       if (!wake.value.empty()) {
         const auto position = normalized.value.find(wake.value);
         if (position != std::string::npos) {
+          wake_confirmed_in_text = true;
           auto erase_start = position;
           auto erase_size = wake.value.size();
           if (erase_start > 0 && normalized.value[erase_start - 1] == ';') {
@@ -483,12 +518,29 @@ CommandParseResult CommandParser::parse(std::string_view text,
           } else if (erase_start + erase_size < normalized.value.size() &&
                      normalized.value[erase_start + erase_size] == ';') {
             ++erase_size;
+          } else if (position > 0) {
+            // A weak utterance tail can make exact-final ASR append one
+            // spurious Chinese character after a suffix wake word (for
+            // example "小助手两"). Remove only one complete UTF-8 codepoint,
+            // only when it is the entire residual tail. Longer residual text
+            // stays rejectable.
+            const auto tail = position + wake.value.size();
+            if (const auto decoded = decode_one(normalized.value, tail);
+                decoded && tail + decoded->second == normalized.value.size()) {
+              erase_size += decoded->second;
+            }
           }
           normalized.value.erase(erase_start, erase_size);
         }
       }
     }
   }
+  // Polite lead-ins do not change command semantics. Remove one known prefix,
+  // then continue to require the remainder to match the configured grammar
+  // exactly; arbitrary filler and trailing residual text remain rejected.
+  strip_polite_prefix(normalized.value);
+  correct_wake_confirmed_asr_confusions(
+      normalized.value, impl_->rules, wake_confirmed_in_text);
   if (normalized.value.empty()) {
     return failure("empty_text", "ASR text does not contain a command", 0);
   }

@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -19,13 +20,20 @@ namespace dvo {
 class DebugServer {
  public:
   using CommandHandler = std::function<nlohmann::json(const nlohmann::json&)>;
+  struct FileResource {
+    std::filesystem::path path;
+    std::string content_type{"application/octet-stream"};
+  };
+  using FileHandler =
+      std::function<std::optional<FileResource>(const nlohmann::json&)>;
 
   explicit DebugServer(std::size_t telemetry_queue_capacity = 4096);
   ~DebugServer();
   DebugServer(const DebugServer&) = delete;
   DebugServer& operator=(const DebugServer&) = delete;
 
-  void start(const WebConfig& config, CommandHandler commands);
+  void start(const WebConfig& config, CommandHandler commands,
+             FileHandler files = {});
   void stop();
   bool publish(std::string type, nlohmann::json payload, std::uint64_t timestamp_sample = 0,
                std::string source = "live");

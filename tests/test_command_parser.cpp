@@ -45,6 +45,10 @@ TEST_CASE("Chinese command parser maps the four default rules") {
   CHECK(play.plan->actions[0].type == dvo::ActionType::media_play);
   CHECK_FALSE(play.plan->actions[0].volume_delta_percent.has_value());
 
+  const auto open = parser.parse("打开音乐", context("open"));
+  REQUIRE(open.ok());
+  CHECK(open.plan->actions[0].type == dvo::ActionType::media_play);
+
   const auto pause = parser.parse("暂停音乐", context("pause"));
   REQUIRE(pause.ok());
   CHECK(pause.plan->actions[0].type == dvo::ActionType::media_pause);
@@ -167,6 +171,36 @@ TEST_CASE("Wake text, plus separators and one-character ASR omissions remain exe
   CHECK(truncated_second.plan->actions[0].type == dvo::ActionType::media_play);
   CHECK(truncated_second.plan->actions[1].type == dvo::ActionType::media_pause);
   CHECK(truncated_second.plan->normalized_text == "播放音乐;暂停音乐");
+
+  const auto polite_suffix_wake =
+      parser.parse("帮我打开音乐小助手", wake_context);
+  REQUIRE(polite_suffix_wake.ok());
+  REQUIRE(polite_suffix_wake.plan->actions.size() == 1);
+  CHECK(polite_suffix_wake.plan->actions[0].type ==
+        dvo::ActionType::media_play);
+  CHECK(polite_suffix_wake.plan->normalized_text == "打开音乐");
+
+  const auto polite_prefix_wake =
+      parser.parse("小助手，请帮我播放音乐", wake_context);
+  REQUIRE(polite_prefix_wake.ok());
+  CHECK(polite_prefix_wake.plan->actions[0].type ==
+        dvo::ActionType::media_play);
+
+  const auto pause_confusion =
+      parser.parse("再连音乐小助手两", wake_context);
+  REQUIRE(pause_confusion.ok());
+  CHECK(pause_confusion.plan->actions[0].type ==
+        dvo::ActionType::media_pause);
+  CHECK(pause_confusion.plan->normalized_text == "暂停音乐");
+
+  const auto alternate_pause_confusion =
+      parser.parse("再听音乐小助手", wake_context);
+  REQUIRE(alternate_pause_confusion.ok());
+  CHECK(alternate_pause_confusion.plan->actions[0].type ==
+        dvo::ActionType::media_pause);
+
+  CHECK_FALSE(parser.parse("再连音乐", wake_context).ok());
+  CHECK_FALSE(parser.parse("再连音乐小助手两次", wake_context).ok());
 }
 
 TEST_CASE("Natural multi-command connectors are accepted") {
@@ -182,7 +216,7 @@ TEST_CASE("Natural multi-command connectors are accepted") {
 
 TEST_CASE("Parser rejects the whole sentence when any residual text is unknown") {
   const dvo::CommandParser parser;
-  for (const auto* text : {"帮我播放音乐", "播放音乐吧", "播放音乐然后未知命令",
+  for (const auto* text : {"帮我未知命令", "播放音乐吧", "播放音乐然后未知命令",
                            "播放音乐暂停音乐谢谢", "播放，音乐", "增加音量五",
                            "播放音乐并暂停音乐"}) {
     CAPTURE(text);
@@ -241,6 +275,30 @@ TEST_CASE("Plan IDs are deterministic per utterance and non-live sources are dry
   CHECK(first.plan->activation_id == "activation-1");
   CHECK(first.plan->turn_index == 2);
   CHECK(first.plan->trigger_sample == 15000);
+}
+
+TEST_CASE("Replay parse debugging strips the wake word and preserves action order") {
+  const dvo::CommandParser parser;
+  auto replay_context = context("replay-parse-debug");
+  replay_context.origin = dvo::UtteranceOrigin::keyword;
+  replay_context.wake_word = "小助手";
+  replay_context.source = dvo::ExecutionSource::replay;
+  replay_context.execution_mode = dvo::ExecutionMode::dry_run;
+
+  const auto parsed = parser.parse(
+      "小助手，暂停音乐，然后增加音量百分之十，再播放音乐",
+      replay_context);
+
+  REQUIRE(parsed.ok());
+  REQUIRE(parsed.plan->actions.size() == 3);
+  CHECK(parsed.plan->normalized_text ==
+        "暂停音乐;增加音量10%;播放音乐");
+  CHECK(parsed.plan->actions[0].type == dvo::ActionType::media_pause);
+  CHECK(parsed.plan->actions[1].type ==
+        dvo::ActionType::master_volume_adjust);
+  CHECK(parsed.plan->actions[1].volume_delta_percent == 10);
+  CHECK(parsed.plan->actions[2].type == dvo::ActionType::media_play);
+  CHECK(parsed.plan->execution_mode == dvo::ExecutionMode::dry_run);
 }
 
 TEST_CASE("Plan idempotency keys include runtime generation and final revision boundaries") {

@@ -94,3 +94,39 @@ TEST_CASE("benchmark event reader preserves valid NDJSON around malformed lines"
   CHECK(errors[0].starts_with("line 2:"));
   std::filesystem::remove(path);
 }
+
+TEST_CASE("benchmark report accepts nullable follow-up and media action fields") {
+  const std::vector<nlohmann::json> replayed{
+      event("candidate",
+            {{"utterance_id", "followup-1"},
+             {"position", nullptr},
+             {"wake_span", nullptr},
+             {"source_spans",
+              nlohmann::json::array(
+                  {{{"start", 1000}, {"end", 2000}}})}}),
+      event("command_plan",
+            {{"utterance_id", "followup-1"},
+             {"normalized_text", "播放音乐"},
+             {"execution_mode", "dry_run"},
+             {"actions",
+              nlohmann::json::array(
+                  {{{"sequence", 1},
+                    {"type", "media.play"},
+                    {"volume_delta_percent", nullptr}}})}}),
+      event("action_dry_run",
+            {{"utterance_id", "followup-1"},
+             {"action_id", "action-1"},
+             {"sequence", 1},
+             {"type", "media.play"},
+             {"status", "dry_run"},
+             {"requested_volume_delta_percent", nullptr},
+             {"message", "benchmark dry-run"}})};
+
+  const auto report = dvo::build_benchmark_comparison({}, replayed, 160);
+  CHECK(report["candidates"]["replayed_count"] == 1);
+  CHECK(report["command_plans"]["replayed"][0]["actions"][0]
+              ["volume_delta_percent"]
+                  .is_null());
+  CHECK(report["dry_run"]["actions"][0]["requested_volume_delta_percent"]
+            .is_null());
+}

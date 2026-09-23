@@ -43,7 +43,7 @@ struct CommandParseResult {
 };
 
 struct CommandGrammar {
-  std::vector<std::string> play_phrases{"播放音乐"};
+  std::vector<std::string> play_phrases{"播放音乐", "打开音乐"};
   std::vector<std::string> pause_phrases{"暂停音乐"};
   std::vector<std::string> volume_up_phrases{"增加音量"};
   std::vector<std::string> volume_down_phrases{"降低音量"};
