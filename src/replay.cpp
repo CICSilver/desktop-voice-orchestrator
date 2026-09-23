@@ -48,6 +48,7 @@ void ReplayController::play() {
     if (cursor_ >= entries_.size()) {
       cursor_ = 0;
       next_progress_qpc_100ns_ = 0;
+      seek_target_.reset();
     }
     last_error_.clear();
     playing_ = true;
@@ -166,7 +167,8 @@ nlohmann::json ReplayController::state_locked() const {
           {"dispatching", dispatching_}, {"speed", speed_},
           {"cursor", cursor_}, {"entries", entries_.size()}, {"seeking", seek_target_.has_value()},
           {"duration_seconds", duration_seconds}, {"position_seconds", position_seconds},
-          {"finished", finished}, {"error", last_error_}};
+          {"finished", finished},
+          {"error", last_error_.empty() ? nlohmann::json(nullptr) : nlohmann::json(last_error_)}};
 }
 
 void ReplayController::publish_state(nlohmann::json state) const {
@@ -183,23 +185,28 @@ void ReplayController::load_timeline() {
   std::ifstream input(session_ / "timeline.ndjson", std::ios::binary);
   if (!input) throw std::runtime_error("session timeline.ndjson is missing");
   std::string line;
+  bool has_microphone{};
+  std::vector<TimelineEntry> loaded;
   while (std::getline(input, line)) {
     if (line.empty()) continue;
     const auto value = nlohmann::json::parse(line);
     const auto kind = value.value("kind", "");
     if (kind != "microphone" && kind != "loopback") continue;
-    entries_.push_back({kind == "microphone" ? AudioStreamKind::microphone : AudioStreamKind::loopback,
-                        value.at("offset_frames").get<std::uint64_t>(),
-                        value.at("frame_count").get<std::uint64_t>(),
-                        value.at("qpc_100ns").get<std::uint64_t>(),
-                        value.value("arrival_qpc_100ns", value.at("qpc_100ns").get<std::uint64_t>()),
-                        value.value("device_position", 0ULL), value.value("stream_epoch", 0ULL),
-                        value.value("sequence", 0ULL), value.value("silent", false),
-                        value.value("discontinuity", false), value.value("timestamp_error", false),
-                        value.value("synthetic", false)});
+    has_microphone = has_microphone || kind == "microphone";
+    loaded.push_back({kind == "microphone" ? AudioStreamKind::microphone : AudioStreamKind::loopback,
+                      value.at("offset_frames").get<std::uint64_t>(),
+                      value.at("frame_count").get<std::uint64_t>(),
+                      value.at("qpc_100ns").get<std::uint64_t>(),
+                      value.value("arrival_qpc_100ns", value.at("qpc_100ns").get<std::uint64_t>()),
+                      value.value("device_position", 0ULL), value.value("stream_epoch", 0ULL),
+                      value.value("sequence", 0ULL), value.value("silent", false),
+                      value.value("discontinuity", false), value.value("timestamp_error", false),
+                      value.value("synthetic", false)});
   }
-  std::stable_sort(entries_.begin(), entries_.end(),
+  if (!has_microphone) throw std::runtime_error("session timeline has no microphone packets");
+  std::stable_sort(loaded.begin(), loaded.end(),
                    [](const auto& a, const auto& b) { return a.qpc_100ns < b.qpc_100ns; });
+  entries_ = std::move(loaded);
 }
 
 void ReplayController::run(std::stop_token stop) {

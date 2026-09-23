@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -100,16 +101,54 @@ TEST_CASE("recording session stores all three streams and timeline") {
     lock.unlock();
     REQUIRE(replay.wait_until_finished(std::chrono::seconds(2)));
     CHECK_FALSE(replay.state().value("dispatching", true));
+    CHECK(replay.state()["error"].is_null());
+
+    replay.play();
+    lock.lock();
+    REQUIRE(replay_cv.wait_for(lock, std::chrono::seconds(2), [&] { return replayed.size() == 4; }));
+    lock.unlock();
+    REQUIRE(replay.wait_until_finished(std::chrono::seconds(2)));
+    CHECK(replay.state()["error"].is_null());
   }
   REQUIRE(replayed[0].stream == dvo::AudioStreamKind::microphone);
   REQUIRE(replayed[1].stream == dvo::AudioStreamKind::loopback);
+  REQUIRE(replayed[2].stream == dvo::AudioStreamKind::microphone);
+  REQUIRE(replayed[3].stream == dvo::AudioStreamKind::loopback);
   REQUIRE(replayed[0].samples.front() == Catch::Approx(0.25F));
   REQUIRE(replayed[1].samples.front() == Catch::Approx(-0.1F));
-  REQUIRE_FALSE(replay_states.empty());
-  CHECK(std::ranges::any_of(replay_states, [](const nlohmann::json& state) {
-    return state.value("finished", false) &&
-           !state.value("playing", true);
-  }));
+  REQUIRE(replayed[2].samples.front() == Catch::Approx(0.25F));
+  REQUIRE(replayed[3].samples.front() == Catch::Approx(-0.1F));
+  REQUIRE(replay_states.size() >= 2);
+  CHECK(std::ranges::count_if(replay_states, [](const nlohmann::json& state) {
+          return state.value("finished", false) &&
+                 !state.value("playing", true) && state["error"].is_null();
+        }) >= 2);
+
+  const auto no_mic_session = root / "no-mic";
+  std::filesystem::create_directories(no_mic_session);
+  {
+    dvo::FloatWavWriter writer;
+    writer.open(no_mic_session / "loopback.wav", {48000, 1});
+    std::vector<float> samples(480, 0.1F);
+    writer.write(samples);
+  }
+  {
+    std::ofstream timeline(no_mic_session / "timeline.ndjson", std::ios::binary);
+    timeline << nlohmann::json{{"kind", "loopback"}, {"offset_frames", 0},
+                               {"frame_count", 480}, {"qpc_100ns", 1000}}.dump()
+             << '\n';
+  }
+  {
+    dvo::ReplayController replay([](dvo::AudioPacket) {});
+    bool rejected{};
+    try {
+      replay.open(no_mic_session);
+    } catch (const std::runtime_error& error) {
+      rejected = true;
+      CHECK(std::string(error.what()).find("no microphone") != std::string::npos);
+    }
+    CHECK(rejected);
+  }
 
   std::mutex blocked_mutex;
   std::condition_variable blocked_cv;
