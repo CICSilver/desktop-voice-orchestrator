@@ -12,7 +12,7 @@ const GROUPS = [
   {id: 'quiet-far', title: '安静 · 2 米', condition: 'quiet', distance_m: 2.0, silence_s: 15,
     intro: '保持安静，站或坐在离麦克风约 2 米的位置，用你平时对电脑说话的音量，不要刻意提高嗓门。'},
   {id: 'music-far', title: '播放音乐 · 2 米', condition: 'music', distance_m: 2.0, silence_s: 30,
-    intro: '用任意播放器通过音箱播放音乐，音量调到平时习惯的大小，然后在约 2 米处说话。最后一条是纯音乐静默段，用来统计误唤醒。'},
+    intro: '用任意播放器通过音箱播放音乐，音量调到平时习惯的大小，然后在约 2 米处说话。第一条是纯音乐静默段，用来统计误唤醒。'},
   {id: 'music-near', title: '播放音乐 · 近距离（约 0.5 米）', condition: 'music', distance_m: 0.5, silence_s: 20, optional: true,
     intro: '继续播放音乐，回到离麦克风约 0.5 米的位置说话。'}
 ];
@@ -37,16 +37,17 @@ const COMMANDS = [
   {key: 'pre-open', position: 'prefix', say: '{W}，打开音乐', actions: [PLAY]}
 ];
 
-// Negatives wait out the follow-up window first (6 s idle after the previous
-// command finishes processing, plus endpointing), otherwise a correct
-// follow-up would be scored as a false trigger.
+// Silence and negatives come before any command, so no activation window can
+// be open yet: speech within 6 s of a command is a legitimate follow-up turn
+// and would otherwise have to be waited out before every negative.
 const NEGATIVES = [
-  {key: 'neg-command', kind: 'negative', say: '暂停音乐', note: '这条不要说唤醒词', gap_s: 9},
-  {key: 'neg-chat', kind: 'negative', say: '今天晚上吃点什么好呢', note: '这条不要说唤醒词', gap_s: 9}
+  {key: 'neg-command', kind: 'negative', say: '暂停音乐', note: '这条不要说唤醒词'},
+  {key: 'neg-chat', kind: 'negative', say: '今天晚上吃点什么好呢', note: '这条不要说唤醒词'}
 ];
 
-const DEFAULT_GAP_S = 2.5;
-const REDO_GAP_S = 1.5;
+// Pause before each prompt appears. Together with reading time it keeps
+// consecutive takes in separate VAD segments (endpoint silence is 0.9 s).
+const GAP_S = 1.5;
 const MIN_TAKE_MS = 600;
 
 const state = {
@@ -180,7 +181,7 @@ function renderGroups() {
     const title = document.createElement('strong');
     title.textContent = group.title;
     const hint = document.createElement('span');
-    const minutes = Math.ceil((COMMANDS.length * 7 + NEGATIVES.length * 11 + group.silence_s + 10) / 60);
+    const minutes = Math.ceil(((COMMANDS.length + NEGATIVES.length) * (GAP_S + 4) + group.silence_s + 10) / 60);
     hint.textContent = `约 ${minutes} 分钟${group.optional ? ' · 可选' : ''}`;
     label.append(input, title, hint);
     return label;
@@ -190,15 +191,12 @@ function renderGroups() {
 function buildTakes(group, groupIndex) {
   const rotation = (groupIndex * 5) % COMMANDS.length;
   const commands = COMMANDS.slice(rotation).concat(COMMANDS.slice(0, rotation));
-  const script = [];
-  commands.forEach((item, index) => {
-    script.push({...item, kind: 'command'});
-    if (index === 4) script.push({...NEGATIVES[0], position: 'none', actions: []});
-    if (index === 9) script.push({...NEGATIVES[1], position: 'none', actions: []});
-  });
-  script.push({key: 'silence', kind: 'silence', position: 'none', say: '', actions: [],
-    gap_s: 7.5, auto_s: group.silence_s,
-    note: group.condition === 'music' ? '让音乐继续播放，不要说话' : '不要说话'});
+  const script = [
+    {key: 'silence', kind: 'silence', position: 'none', say: '', actions: [], auto_s: group.silence_s,
+      note: group.condition === 'music' ? '让音乐继续播放，不要说话' : '不要说话'},
+    ...NEGATIVES.map((item) => ({...item, position: 'none', actions: []})),
+    ...commands.map((item) => ({...item, kind: 'command'}))
+  ];
   return script.map((item, index) => {
     const text = item.say.replaceAll('{W}', state.wake);
     return {
@@ -208,7 +206,6 @@ function buildTakes(group, groupIndex) {
       prompt: item.kind === 'silence' ? `保持安静 ${item.auto_s} 秒` : text,
       text,
       expected_actions: item.actions,
-      gap_s: item.gap_s ?? DEFAULT_GAP_S,
       auto_s: item.auto_s ?? 0,
       note: item.note || ''
     };
@@ -255,10 +252,10 @@ async function startGroup() {
   state.labels = [];
   setRecording(true);
   show('take');
-  beginTake(state.takes[0].gap_s);
+  beginTake();
 }
 
-function beginTake(gapSeconds) {
+function beginTake() {
   clearTimer();
   state.phase = 'countdown';
   const take = state.takes[state.takeIndex];
@@ -272,7 +269,7 @@ function beginTake(gapSeconds) {
   $('take-prompt').className = 'prompt waiting';
   $('take-note').textContent = state.attempt > 1 ? `第 ${state.attempt} 次录这一条` : '';
   for (const id of ['next-take', 'redo-take', 'skip-take']) $(id).disabled = true;
-  const until = Date.now() + gapSeconds * 1000;
+  const until = Date.now() + GAP_S * 1000;
   const tick = () => {
     const remaining = Math.max(0, until - Date.now());
     $('take-countdown').textContent = remaining > 0 ? `${(remaining / 1000).toFixed(1)} 秒后开始` : '';
@@ -326,7 +323,7 @@ function finishTake(status) {
   recordTake(status);
   if (status === 'discarded') {
     state.attempt += 1;
-    beginTake(REDO_GAP_S);
+    beginTake();
     return;
   }
   state.takeIndex += 1;
@@ -335,7 +332,7 @@ function finishTake(status) {
     endGroup();
     return;
   }
-  beginTake(state.takes[state.takeIndex].gap_s);
+  beginTake();
 }
 
 function labelsDocument(complete) {

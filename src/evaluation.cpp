@@ -27,7 +27,9 @@ constexpr double kSlackBefore = 0.2;
 constexpr double kSlackAfter = 0.8;
 // A wake hit's estimated end can trail the take: the VAD segment may include
 // the key press that ended it, and a probe hit sits at the segment end. Takes
-// are at least 2.5 s apart and nobody speaks within 0.1 s of a new prompt.
+// can be as little as 1.5 s apart, so a hit inside a take's window always
+// belongs to it and a hit between takes goes to the nearer one; nobody speaks
+// within 0.1 s of a new prompt.
 constexpr double kHitSlackAfter = 2.4;
 // Reference decodes see a little context around the window.
 constexpr double kReferencePadBefore = 0.3;
