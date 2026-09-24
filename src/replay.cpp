@@ -19,6 +19,11 @@ ReplayController::ReplayController(PacketCallback callback,
 
 ReplayController::~ReplayController() { stop(); }
 
+void ReplayController::set_dispatch_gate(DispatchGate gate) {
+  std::scoped_lock lock(mutex_);
+  dispatch_gate_ = std::move(gate);
+}
+
 void ReplayController::open(const std::filesystem::path& session) {
   nlohmann::json snapshot;
   {
@@ -218,6 +223,7 @@ void ReplayController::run(std::stop_token stop) {
     TimelineEntry entry;
     std::filesystem::path session;
     double speed{};
+    DispatchGate gate;
     {
       std::unique_lock lock(mutex_);
       cv_.wait_for(lock, std::chrono::milliseconds(20), [this, stop] {
@@ -228,6 +234,7 @@ void ReplayController::run(std::stop_token stop) {
       dispatching_ = true;
       entry = entries_[cursor_++];
       session = session_;
+      gate = dispatch_gate_;
       speed = seek_target_ ? 0.0 : speed_;
       if (seek_target_ && cursor_ >= *seek_target_) {
         seek_target_.reset();
@@ -263,6 +270,7 @@ void ReplayController::run(std::stop_token stop) {
       packet.discontinuity = entry.discontinuity;
       packet.timestamp_error = entry.timestamp_error;
       packet.synthetic = entry.synthetic;
+      if (gate) gate(speed, stop);
       callback_(std::move(packet));
       std::optional<nlohmann::json> snapshot;
       {

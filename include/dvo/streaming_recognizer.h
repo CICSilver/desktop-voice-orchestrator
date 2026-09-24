@@ -193,6 +193,12 @@ std::unique_ptr<IStreamingRecognizer> create_streaming_recognizer(
     StreamingRecognizerConfig config, RecognitionResultCallback callback,
     std::unique_ptr<IOnlineAsrEngine> engine = {});
 
+// Synchronous engine for offline analysis such as evaluation reference
+// decodes. Throws when the configuration or model files are invalid, or when
+// the build lacks sherpa-onnx.
+std::unique_ptr<IOnlineAsrEngine> create_online_asr_engine(
+    const StreamingRecognizerConfig& config);
+
 [[nodiscard]] const char* to_string(RecognitionResultKind kind) noexcept;
 [[nodiscard]] const char* to_string(RecognitionSubmitStatus status) noexcept;
 [[nodiscard]] const char* to_string(StreamingRecognizerState state) noexcept;

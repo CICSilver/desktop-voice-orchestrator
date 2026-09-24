@@ -1,0 +1,60 @@
+body.collect { min-width: 0; }
+.collect-main { max-width: 980px; margin: 0 auto; padding: 28px 24px 48px; }
+.stage { padding: 26px 30px; }
+.stage h2 { font-size: 22px; margin: 6px 0 12px; }
+.lead { color: #b8c7d8; line-height: 1.7; margin-bottom: 18px; }
+kbd { display: inline-block; min-width: 18px; padding: 1px 6px; border: 1px solid #3a4a5e; border-bottom-width: 2px; border-radius: 5px; background: #0b1118; color: var(--text); font: 600 11px Consolas, monospace; text-align: center; }
+code { color: var(--cyan); font: 12px Consolas, monospace; }
+.setup-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 16px; }
+.setup-grid label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; }
+.setup-grid input { width: 100%; }
+.setup-grid output { color: var(--cyan); font: 700 20px "Segoe UI", sans-serif; }
+.setup-grid small { color: #66778b; font-size: 11px; }
+.group-list { display: block; }
+.group-list label { display: flex; align-items: baseline; gap: 10px; padding: 7px 2px; color: var(--text); }
+.group-list label span { color: var(--muted); font-size: 12px; }
+.group-list input, .check input { width: auto; }
+.check { display: flex; align-items: center; gap: 9px; color: #b8c7d8; margin: 14px 0 6px; }
+.stage-actions { display: flex; align-items: center; justify-content: flex-end; gap: 10px; margin-top: 22px; flex-wrap: wrap; }
+.stage-actions kbd { margin-left: 6px; }
+.control-message-inline { margin-right: auto; color: var(--amber); font-size: 12px; }
+
+.meters { display: grid; gap: 10px; margin: 8px 0 12px; }
+.meter { display: grid; grid-template-columns: 70px minmax(0, 1fr) 90px; align-items: center; gap: 10px; color: var(--muted); font-size: 12px; }
+.meter b { color: var(--text); font: 600 12px Consolas, monospace; text-align: right; }
+.bar { height: 10px; border: 1px solid var(--line); border-radius: 999px; background: #0b1118; overflow: hidden; }
+.bar i { display: block; height: 100%; width: 0; background: var(--cyan); transition: width .08s linear; }
+.bar i.hot { background: var(--amber); }
+.condition-check { min-height: 20px; font-size: 13px; }
+.condition-check.ok { color: var(--green); }
+.condition-check.warn { color: var(--amber); }
+
+.take-stage { min-height: 460px; display: flex; flex-direction: column; }
+.take-head { display: flex; align-items: center; gap: 10px; }
+.take-group { color: var(--muted); }
+.take-head .pill:last-child { margin-left: auto; }
+.progress { height: 3px; margin: 14px 0 0; background: #1a2430; border-radius: 3px; overflow: hidden; }
+.progress i { display: block; height: 100%; width: 0; background: var(--cyan); }
+.countdown { min-height: 28px; margin-top: 34px; color: var(--amber); font: 700 18px Consolas, monospace; text-align: center; }
+.prompt { flex: 1; display: flex; align-items: center; justify-content: center; margin: 10px 0; color: #f3f8ff; font: 600 46px/1.35 "Microsoft YaHei UI", "Segoe UI", sans-serif; text-align: center; letter-spacing: .02em; }
+.prompt.waiting { color: #3c4a5c; }
+.prompt.silence { color: var(--muted); font-size: 32px; }
+.take-note { min-height: 22px; color: var(--amber); text-align: center; }
+.take-meter { margin-top: 18px; }
+
+.saved-list { margin: 0 0 16px; padding-left: 20px; color: #b8c7d8; line-height: 1.8; }
+.saved-list code { color: var(--text); }
+.command-line { margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: #0b1118; color: var(--cyan); font: 13px Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
+.collect-message { display: block; min-height: 20px; margin-top: 14px; color: var(--muted); font-size: 13px; }
+.collect-message.error { color: var(--red); }
+.collect-message.success { color: var(--green); }
+.pill.dry { color: var(--green); border-color: #285b3c; }
+.pill.live-actions { color: var(--amber); border-color: #6c5025; }
+
+@media (max-width: 760px) {
+  .collect-main { padding: 16px; }
+  .stage { padding: 18px 16px; }
+  .setup-grid { grid-template-columns: 1fr; }
+  .prompt { font-size: 30px; }
+  .topbar { flex-wrap: wrap; gap: 10px; padding: 16px; }
+}

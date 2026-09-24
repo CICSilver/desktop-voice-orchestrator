@@ -206,3 +206,47 @@ TEST_CASE("recording manifest is incomplete after a timestamp discontinuity") {
   }
   std::filesystem::remove_all(root);
 }
+
+TEST_CASE("replay dispatch gate runs before every packet with the effective speed") {
+  const auto suffix = std::chrono::steady_clock::now().time_since_epoch().count();
+  const auto root = std::filesystem::temp_directory_path() /
+                    ("dvo-replay-gate-test-" + std::to_string(suffix));
+  dvo::RecordingConfig config;
+  config.session_root = root;
+  dvo::SessionRecorder recorder(128);
+  const auto session = recorder.start(config, {{"test", true}});
+  for (std::uint64_t index = 0; index < 3; ++index) {
+    dvo::AudioPacket mic;
+    mic.stream = dvo::AudioStreamKind::microphone;
+    mic.format = {16000, 1};
+    mic.samples.assign(160, 0.1F);
+    mic.qpc_100ns = 1000 + index * 100000;
+    REQUIRE(recorder.try_enqueue(mic));
+  }
+  recorder.stop();
+
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::vector<std::string> order;
+  std::vector<double> speeds;
+  {
+    dvo::ReplayController replay([&](dvo::AudioPacket) {
+      std::scoped_lock lock(mutex);
+      order.push_back("packet");
+      cv.notify_all();
+    });
+    replay.set_dispatch_gate([&](double speed, std::stop_token) {
+      std::scoped_lock lock(mutex);
+      order.push_back("gate");
+      speeds.push_back(speed);
+    });
+    replay.open(session);
+    replay.set_speed(0.0);
+    replay.play();
+    std::unique_lock lock(mutex);
+    REQUIRE(cv.wait_for(lock, std::chrono::seconds(2), [&] { return order.size() == 6; }));
+  }
+  CHECK(order == std::vector<std::string>{"gate", "packet", "gate", "packet", "gate", "packet"});
+  CHECK(std::ranges::all_of(speeds, [](double speed) { return speed == 0.0; }));
+  std::filesystem::remove_all(root);
+}

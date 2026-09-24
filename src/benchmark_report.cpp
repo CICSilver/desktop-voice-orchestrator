@@ -5,6 +5,8 @@
 #include <cmath>
 #include <exception>
 #include <fstream>
+#include <functional>
+#include <limits>
 #include <map>
 #include <set>
 #include <string_view>
@@ -21,8 +23,18 @@ bool comparable(std::string_view type) {
          kComparableEventTypes.end();
 }
 
+// Event payloads use null for absent optional strings (for example the wake
+// position of a follow-up candidate); json::value() would throw on those.
+std::string string_value(const nlohmann::json& value, std::string_view key,
+                         std::string_view fallback = {}) {
+  if (!value.is_object()) return std::string(fallback);
+  const auto found = value.find(key);
+  return found != value.end() && found->is_string() ? found->get<std::string>()
+                                                    : std::string(fallback);
+}
+
 std::string type_of(const nlohmann::json& event) {
-  return event.is_object() ? event.value("type", "") : "";
+  return string_value(event, "type");
 }
 
 const nlohmann::json& payload_of(const nlohmann::json& event) {
@@ -41,7 +53,7 @@ std::vector<std::string> comparable_sequence(
     if (!comparable(type)) continue;
     if (type == "candidate") {
       const auto& payload = payload_of(event);
-      const auto key = payload.value("utterance_id", "") + ":" +
+      const auto key = string_value(payload, "utterance_id") + ":" +
                        payload.value("wake_span", nlohmann::json::object()).dump() +
                        ":" +
                        payload.value("source_spans", nlohmann::json::array()).dump();
@@ -92,14 +104,6 @@ nlohmann::json nullable_value(const nlohmann::json& value,
                                                   : *found;
 }
 
-std::string string_value(const nlohmann::json& value,
-                         std::string_view key) {
-  const auto found = value.find(key);
-  return found != value.end() && found->is_string()
-             ? found->get<std::string>()
-             : std::string{};
-}
-
 std::vector<std::uint64_t> candidate_boundaries(const nlohmann::json& payload) {
   std::vector<std::uint64_t> result;
   const auto append_span = [&result](const nlohmann::json& span) {
@@ -124,7 +128,7 @@ std::vector<nlohmann::json> unique_candidates(
   for (const auto& event : events) {
     if (type_of(event) != "candidate") continue;
     const auto& payload = payload_of(event);
-    const auto id = payload.value("utterance_id", "");
+    const auto id = string_value(payload, "utterance_id");
     const auto key = id + ":" + string_value(payload, "position") + ":" +
                      payload.value("wake_span", nlohmann::json::object()).dump() +
                      ":" + payload.value("source_spans", nlohmann::json::array()).dump();
@@ -155,8 +159,8 @@ nlohmann::json compare_candidates(const std::vector<nlohmann::json>& recorded,
                                  left > right ? left - right : right - left);
       }
     }
-    const bool position_equal = old_values[index].value("position", "") ==
-                                new_values[index].value("position", "");
+    const bool position_equal = string_value(old_values[index], "position") ==
+                                string_value(new_values[index], "position");
     const bool is_exact = same_shape && position_equal && maximum_error == 0;
     const bool is_within = same_shape && position_equal &&
                            maximum_error <= frame_samples;
@@ -164,9 +168,9 @@ nlohmann::json compare_candidates(const std::vector<nlohmann::json>& recorded,
     within_frame += is_within ? 1U : 0U;
     details.push_back({{"index", index},
                        {"recorded_utterance_id",
-                        old_values[index].value("utterance_id", "")},
+                        string_value(old_values[index], "utterance_id")},
                        {"replayed_utterance_id",
-                        new_values[index].value("utterance_id", "")},
+                        string_value(new_values[index], "utterance_id")},
                        {"position_equal", position_equal},
                        {"boundary_shape_equal", same_shape},
                        {"max_boundary_error_samples", maximum_error},
@@ -240,15 +244,15 @@ nlohmann::json command_plans(const std::vector<nlohmann::json>& events) {
         found != payload.end() && found->is_array()) {
       for (const auto& action : *found) {
         actions.push_back({{"sequence", action.value("sequence", 0)},
-                           {"type", action.value("type", "")},
+                           {"type", string_value(action, "type")},
                            {"volume_delta_percent",
                             nullable_value(action,
                                            "volume_delta_percent")}});
       }
     }
-    result.push_back({{"utterance_id", payload.value("utterance_id", "")},
-                      {"normalized_text", payload.value("normalized_text", "")},
-                      {"execution_mode", payload.value("execution_mode", "")},
+    result.push_back({{"utterance_id", string_value(payload, "utterance_id")},
+                      {"normalized_text", string_value(payload, "normalized_text")},
+                      {"execution_mode", string_value(payload, "execution_mode")},
                       {"actions", std::move(actions)}});
   }
   return result;
@@ -287,18 +291,18 @@ nlohmann::json dry_run_actions(const std::vector<nlohmann::json>& events) {
       continue;
     }
     const auto& payload = payload_of(event);
-    const auto status = payload.value("status", type.substr(7));
+    const auto status = string_value(payload, "status", type.substr(7));
     ++terminal_count;
     all_dry_run = all_dry_run && status == "dry_run";
-    actions.push_back({{"utterance_id", payload.value("utterance_id", "")},
-                       {"action_id", payload.value("action_id", "")},
+    actions.push_back({{"utterance_id", string_value(payload, "utterance_id")},
+                       {"action_id", string_value(payload, "action_id")},
                        {"sequence", payload.value("sequence", 0)},
-                       {"type", payload.value("type", "")},
+                       {"type", string_value(payload, "type")},
                        {"status", status},
                        {"requested_volume_delta_percent",
                         nullable_value(payload,
                                        "requested_volume_delta_percent")},
-                       {"message", payload.value("message", "")}});
+                       {"message", string_value(payload, "message")}});
   }
   return {{"terminal_count", terminal_count},
           {"has_terminal_actions", terminal_count != 0},
@@ -360,6 +364,162 @@ nlohmann::json build_benchmark_comparison(
                            {"replayed", asr_timing(replayed)}}},
           {"command_plans", compare_plans(recorded, replayed)},
           {"dry_run", dry_run_actions(replayed)}};
+}
+
+nlohmann::json summarize_replayed_utterances(
+    const std::vector<nlohmann::json>& events, std::uint64_t origin_sample) {
+  constexpr double kSampleRate = 16000.0;
+  const auto seconds = [origin_sample](std::uint64_t sample) {
+    return sample >= origin_sample
+               ? static_cast<double>(sample - origin_sample) / kSampleRate
+               : -static_cast<double>(origin_sample - sample) / kSampleRate;
+  };
+
+  auto hits = nlohmann::json::array();
+  std::map<std::string, nlohmann::json> utterances;
+  std::vector<std::string> order;
+  std::set<std::string> microphone_activations;
+  const auto utterance = [&](const std::string& id) -> nlohmann::json& {
+    auto [it, inserted] = utterances.try_emplace(id);
+    if (inserted) {
+      order.push_back(id);
+      it->second = {{"utterance_id", id},
+                    {"origin", nullptr},
+                    {"position", nullptr},
+                    {"activation_id", nullptr},
+                    {"audio_source", "aec"},
+                    {"candidate", nullptr},
+                    {"asr_text", nullptr},
+                    {"asr_latency_ms", nullptr},
+                    {"outcome", "pending"},
+                    {"normalized_text", nullptr},
+                    {"actions", nlohmann::json::array()},
+                    {"rejection", nullptr}};
+    }
+    return it->second;
+  };
+
+  for (const auto& event : events) {
+    const auto type = type_of(event);
+    const auto& payload = payload_of(event);
+    if (type == "kws_hit") {
+      const auto span = payload.value("wake_span", nlohmann::json::object());
+      hits.push_back({{"keyword", string_value(payload, "keyword")},
+                      {"detector", string_value(payload, "detector", "aec")},
+                      {"wake_start_s", seconds(unsigned_value(span, "start"))},
+                      {"wake_end_s", seconds(unsigned_value(span, "end"))},
+                      {"detected_s",
+                       seconds(unsigned_value(payload, "detected_at_sample"))},
+                      {"detected_sample", unsigned_value(payload, "detected_at_sample")},
+                      {"suppressed", nullptr}});
+      continue;
+    }
+    if (type == "kws_suppressed") {
+      // Suppression is reported right after the hit it applies to.
+      const auto at = unsigned_value(event, "timestamp_sample");
+      for (auto it = hits.rbegin(); it != hits.rend(); ++it) {
+        if ((*it)["detected_sample"] == at &&
+            (*it)["detector"] == string_value(payload, "detector", "aec")) {
+          (*it)["suppressed"] = string_value(payload, "reason", "suppressed");
+          break;
+        }
+      }
+      continue;
+    }
+    if (type == "recognition_audio_fallback") {
+      microphone_activations.insert(string_value(payload, "activation_id"));
+      continue;
+    }
+    const auto id = string_value(payload, "utterance_id");
+    if (id.empty()) continue;
+    if (type == "candidate") {
+      auto& record = utterance(id);
+      std::uint64_t start = std::numeric_limits<std::uint64_t>::max();
+      std::uint64_t end{};
+      for (const auto& span : payload.value("source_spans", nlohmann::json::array())) {
+        start = std::min(start, unsigned_value(span, "start"));
+        end = std::max(end, unsigned_value(span, "end"));
+      }
+      if (start > end) start = end;
+      record["origin"] = string_value(payload, "origin");
+      record["position"] = nullable_value(payload, "position");
+      record["activation_id"] = string_value(payload, "activation_id");
+      record["candidate"] = {{"start_s", seconds(start)},
+                             {"end_s", seconds(end)},
+                             {"start_sample", start},
+                             {"end_sample", end},
+                             {"duration_s", static_cast<double>(end - start) / kSampleRate},
+                             {"boundary_source", string_value(payload, "boundary_source")},
+                             {"truncated", payload.value("truncated", false)},
+                             {"timed_out", payload.value("timed_out", false)},
+                             {"discontinuity", payload.value("discontinuity", false)}};
+      if (record["outcome"] == "pending") record["outcome"] = "no_asr";
+    } else if (type == "candidate_rejected") {
+      auto& record = utterance(id);
+      if (record["origin"].is_null()) record["origin"] = string_value(payload, "origin");
+      record["outcome"] = "candidate_rejected";
+      record["rejection"] = {{"stage", "candidate"},
+                             {"reason", string_value(payload, "reason")}};
+    } else if (type == "asr_final") {
+      auto& record = utterance(id);
+      record["asr_text"] = string_value(payload, "text");
+      record["asr_latency_ms"] = nullable_value(payload, "latency_ms");
+      if (record["outcome"] == "pending" || record["outcome"] == "no_asr") {
+        record["outcome"] = "asr_only";
+      }
+    } else if (type == "asr_error" || type == "asr_cancelled") {
+      auto& record = utterance(id);
+      if (record["outcome"] == "pending" || record["outcome"] == "no_asr") {
+        record["outcome"] = type == "asr_error" ? "asr_error" : "asr_cancelled";
+        record["rejection"] = {{"stage", "asr"},
+                               {"reason", string_value(payload, "detail")}};
+      }
+    } else if (type == "parse_debug") {
+      const auto error = payload.find("error");
+      if (error != payload.end() && error->is_object()) {
+        auto& record = utterance(id);
+        record["parse_error"] = {{"stage", string_value(payload, "stage")},
+                                 {"code", string_value(*error, "code")},
+                                 {"message", string_value(*error, "message")}};
+      }
+    } else if (type == "command_plan") {
+      auto& record = utterance(id);
+      record["outcome"] = "plan";
+      record["normalized_text"] = string_value(payload, "normalized_text");
+      auto actions = nlohmann::json::array();
+      for (const auto& action : payload.value("actions", nlohmann::json::array())) {
+        actions.push_back({{"type", string_value(action, "type")},
+                           {"volume_delta_percent",
+                            nullable_value(action, "volume_delta_percent")}});
+      }
+      record["actions"] = std::move(actions);
+    } else if (type == "command_rejected") {
+      auto& record = utterance(id);
+      record["outcome"] = "rejected";
+      record["rejection"] = {{"stage", "command"},
+                             {"reason", string_value(payload, "reason")}};
+      if (record["asr_text"].is_null()) record["asr_text"] = string_value(payload, "text");
+    }
+  }
+
+  std::vector<nlohmann::json> records;
+  records.reserve(order.size());
+  for (const auto& id : order) {
+    auto record = std::move(utterances[id]);
+    if (record["activation_id"].is_string() &&
+        microphone_activations.contains(record["activation_id"].get<std::string>())) {
+      record["audio_source"] = "microphone";
+    }
+    records.push_back(std::move(record));
+  }
+  const auto start_of = [](const nlohmann::json& record) {
+    return record["candidate"].is_object()
+               ? record["candidate"]["start_s"].get<double>()
+               : std::numeric_limits<double>::max();
+  };
+  std::ranges::stable_sort(records, std::less{}, start_of);
+  for (auto& hit : hits) hit.erase("detected_sample");
+  return {{"keyword_hits", std::move(hits)}, {"utterances", std::move(records)}};
 }
 
 }  // namespace dvo

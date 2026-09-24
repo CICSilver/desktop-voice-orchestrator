@@ -46,6 +46,7 @@ add_library(dvo_core STATIC
   src/command_parser.cpp
   src/action_executor.cpp
   src/benchmark_report.cpp
+  src/evaluation.cpp
   src/announcement.cpp
   src/volume_math.cpp
   src/wav_file.cpp
@@ -128,6 +129,7 @@ if(BUILD_TESTING AND DVO_BUILD_TESTS)
     tests/test_command_parser.cpp
     tests/test_action_executor.cpp
     tests/test_benchmark_report.cpp
+    tests/test_evaluation.cpp
     tests/test_debug_server.cpp
     tests/test_announcement.cpp
     tests/test_volume_math.cpp

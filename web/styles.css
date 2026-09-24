@@ -5,6 +5,7 @@
   --amber: #f2bd66; --red: #ff6b72; --green: #74e29a;
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; min-width: 980px; background: radial-gradient(circle at 78% -10%, #14243a 0, transparent 34%), var(--bg); color: var(--text); font: 14px/1.45 "Segoe UI", sans-serif; }
 button, select, input { font: inherit; }
 button, select { border: 1px solid var(--line); background: #151c25; color: var(--text); border-radius: 7px; padding: 8px 12px; }
@@ -18,6 +19,7 @@ h1, h2, p { margin: 0; } h1 { font-size: 26px; letter-spacing: -.4px; } h2 { fon
 .status-cluster, .toolbar, .metric-row, .legend, .form-actions { display: flex; align-items: center; gap: 10px; }
 .pill { padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font: 700 11px Consolas, monospace; }
 .pill.online { color: var(--green); border-color: #285b3c; }.pill.offline { color: var(--red); border-color: #653137; }
+a.pill { text-decoration: none; } a.pill:hover { color: var(--text); border-color: #42566f; } .pill.warn-pill { color: var(--amber); border-color: #6c5025; }
 .record-indicator { display:flex; align-items:center; gap:6px; min-width:150px; padding:5px 10px; color:var(--muted); border:1px solid var(--line); border-radius:8px; background:#0b1118; }.record-indicator i { display:inline-block; width:10px; height:10px; flex:0 0 auto; border-radius:50%; background:#3b4654; }.record-indicator strong { color:var(--text); font:700 12px Consolas,monospace; }.record-indicator.active { color:#ffd8db; border-color:#79363d; background:#261217; }.record-indicator.active i { background:var(--red); box-shadow:0 0 12px var(--red); animation:record-pulse 1.2s ease-in-out infinite; }.record-indicator.pending { color:var(--amber); border-color:#6c5025; }.record-indicator.incomplete { color:var(--amber); border-color:#6c5025; }
 @keyframes record-pulse { 50% { opacity:.45; transform:scale(.82); } }
 main { padding: 18px 28px 36px; }.panel { background: linear-gradient(145deg, rgba(18,24,33,.98), rgba(12,17,24,.98)); border: 1px solid #202b39; border-radius: 11px; box-shadow: 0 15px 45px rgba(0,0,0,.18); }

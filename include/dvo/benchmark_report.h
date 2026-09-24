@@ -23,4 +23,11 @@ namespace dvo {
     const std::vector<nlohmann::json>& replayed,
     std::uint32_t frame_samples);
 
+// Folds a replayed event stream into one record per keyword hit and one per
+// utterance (candidate span, ASR text, plan or rejection). Times are seconds
+// from origin_sample, i.e. offsets into the session's audio files when
+// origin_sample is the first replayed frame.
+[[nodiscard]] nlohmann::json summarize_replayed_utterances(
+    const std::vector<nlohmann::json>& events, std::uint64_t origin_sample);
+
 }  // namespace dvo

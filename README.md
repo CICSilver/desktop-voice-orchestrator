@@ -91,8 +91,13 @@ ctest --preset all
 ./build/windows-x64/Release/voice_frontend.exe list-devices
 ./build/windows-x64/Release/voice_frontend.exe live
 ./build/windows-x64/Release/voice_frontend.exe replay data/sessions/<session>
-./build/windows-x64/Release/voice_frontend.exe benchmark data/sessions/<session>
+./build/windows-x64/Release/voice_frontend.exe benchmark data/sessions/<session> [--events=<file.ndjson>]
+./build/windows-x64/Release/voice_frontend.exe evaluate data/sessions [--out=<report.json>]
 ```
+
+识别效果用带标注的录音量化：在调试台右上角打开“采集评估数据”，按提示录几组（安静/音乐 × 近/远，
+前置/后置唤醒），再运行 `evaluate`，得到分环境、分唤醒位置的唤醒召回、命令正确率、截断和误唤醒统计，
+并区分漏唤醒是流水线问题还是模型/声学问题。流程和指标定义见 [`docs/EVALUATION.md`](docs/EVALUATION.md)。
 
 `live` 会打印带临时访问令牌的本机地址并打开调试台。服务只绑定 `127.0.0.1:8765`。
 命令卡会显示当前激活状态、按样本时间计算的空闲/总时长倒计时以及最近一次播报。当前
@@ -178,6 +183,7 @@ AEC、流式识别、命令语法和执行边界见
 
 - [项目计划](docs/PROJECT_PLAN.md)
 - [系统架构](docs/ARCHITECTURE.md)
+- [识别评估：采集、指标与标注格式](docs/EVALUATION.md)
 - [ADR-0001：软件 AEC 优先](docs/adr/0001-software-aec-first.md)
 - [ADR-0002：开放词表 KWS 与录音校准](docs/adr/0002-open-vocabulary-kws.md)
 

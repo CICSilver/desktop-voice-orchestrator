@@ -925,6 +925,21 @@ std::unique_ptr<IStreamingRecognizer> create_streaming_recognizer(
       std::move(engine_loader));
 }
 
+std::unique_ptr<IOnlineAsrEngine> create_online_asr_engine(
+    const StreamingRecognizerConfig& config) {
+  if (const auto invalid = validate_common_config(config); !invalid.empty()) {
+    throw std::invalid_argument(invalid);
+  }
+  if (const auto missing = missing_model_reason(config); !missing.empty()) {
+    throw std::runtime_error(missing);
+  }
+#if DVO_HAS_SHERPA
+  return std::make_unique<SherpaOnlineParaformerEngine>(config);
+#else
+  throw std::runtime_error("built without sherpa-onnx");
+#endif
+}
+
 const char* to_string(RecognitionResultKind kind) noexcept {
   switch (kind) {
     case RecognitionResultKind::started: return "started";

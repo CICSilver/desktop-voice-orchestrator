@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>评估数据采集</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/collect.css">
+</head>
+<body class="collect">
+  <header class="topbar">
+    <div><p class="eyebrow">DESKTOP VOICE ORCHESTRATOR</p><h1>评估数据采集</h1></div>
+    <div class="status-cluster">
+      <span id="connection" class="pill offline">离线</span>
+      <span id="dry-run" class="pill">系统动作：未知</span>
+      <span id="recording" class="record-indicator" role="status" aria-live="polite">
+        <i></i><span id="recording-label">未录制</span>
+      </span>
+    </div>
+  </header>
+
+  <main class="collect-main">
+    <section id="setup" class="panel stage">
+      <p class="section-label">SETUP</p>
+      <h2>采集一批带标注的测试录音</h2>
+      <p class="lead">
+        每组会录成一个独立的会话。每条会先倒计时，然后显示要说的话；照着念完，按
+        <kbd>空格</kbd> 进入下一条。说错了按 <kbd>R</kbd> 重录这一条。
+        全部结束后，用 <code>voice_frontend.exe evaluate</code> 统计唤醒率、命令正确率和截断情况。
+      </p>
+      <div class="setup-grid">
+        <label>说话人代号
+          <input id="speaker" type="text" maxlength="32" value="录制者">
+          <small>换人录时改成别的代号，例如“访客1”。不要填真实姓名。</small>
+        </label>
+        <label>唤醒词
+          <output id="wake-word">读取中…</output>
+          <small>来自 config/keywords.txt，提示词里的唤醒词会用它替换。</small>
+        </label>
+      </div>
+      <fieldset class="group-list">
+        <legend>要录的组</legend>
+        <div id="groups"></div>
+      </fieldset>
+      <label class="check"><input id="use-dry-run" type="checkbox" checked>
+        采集期间停用系统动作（推荐：否则“暂停音乐”会真的把音乐停掉）</label>
+      <div class="stage-actions">
+        <span id="setup-message" class="control-message-inline"></span>
+        <button id="start-collection" class="primary" disabled>开始</button>
+      </div>
+    </section>
+
+    <section id="group-intro" class="panel stage" hidden>
+      <p class="section-label" id="intro-progress">GROUP</p>
+      <h2 id="intro-title"></h2>
+      <p class="lead" id="intro-text"></p>
+      <div class="meters">
+        <div class="meter"><span>麦克风</span><div class="bar"><i id="intro-mic-bar"></i></div><b id="intro-mic-db">— dBFS</b></div>
+        <div class="meter"><span>音箱输出</span><div class="bar"><i id="intro-loop-bar"></i></div><b id="intro-loop-db">— dBFS</b></div>
+      </div>
+      <p id="intro-check" class="condition-check"></p>
+      <div class="stage-actions">
+        <button id="finish-early">结束采集</button>
+        <button id="start-group" class="primary">开始本组录制 <kbd>Enter</kbd></button>
+      </div>
+    </section>
+
+    <section id="take" class="panel stage take-stage" hidden>
+      <div class="take-head">
+        <span id="take-progress" class="pill"></span>
+        <span id="take-group" class="take-group"></span>
+        <span id="take-kind" class="pill"></span>
+      </div>
+      <div class="progress"><i id="take-progress-bar"></i></div>
+      <p id="take-countdown" class="countdown"></p>
+      <p id="take-prompt" class="prompt"></p>
+      <p id="take-note" class="take-note"></p>
+      <div class="meter take-meter"><span>麦克风</span><div class="bar"><i id="take-mic-bar"></i></div><b id="take-mic-db">— dBFS</b></div>
+      <div class="stage-actions">
+        <button id="abort-group">放弃本组 <kbd>Esc</kbd></button>
+        <button id="skip-take">跳过 <kbd>S</kbd></button>
+        <button id="redo-take">重录这条 <kbd>R</kbd></button>
+        <button id="next-take" class="primary">说完了，下一条 <kbd>空格</kbd></button>
+      </div>
+    </section>
+
+    <section id="group-done" class="panel stage" hidden>
+      <p class="section-label">SAVED</p>
+      <h2 id="done-title"></h2>
+      <p class="lead" id="done-text"></p>
+      <div class="stage-actions">
+        <button id="finish-now">结束采集</button>
+        <button id="next-group" class="primary">下一组 <kbd>Enter</kbd></button>
+      </div>
+    </section>
+
+    <section id="finished" class="panel stage" hidden>
+      <p class="section-label">DONE</p>
+      <h2>采集完成</h2>
+      <ul id="saved-list" class="saved-list"></ul>
+      <p class="lead">在项目根目录运行下面的命令，就能得到统计结果（逐条明细写在每个会话的 <code>evaluation.json</code> 里）：</p>
+      <pre id="evaluate-command" class="command-line"></pre>
+      <div class="stage-actions">
+        <button id="restart" class="primary">再录一轮</button>
+      </div>
+    </section>
+
+    <output id="message" class="collect-message" role="status" aria-live="polite"></output>
+  </main>
+  <script src="/collect.js"></script>
+</body>
+</html>

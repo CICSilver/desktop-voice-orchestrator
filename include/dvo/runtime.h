@@ -44,7 +44,17 @@ class VoiceFrontendRuntime {
   void start_live(bool enable_web = true);
   void start_replay(const std::filesystem::path& session, bool enable_web = true,
                     double speed = 1.0);
+  struct BenchmarkRun {
+    nlohmann::json metrics;
+    // Every event emitted while the session was replayed, in emission order.
+    std::vector<nlohmann::json> events;
+    // Processing-clock sample of the first replayed frame; subtract it to get
+    // an offset into the session's audio files.
+    std::uint64_t first_frame_sample{};
+  };
   [[nodiscard]] nlohmann::json run_benchmark(const std::filesystem::path& session);
+  [[nodiscard]] BenchmarkRun run_benchmark_detailed(
+      const std::filesystem::path& session);
   void stop();
   [[nodiscard]] bool running() const { return running_.load(std::memory_order_acquire); }
   [[nodiscard]] std::string debug_url() const { return debug_.url(); }
@@ -133,6 +143,13 @@ class VoiceFrontendRuntime {
   [[nodiscard]] nlohmann::json session_list() const;
   [[nodiscard]] std::optional<DebugServer::FileResource>
   session_audio_resource(const nlohmann::json& request) const;
+  [[nodiscard]] nlohmann::json save_session_labels(const nlohmann::json& request) const;
+  [[nodiscard]] std::vector<std::string> configured_wake_words() const;
+  // Replay dispatch gate: holds each packet until the ASR model has loaded
+  // and, at analysis speed, until the pipeline has consumed the previous
+  // packet and ASR has delivered every queued result. This makes analysis
+  // replays independent of worker-thread scheduling.
+  void wait_for_replay_dispatch(double speed, std::stop_token stop);
   [[nodiscard]] nlohmann::json metrics_json() const;
   [[nodiscard]] PreprocessDiagnostics preprocess_diagnostics_snapshot() const;
   [[nodiscard]] static SignalSummary summarize(std::span<const float> values);
@@ -249,6 +266,10 @@ class VoiceFrontendRuntime {
   // Enabled only by run_benchmark(). Events are copied here before the debug
   // broker takes ownership so a headless benchmark can compare derived output
   // without depending on a WebSocket client or diagnostic recording.
+  // Evaluation recordings disable live system actions so that, for example,
+  // a spoken "暂停音乐" does not stop the music the take is being recorded over.
+  std::atomic<bool> live_dry_run_{};
+  std::optional<std::uint64_t> first_frame_sample_;
   std::atomic<bool> benchmark_capture_enabled_{};
   mutable std::mutex benchmark_events_mutex_;
   std::vector<nlohmann::json> benchmark_events_;

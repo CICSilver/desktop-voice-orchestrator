@@ -20,10 +20,16 @@ class ReplayController {
  public:
   using PacketCallback = std::function<void(AudioPacket)>;
   using StateCallback = std::function<void(nlohmann::json)>;
+  // Invoked on the replay thread immediately before each packet is handed to
+  // PacketCallback, with the effective dispatch speed (0 = analysis speed,
+  // also used while seeking). A gate may block until downstream consumers
+  // catch up; it must return promptly once the stop token is signalled.
+  using DispatchGate = std::function<void(double speed, std::stop_token stop)>;
   explicit ReplayController(PacketCallback callback,
                             StateCallback state_callback = {});
   ~ReplayController();
 
+  void set_dispatch_gate(DispatchGate gate);
   void open(const std::filesystem::path& session);
   void play();
   void pause();
@@ -58,6 +64,7 @@ class ReplayController {
 
   PacketCallback callback_;
   StateCallback state_callback_;
+  DispatchGate dispatch_gate_;
   mutable std::mutex mutex_;
   std::condition_variable cv_;
   std::jthread thread_;

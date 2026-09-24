@@ -418,6 +418,9 @@ function handle(message) {
     const mode = payload.mode === 'replay' ? 'replay' : 'live';
     setActiveMode(mode, mode !== state.activeMode);
     addEvent(message);
+  } else if (type === 'live_dry_run_state') {
+    $('dry-run-state').hidden = !payload.enabled;
+    addEvent(message);
   } else if (type === 'replay_state') {
     const replayTransition =
       Boolean(payload.playing) !== state.replayPlaying ||
@@ -1041,6 +1044,7 @@ for (const id of ['waveform', 'aec-band', 'vad', 'kws']) installTimelineDrag($(i
 
 syncViewControls();
 setActiveMode('live');
+$('collect-link').href = `/collect.html?token=${encodeURIComponent(token)}`;
 connect();
 draw();
 setInterval(updateRecordingControls, 500);

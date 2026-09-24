@@ -443,6 +443,7 @@ void VoiceFrontendRuntime::initialize_pipeline() {
   telemetry_enabled_.store(false, std::memory_order_release);
   next_telemetry_sample_ = 0;
   view_sample_origin_.reset();
+  first_frame_sample_.reset();
 }
 
 void VoiceFrontendRuntime::reset_audio_queues() {
@@ -503,6 +504,9 @@ void VoiceFrontendRuntime::start_replay(const std::filesystem::path& session, bo
       [this](nlohmann::json state) {
         emit_event("replay_state", std::move(state), 0, "replay");
       });
+  replay_->set_dispatch_gate([this](double gate_speed, std::stop_token stop) {
+    wait_for_replay_dispatch(gate_speed, stop);
+  });
   replay_->open(session);
   replay_->set_speed(speed);
   replay_->play();
@@ -516,7 +520,44 @@ void VoiceFrontendRuntime::start_replay(const std::filesystem::path& session, bo
   emit_event("sessions", session_list(), 0, "replay");
 }
 
+void VoiceFrontendRuntime::wait_for_replay_dispatch(double speed,
+                                                    std::stop_token stop) {
+  // ASR loads asynchronously after every pipeline initialization. Audio
+  // replayed before it is ready reaches exact-final decoding only after later
+  // keyword hits may already have cancelled its recognition generation.
+  while (!stop.stop_requested() && running() && asr_ &&
+         asr_->state() == StreamingRecognizerState::loading) {
+    (void)asr_->wait_until_loaded(std::chrono::milliseconds(50));
+  }
+  if (speed != 0.0) return;
+
+  // At analysis speed the replay thread would otherwise run far ahead of the
+  // ASR worker, so activation decisions (rearm, follow-up refresh) would see
+  // results much later in audio time than a live run does. Hold each packet
+  // until the previous one has been consumed and every queued recognition
+  // result has been delivered. The deadline only guards against a stalled
+  // consumer; a healthy pipeline drains in well under a millisecond.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!stop.stop_requested() && running() &&
+         std::chrono::steady_clock::now() < deadline) {
+    const bool drained =
+        microphone_queue_->size() == 0 && loopback_queue_->size() == 0 &&
+        (!candidate_assembler_ || candidate_assembler_->outstanding() == 0) &&
+        (!microphone_candidate_assembler_ ||
+         microphone_candidate_assembler_->outstanding() == 0) &&
+        (!asr_ || asr_->pending_requests() == 0);
+    if (drained) return;
+    std::this_thread::yield();
+  }
+}
+
 nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& session) {
+  return run_benchmark_detailed(session).metrics;
+}
+
+VoiceFrontendRuntime::BenchmarkRun VoiceFrontendRuntime::run_benchmark_detailed(
+    const std::filesystem::path& session) {
   {
     std::scoped_lock lock(benchmark_events_mutex_);
     benchmark_events_.clear();
@@ -604,8 +645,14 @@ nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& 
   metrics["comparison"]["historical_events_available"] =
       std::filesystem::exists(session / "events.ndjson");
   metrics["comparison"]["event_read_errors"] = event_read_errors;
+  // stop() joins the processing thread, which is the only writer of
+  // first_frame_sample_ (it may still be running if the replay timed out).
   stop();
-  return metrics;
+  const auto first_frame_sample = first_frame_sample_.value_or(0);
+  metrics["replay_first_frame_sample"] = first_frame_sample;
+  metrics["utterances"] =
+      summarize_replayed_utterances(replayed_events, first_frame_sample);
+  return {std::move(metrics), std::move(replayed_events), first_frame_sample};
 }
 
 void VoiceFrontendRuntime::start_processing() {
@@ -966,6 +1013,7 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
                                          const SignalSummary& microphone,
                                          const SignalSummary& loopback) {
   if (!view_sample_origin_) view_sample_origin_ = frame.first_sample;
+  if (!first_frame_sample_) first_frame_sample_ = frame.first_sample;
   ring_->push(frame.first_sample, frame.samples);
   processed_frames_.fetch_add(1, std::memory_order_relaxed);
   if (recorder_.active()) recorder_.try_enqueue(frame);
@@ -1920,7 +1968,9 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
   context.source =
       source == "live" ? ExecutionSource::live : ExecutionSource::replay;
   context.execution_mode =
-      source == "live" ? ExecutionMode::live : ExecutionMode::dry_run;
+      source == "live" && !live_dry_run_.load(std::memory_order_acquire)
+          ? ExecutionMode::live
+          : ExecutionMode::dry_run;
 
   std::string parse_stage{"precondition"};
   bool parse_debug_emitted{};
@@ -2448,6 +2498,8 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
                                   {"latest_announcement", latest_announcement}},
                activation_sample, mode);
     if (replay_) emit_event("replay_state", replay_->state(), 0, "replay");
+    emit_event("live_dry_run_state",
+               {{"enabled", live_dry_run_.load(std::memory_order_acquire)}});
     return {{"ok", true}, {"metrics", metrics_json()},
             {"activation_state", std::move(activation_state)},
             {"latest_announcement", std::move(latest_announcement)}};
@@ -2551,7 +2603,8 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
                 {"session", path.string()},
                 {"started_at_ms", recorder_.started_at_unix_ms()},
                 {"incomplete", false}});
-    return {{"ok", true}, {"session", path.string()}};
+    return {{"ok", true}, {"session", path.string()},
+            {"started_at_ms", recorder_.started_at_unix_ms()}};
   }
   if (action == "recording.stop") {
     if (!recorder_.active()) {
@@ -2565,6 +2618,26 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
                 {"incomplete", recorder_.incomplete()}});
     emit_event("sessions", session_list());
     return {{"ok", true}};
+  }
+  if (action == "recording.save_labels") {
+    return save_session_labels(command);
+  }
+  if (action == "commands.live_dry_run") {
+    const auto enabled_it = command.find("enabled");
+    if (enabled_it == command.end() || !enabled_it->is_boolean()) {
+      return {{"ok", false}, {"error", "enabled must be a boolean"}};
+    }
+    live_dry_run_.store(enabled_it->get<bool>(), std::memory_order_release);
+    emit_event("live_dry_run_state", {{"enabled", enabled_it->get<bool>()}});
+    return {{"ok", true}, {"enabled", enabled_it->get<bool>()}};
+  }
+  if (action == "evaluation.info") {
+    return {{"ok", true},
+            {"wake_words", configured_wake_words()},
+            {"live_dry_run", live_dry_run_.load(std::memory_order_acquire)},
+            {"recording_active", recorder_.active()},
+            {"mode", replay_mode_.load(std::memory_order_acquire) ? "replay"
+                                                                   : "live"}};
   }
   if (action == "config.apply") {
     AppConfig candidate;
@@ -2888,6 +2961,10 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
           [this](nlohmann::json state) {
             emit_event("replay_state", std::move(state), 0, "replay");
           });
+      replay_->set_dispatch_gate(
+          [this](double gate_speed, std::stop_token stop) {
+            wait_for_replay_dispatch(gate_speed, stop);
+          });
     }
     replay_->open(session);
     emit_event("runtime_mode", {{"mode", "replay"}, {"session", session.string()}}, 0, "replay");
@@ -2956,6 +3033,80 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     return {{"ok", true}};
   }
   return {{"ok", false}, {"error", "unknown or unavailable action: " + action}};
+}
+
+nlohmann::json VoiceFrontendRuntime::save_session_labels(
+    const nlohmann::json& request) const {
+  const auto labels = request.find("labels");
+  if (labels == request.end() || !labels->is_object() ||
+      labels->value("schema", "") != "dvo-eval-labels") {
+    return {{"ok", false}, {"error", "labels must be a dvo-eval-labels object"}};
+  }
+  const auto serialized = labels->dump(2);
+  if (serialized.size() > 1'000'000) {
+    return {{"ok", false}, {"error", "labels are too large"}};
+  }
+  std::filesystem::path session_root;
+  {
+    std::scoped_lock config_lock(config_mutex_);
+    session_root = config_.recording.session_root;
+  }
+  std::error_code path_error;
+  const auto canonical_root =
+      std::filesystem::weakly_canonical(session_root, path_error);
+  if (path_error) return {{"ok", false}, {"error", "recording root is unavailable"}};
+  // Only the directory name is taken from the client; the root is ours.
+  const auto name =
+      std::filesystem::path(request.value("session", "")).filename().string();
+  if (!valid_session_name(name)) {
+    return {{"ok", false}, {"error", "invalid session name"}};
+  }
+  const auto session = canonical_root / name;
+  if (recorder_.active() &&
+      std::filesystem::weakly_canonical(recorder_.session_path(), path_error) ==
+          session) {
+    return {{"ok", false}, {"error", "stop the recording before saving labels"}};
+  }
+  if (!inspect_session_directory(session)) {
+    return {{"ok", false}, {"error", "session has no replayable audio"}};
+  }
+  const auto target = session / "labels.json";
+  const auto temporary = session / "labels.json.tmp";
+  {
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    output << serialized << '\n';
+    if (!output) return {{"ok", false}, {"error", "labels could not be written"}};
+  }
+  std::filesystem::rename(temporary, target, path_error);
+  if (path_error) {
+    std::filesystem::remove(temporary, path_error);
+    return {{"ok", false}, {"error", "labels could not be written"}};
+  }
+  return {{"ok", true}, {"path", target.string()}};
+}
+
+std::vector<std::string> VoiceFrontendRuntime::configured_wake_words() const {
+  std::filesystem::path keywords;
+  {
+    std::scoped_lock config_lock(config_mutex_);
+    keywords = config_.kws.keywords;
+  }
+  // sherpa keyword lines look like "x iǎo zh ù sh ǒu :1.5 #0.3 @小助手"; the
+  // display phrase follows '@'. Lines without one cannot be shown to a user.
+  std::vector<std::string> result;
+  std::ifstream input(keywords, std::ios::binary);
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto at = line.find('@');
+    if (at == std::string::npos) continue;
+    auto phrase = line.substr(at + 1);
+    while (!phrase.empty() &&
+           (phrase.back() == '\r' || phrase.back() == ' ' || phrase.back() == '\t')) {
+      phrase.pop_back();
+    }
+    if (!phrase.empty()) result.push_back(std::move(phrase));
+  }
+  return result;
 }
 
 nlohmann::json VoiceFrontendRuntime::session_list() const {
