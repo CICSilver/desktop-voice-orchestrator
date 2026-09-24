@@ -328,6 +328,27 @@ std::optional<nlohmann::json> inspect_session_directory(
       {"streams", std::move(streams)}};
 }
 
+// sherpa keyword lines look like "x iao zh u sh ou :1.5 #0.3 @<phrase>"; the
+// display phrase follows '@'. Lines without one cannot be shown to a user.
+std::vector<std::string> read_wake_words(const std::filesystem::path& keywords) {
+  std::vector<std::string> result;
+  std::ifstream input(keywords, std::ios::binary);
+  std::string line;
+  while (std::getline(input, line)) {
+    const auto at = line.find('@');
+    if (at == std::string::npos) continue;
+    auto phrase = line.substr(at + 1);
+    while (!phrase.empty() &&
+           (phrase.back() == '\r' || phrase.back() == ' ' || phrase.back() == '\t')) {
+      phrase.pop_back();
+    }
+    if (!phrase.empty() && std::ranges::find(result, phrase) == result.end()) {
+      result.push_back(std::move(phrase));
+    }
+  }
+  return result;
+}
+
 }  // namespace
 
 CommandGrammar command_grammar(const CommandsConfig& config) {
@@ -352,6 +373,8 @@ VoiceFrontendRuntime::~VoiceFrontendRuntime() { stop(); }
 
 void VoiceFrontendRuntime::initialize_pipeline() {
   std::scoped_lock lock(pipeline_mutex_);
+  // The probe reads the rings replaced below.
+  wake_probe_.reset();
   runtime_session_id_ = make_runtime_session_id();
   const auto capacity = static_cast<std::size_t>(config_.ring.duration_ms) * kProcessingSampleRate / 1000;
   ring_ = std::make_unique<TimedRingBuffer>(capacity);
@@ -402,6 +425,22 @@ void VoiceFrontendRuntime::initialize_pipeline() {
         handle_recognition_result(std::move(result));
       });
   last_published_asr_state_ = asr_->state();
+  if (config_.kws.asr_probe && config_.asr.final_decoder != "streaming") {
+    auto wake_words = read_wake_words(config_.kws.keywords);
+    if (!wake_words.empty()) {
+      const FinalDecoderConfig decoder{config_.asr.final_decoder, config_.asr.final_model,
+                                       config_.asr.final_tokens};
+      const auto provider = config_.asr.provider;
+      const auto threads = config_.asr.num_threads;
+      const auto& probe_ring =
+          config_.kws.asr_probe_source == "aec" ? *ring_ : *microphone_ring_;
+      wake_probe_ = std::make_unique<WakeProbe>(
+          [decoder, provider, threads] {
+            return create_offline_asr_engine(decoder, provider, threads);
+          },
+          probe_ring, std::move(wake_words));
+    }
+  }
   {
     std::scoped_lock command_lock(command_mutex_);
     command_parser_ = std::make_shared<const CommandParser>(
@@ -555,7 +594,8 @@ void VoiceFrontendRuntime::wait_for_replay_dispatch(double speed,
         (!candidate_assembler_ || candidate_assembler_->outstanding() == 0) &&
         (!microphone_candidate_assembler_ ||
          microphone_candidate_assembler_->outstanding() == 0) &&
-        (!asr_ || asr_->pending_requests() == 0);
+        (!asr_ || asr_->pending_requests() == 0) &&
+        (!wake_probe_ || wake_probe_->idle());
     if (drained) return;
     std::this_thread::yield();
   }
@@ -775,6 +815,7 @@ void VoiceFrontendRuntime::stop() {
 }
 
 void VoiceFrontendRuntime::stop_async_services() {
+  wake_probe_.reset();
   if (candidate_assembler_) candidate_assembler_->stop();
   candidate_assembler_.reset();
   if (microphone_candidate_assembler_) {
@@ -1067,8 +1108,11 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
     followup_turns_.fetch_add(1, std::memory_order_relaxed);
     begin_recognition(*start);
   }
+  std::vector<VadInterval> probe_intervals;
   for (const auto& interval : vad_update.completed) {
-    if (!suppress_current_vad_interval_) segmenter_->add_vad_interval(interval);
+    if (suppress_current_vad_interval_) continue;
+    segmenter_->add_vad_interval(interval);
+    if (wake_probe_) probe_intervals.push_back(interval);
   }
   if (!vad_update.speech && !vad_update.completed.empty()) {
     suppress_current_vad_interval_ = false;
@@ -1086,6 +1130,14 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
     pending_microphone_keywords_.pop_front();
     process_keyword_hit(std::move(hit), capture_blocked,
                         processed_speech_present, "microphone_fallback");
+  }
+  // Probes are submitted after this frame's KWS hits so that speech the KWS
+  // already caught is never probed, and matches enter the keyword path
+  // before the segmenter advances.
+  if (wake_probe_) {
+    for (const auto& interval : probe_intervals) submit_wake_probe(interval);
+    WakeProbeResult probe;
+    while (wake_probe_->try_pop(probe)) handle_wake_probe(std::move(probe), frame_end);
   }
 
   feed_recognizers(frame);
@@ -1236,16 +1288,20 @@ void VoiceFrontendRuntime::process_keyword_hit(
   }
 
   const bool rearming = segmenter_->activation().active();
-  const bool use_microphone_audio =
+  const bool discontinuity_fallback =
       detector == "microphone_fallback" &&
       microphone_candidate_fallback_after_sample_ != 0 &&
       hit.detected_at_sample >= microphone_candidate_fallback_after_sample_;
+  // A probe-confirmed wake is recognized from the same stream the probe heard.
+  const bool probe_microphone =
+      detector == "asr_probe" && config_.kws.asr_probe_source == "microphone";
   if (auto start = segmenter_->add_kws_hit(std::move(hit))) {
-    if (use_microphone_audio) {
+    if (discontinuity_fallback || probe_microphone) {
       microphone_audio_activations_.insert(start->activation_id);
       emit_event("recognition_audio_fallback",
                  {{"activation_id", start->activation_id},
-                  {"reason", "aec_processed_stream_discontinuity"},
+                  {"reason", discontinuity_fallback ? "aec_processed_stream_discontinuity"
+                                                    : "asr_probe_source"},
                   {"audio_source", "microphone"}},
                  start->trigger_sample,
                  replay_mode_ ? "replay" : "live");
@@ -1260,6 +1316,64 @@ void VoiceFrontendRuntime::process_keyword_hit(
     }
     begin_recognition(*start);
   }
+}
+
+void VoiceFrontendRuntime::submit_wake_probe(const VadInterval& interval) {
+  // Speech inside an activation is already a follow-up turn.
+  if (segmenter_->activation().active()) return;
+  const auto length = interval.span.end - interval.span.start;
+  constexpr std::uint64_t kMinimumProbeSamples = kProcessingSampleRate * 2 / 5;
+  if (length < kMinimumProbeSamples ||
+      length > static_cast<std::uint64_t>(config_.kws.asr_probe_max_ms) *
+                   kProcessingSampleRate / 1000) {
+    return;
+  }
+  // Speech that produced a keyword hit belongs to the keyword path.
+  constexpr std::uint64_t kKeywordGuardSamples = kProcessingSampleRate / 2;
+  if (last_runtime_keyword_sample_ != 0 &&
+      last_runtime_keyword_sample_ + kKeywordGuardSamples >= interval.span.start) {
+    return;
+  }
+  constexpr std::uint64_t kMarginSamples = kProcessingSampleRate * 3 / 10;
+  WakeProbeRequest request;
+  request.id = next_wake_probe_id_++;
+  request.speech = interval.span;
+  request.audio = {interval.span.start > kMarginSamples ? interval.span.start - kMarginSamples
+                                                         : 0,
+                   interval.span.end + kMarginSamples};
+  if (!wake_probe_->try_submit(request)) {
+    emit_event("wake_probe_dropped", {{"reason", "probe queue is full"},
+                                      {"speech", span_json(interval.span)}},
+               interval.span.end, replay_mode_ ? "replay" : "live");
+  }
+}
+
+void VoiceFrontendRuntime::handle_wake_probe(WakeProbeResult result,
+                                             std::uint64_t frame_end) {
+  const bool replay = replay_mode_.load(std::memory_order_acquire);
+  auto payload = nlohmann::json{{"probe_id", result.id},
+                                {"matched", result.matched},
+                                {"exact", result.exact},
+                                {"speech", span_json(result.speech)},
+                                {"decode_ms", result.decode_ms}};
+  if (!result.error.empty()) payload["error"] = result.error;
+  // Probes decode ordinary conversation; its text is published only when a
+  // recorded session is replayed, never for live audio.
+  if (replay) payload["text"] = result.text;
+  const bool superseded =
+      result.matched &&
+      (segmenter_->activation().active() ||
+       (last_runtime_keyword_sample_ != 0 &&
+        last_runtime_keyword_sample_ + kProcessingSampleRate / 2 >= result.speech.start));
+  payload["superseded"] = superseded;
+  emit_event("wake_probe", std::move(payload), frame_end, replay ? "replay" : "live");
+  if (!result.matched || superseded || !result.wake_span) return;
+
+  KwsHit hit;
+  hit.keyword = result.keyword;
+  hit.wake_span = *result.wake_span;
+  hit.detected_at_sample = frame_end;
+  process_keyword_hit(std::move(hit), false, true, "asr_probe");
 }
 
 bool VoiceFrontendRuntime::drain_audio_assemblies() {
@@ -2422,6 +2536,7 @@ void VoiceFrontendRuntime::reset_pipeline(bool discontinuity,
   if (microphone_candidate_assembler_) {
     microphone_candidate_assembler_->cancel_pending();
   }
+  if (wake_probe_) wake_probe_->clear();
   const auto next = ring_ ? ring_->tail() : 0;
   if (ring_) ring_->reset(next);
   if (preprocessor_ && discontinuity && reset_preprocessor) preprocessor_->reset();
@@ -3124,22 +3239,7 @@ std::vector<std::string> VoiceFrontendRuntime::configured_wake_words() const {
     std::scoped_lock config_lock(config_mutex_);
     keywords = config_.kws.keywords;
   }
-  // sherpa keyword lines look like "x iǎo zh ù sh ǒu :1.5 #0.3 @小助手"; the
-  // display phrase follows '@'. Lines without one cannot be shown to a user.
-  std::vector<std::string> result;
-  std::ifstream input(keywords, std::ios::binary);
-  std::string line;
-  while (std::getline(input, line)) {
-    const auto at = line.find('@');
-    if (at == std::string::npos) continue;
-    auto phrase = line.substr(at + 1);
-    while (!phrase.empty() &&
-           (phrase.back() == '\r' || phrase.back() == ' ' || phrase.back() == '\t')) {
-      phrase.pop_back();
-    }
-    if (!phrase.empty()) result.push_back(std::move(phrase));
-  }
-  return result;
+  return read_wake_words(keywords);
 }
 
 nlohmann::json VoiceFrontendRuntime::session_list() const {

@@ -152,6 +152,9 @@ AppConfig ConfigStore::load() const {
   c.kws.num_trailing_blanks = read<std::int64_t>(table, "kws.num_trailing_blanks", 1);
   c.kws.boosting_score = read<double>(table, "kws.boosting_score", 1.0);
   c.kws.threshold = read<double>(table, "kws.threshold", 0.25);
+  c.kws.asr_probe = read<bool>(table, "kws.asr_probe", false);
+  c.kws.asr_probe_source = read<std::string>(table, "kws.asr_probe_source", "microphone");
+  c.kws.asr_probe_max_ms = read<std::int64_t>(table, "kws.asr_probe_max_ms", 8000);
 
   c.vad.enabled = read<bool>(table, "vad.enabled", true);
   c.vad.model = resolve(project_root_, read_path(table, "vad.model", {}));
@@ -289,6 +292,12 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
   range(c.ring.duration_ms >= 1000 && c.ring.duration_ms <= 120000,
         "ring.duration_ms must be in [1000, 120000]");
   range(c.kws.threshold >= 0.0F && c.kws.threshold <= 1.0F, "kws.threshold must be in [0, 1]");
+  range(!c.kws.asr_probe || c.asr.final_decoder != "streaming",
+        "kws.asr_probe requires an offline asr.final_decoder");
+  range(c.kws.asr_probe_source == "microphone" || c.kws.asr_probe_source == "aec",
+        "kws.asr_probe_source must be 'microphone' or 'aec'");
+  range(c.kws.asr_probe_max_ms >= 1000 && c.kws.asr_probe_max_ms <= 20000,
+        "kws.asr_probe_max_ms must be in [1000, 20000]");
   range(c.kws.boosting_score >= 0.0F && c.kws.boosting_score <= 20.0F,
         "kws.boosting_score must be in [0, 20]");
   range(c.kws.num_threads >= 1 && c.kws.num_threads <= 16, "kws.num_threads must be in [1, 16]");
@@ -412,6 +421,7 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                {"missing_render_policy", c.aec.missing_render_policy},
                {"stats_hz", c.aec.stats_hz}}},
       {"kws", {{"threshold", c.kws.threshold}, {"boosting_score", c.kws.boosting_score},
+               {"asr_probe", c.kws.asr_probe},
                {"max_active_paths", c.kws.max_active_paths}, {"num_threads", c.kws.num_threads},
                {"provider", c.kws.provider}, {"encoder", c.kws.encoder.string()},
                {"decoder", c.kws.decoder.string()}, {"joiner", c.kws.joiner.string()},
@@ -516,7 +526,9 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                {"keywords", c.kws.keywords.string()}, {"provider", c.kws.provider},
                {"num_threads", c.kws.num_threads}, {"max_active_paths", c.kws.max_active_paths},
                {"num_trailing_blanks", c.kws.num_trailing_blanks},
-               {"boosting_score", c.kws.boosting_score}, {"threshold", c.kws.threshold}}},
+               {"boosting_score", c.kws.boosting_score}, {"threshold", c.kws.threshold},
+               {"asr_probe", c.kws.asr_probe}, {"asr_probe_source", c.kws.asr_probe_source},
+               {"asr_probe_max_ms", c.kws.asr_probe_max_ms}}},
       {"vad", {{"enabled", c.vad.enabled}, {"model", c.vad.model.string()},
                {"provider", c.vad.provider}, {"num_threads", c.vad.num_threads},
                {"threshold", c.vad.threshold}, {"window_size", c.vad.window_size},

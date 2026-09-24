@@ -37,11 +37,12 @@ const COMMANDS = [
   {key: 'pre-open', position: 'prefix', say: '{W}，打开音乐', actions: [PLAY]}
 ];
 
-// Negatives wait out the 6 s follow-up window first, otherwise a correct
+// Negatives wait out the follow-up window first (6 s idle after the previous
+// command finishes processing, plus endpointing), otherwise a correct
 // follow-up would be scored as a false trigger.
 const NEGATIVES = [
-  {key: 'neg-command', kind: 'negative', say: '暂停音乐', note: '这条不要说唤醒词', gap_s: 7.5},
-  {key: 'neg-chat', kind: 'negative', say: '今天晚上吃点什么好呢', note: '这条不要说唤醒词', gap_s: 7.5}
+  {key: 'neg-command', kind: 'negative', say: '暂停音乐', note: '这条不要说唤醒词', gap_s: 9},
+  {key: 'neg-chat', kind: 'negative', say: '今天晚上吃点什么好呢', note: '这条不要说唤醒词', gap_s: 9}
 ];
 
 const DEFAULT_GAP_S = 2.5;

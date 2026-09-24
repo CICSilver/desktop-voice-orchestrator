@@ -243,3 +243,28 @@ TEST_CASE("missing characters that extension does not recover are model drops") 
   CHECK(report["takes"][0]["utterances"][0]["reference"]["text_tail_extended"] ==
         "小助手暂停音");
 }
+
+TEST_CASE("plans on negative takes are split into false executions and follow-ups") {
+  auto document = labels_document();
+  document["takes"] = nlohmann::json::array(
+      {take("n1", "negative", "暂停音乐", "none", nlohmann::json::array(), 1.0, 4.0),
+       take("n2", "negative", "暂停音乐", "none", nlohmann::json::array(), 6.0, 9.0)});
+  const auto labels = dvo::parse_evaluation_labels(document);
+  auto followup = utterance("f1", 1.5, 3.5, "暂停音乐", "plan",
+                            nlohmann::json::array({{{"type", "media.pause"},
+                                                    {"volume_delta_percent", nullptr}}}));
+  followup["origin"] = "followup";
+  auto keyword = utterance("k1", 6.5, 8.5, "暂停音乐", "plan",
+                           nlohmann::json::array({{{"type", "media.pause"},
+                                                   {"volume_delta_percent", nullptr}}}));
+  const nlohmann::json summary{{"keyword_hits", nlohmann::json::array()},
+                               {"utterances", nlohmann::json::array({followup, keyword})}};
+  dvo::SessionReference reference;
+  reference.takes.resize(2);
+
+  const auto report = dvo::evaluate_labeled_session(labels, summary, reference);
+  CHECK(report["takes"][0]["verdict"] == "followup_in_window");
+  CHECK(report["takes"][1]["verdict"] == "false_plan");
+  CHECK(report["summary"]["negatives"]["false_plans"] == 1);
+  CHECK(report["summary"]["negatives"]["followup_plans"] == 1);
+}

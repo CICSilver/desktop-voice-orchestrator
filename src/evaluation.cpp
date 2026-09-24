@@ -25,6 +25,10 @@ constexpr double kRate = 16000.0;
 // candidate end-pointing may land shortly after the user moves on.
 constexpr double kSlackBefore = 0.2;
 constexpr double kSlackAfter = 0.8;
+// A wake hit's estimated end can trail the take: the VAD segment may include
+// the key press that ended it, and a probe hit sits at the segment end. Takes
+// are at least 2.5 s apart and nobody speaks within 0.1 s of a new prompt.
+constexpr double kHitSlackAfter = 2.4;
 // Reference decodes see a little context around the window.
 constexpr double kReferencePadBefore = 0.3;
 constexpr double kReferencePadAfter = 0.8;
@@ -580,7 +584,7 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
     double best_distance = std::numeric_limits<double>::max();
     for (std::size_t index = 0; index < takes.size(); ++index) {
       const auto& take = takes[index];
-      if (time < take.start_s - kSlackBefore || time > take.end_s + kSlackAfter) continue;
+      if (time < take.start_s - kSlackBefore || time > take.end_s + kHitSlackAfter) continue;
       const auto distance = time < take.start_s ? take.start_s - time : time - take.end_s;
       if (distance < best_distance) {
         best_distance = distance;
@@ -623,10 +627,12 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
                              {"correct", 0U}, {"wrong_actions", 0U}, {"rejected", 0U},
                              {"no_asr", 0U}, {"candidate_rejected", 0U}, {"no_candidate", 0U},
                              {"no_wake", 0U}, {"tail_cut", 0U}, {"head_cut", 0U},
+                             {"followup_covered", 0U},
                              {"asr_drop", 0U},
                              {"music_takes", 0U}};
   nlohmann::json by_position = nlohmann::json::object();
   nlohmann::json negatives = {{"total", 0U}, {"false_wakes", 0U}, {"false_plans", 0U},
+                              {"followup_plans", 0U},
                               {"duration_s", 0.0}};
   auto results = nlohmann::json::array();
 
@@ -703,12 +709,25 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
     if (take.kind != "command") {
       negatives["total"] = counter(negatives, "total") + 1;
       negatives["duration_s"] = negatives.value("duration_s", 0.0) + (take.end_s - take.start_s);
-      const bool false_plan = !actions.empty();
+      // Speech inside a still-open activation window is a follow-up turn by
+      // design; only a plan that needed a wake word here is a false execution.
+      bool keyword_plan{};
+      bool followup_plan{};
+      for (const auto& utterance : utterance_results) {
+        if (utterance.value("outcome", "") != "plan") continue;
+        (utterance.value("origin", "") == "followup" ? followup_plan : keyword_plan) = true;
+      }
       if (detected) negatives["false_wakes"] = counter(negatives, "false_wakes") + 1;
-      if (false_plan) negatives["false_plans"] = counter(negatives, "false_plans") + 1;
+      if (keyword_plan) negatives["false_plans"] = counter(negatives, "false_plans") + 1;
+      if (followup_plan && !keyword_plan) {
+        negatives["followup_plans"] = counter(negatives, "followup_plans") + 1;
+      }
       result["wake"] = {{"detected", detected}, {"detectors", detectors},
                         {"verdict", detected ? "false_wake" : "none"}};
-      result["verdict"] = false_plan ? "false_plan" : detected ? "false_wake" : "ok";
+      result["verdict"] = keyword_plan    ? "false_plan"
+                          : detected      ? "false_wake"
+                          : followup_plan ? "followup_in_window"
+                                          : "ok";
       results.push_back(std::move(result));
       continue;
     }
@@ -726,11 +745,22 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
     if (ref.kws_processed) {
       commands["reference_kws_processed"] = counter(commands, "reference_kws_processed") + 1;
     }
+    // A command said while the previous command's activation window was still
+    // open needs no wake word; it is not a wake miss.
+    const bool followup_covered =
+        !detected && !utterance_results.empty() &&
+        std::ranges::all_of(utterance_results, [](const nlohmann::json& utterance) {
+          return utterance.value("origin", "") == "followup";
+        });
     std::string wake_verdict;
     if (detected) {
       wake_verdict = "detected";
       commands["wake_detected"] = counter(commands, "wake_detected") + 1;
       position["wake_detected"] = counter(position, "wake_detected") + 1;
+    } else if (followup_covered) {
+      wake_verdict = "followup";
+      commands["followup_covered"] = counter(commands, "followup_covered") + 1;
+      position["followup_covered"] = counter(position, "followup_covered") + 1;
     } else if (suppressed) {
       wake_verdict = "suppressed";
       commands["wake_suppressed"] = counter(commands, "wake_suppressed") + 1;
@@ -864,13 +894,19 @@ std::string format_evaluation_summary(const std::vector<nlohmann::json>& session
     const auto& positions = block.value("by_position", nlohmann::json::object());
     const auto& negatives = block.value("negatives", nlohmann::json::object());
     const auto total = counter(commands, "total");
-    out << "    唤醒召回    " << ratio(counter(commands, "wake_detected"), total);
+    // Recall counts only takes that needed a wake word.
+    out << "    唤醒召回    "
+        << ratio(counter(commands, "wake_detected"),
+                 total - counter(commands, "followup_covered"));
     for (const char* position : {"prefix", "suffix"}) {
       if (!positions.contains(position)) continue;
       const auto& part = positions[position];
       out << "   " << wake_position_label(position) << " "
-          << ratio(counter(part, "wake_detected"), counter(part, "total"));
+          << ratio(counter(part, "wake_detected"),
+                   counter(part, "total") - counter(part, "followup_covered"));
     }
+    out << "   （另有 " << counter(commands, "followup_covered")
+        << " 条落在上一条的激活窗口内，无需唤醒）";
     out << "\n    离线参考    麦克风 " << ratio(counter(commands, "reference_kws_microphone"), total)
         << "   AEC后 " << ratio(counter(commands, "reference_kws_processed"), total) << "\n";
     out << "    漏唤醒原因  流水线 " << counter(commands, "wake_missed_pipeline")
@@ -894,7 +930,8 @@ std::string format_evaluation_summary(const std::vector<nlohmann::json>& session
     out << "    误唤醒      " << counter(negatives, "false_wakes") << " 次 / "
         << counter(negatives, "total") << " 条负样本（"
         << format_fixed(negatives.value("duration_s", 0.0), 0) << " 秒）   误执行 "
-        << counter(negatives, "false_plans") << "\n";
+        << counter(negatives, "false_plans") << "   （激活窗口内按后续话语执行 "
+        << counter(negatives, "followup_plans") << "）\n";
   };
 
   out << "================ 评估汇总 ================\n";
@@ -913,7 +950,8 @@ std::string format_evaluation_summary(const std::vector<nlohmann::json>& session
   static const std::map<std::string, std::string> verdicts{
       {"wrong_actions", "动作不符"}, {"rejected", "解析拒绝"}, {"no_asr", "无识别结果"},
       {"candidate_rejected", "候选被丢弃"}, {"no_candidate", "唤醒了但没有候选"},
-      {"no_wake", "未唤醒"}, {"false_wake", "误唤醒"}, {"false_plan", "误执行"}};
+      {"no_wake", "未唤醒"}, {"false_wake", "误唤醒"}, {"false_plan", "误执行"},
+      {"followup_in_window", "落在上一条的连续激活窗口内，按后续话语执行"}};
   static const std::map<std::string, std::string> wakes{
       {"missed_pipeline", "漏唤醒（离线参考能检出 → 流水线问题）"},
       {"missed_model", "漏唤醒（离线参考也检不出 → 模型/声学问题）"},

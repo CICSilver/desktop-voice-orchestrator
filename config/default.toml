@@ -82,6 +82,13 @@ num_trailing_blanks = 1
 boosting_score = 1.0
 # 热：KWS命中阈值，范围0..1。
 threshold = 0.25
+# 冷：二级唤醒。未激活时，没有KWS命中的语音段交给整句识别模型（asr.final_decoder）检查是否含唤醒词；
+# 命中后走与KWS相同的候选、识别和严格解析流程。未命中的识别文本不会发布或记录。
+asr_probe = true
+# 冷：探测使用的音频："microphone"（原始麦克风，音乐播放时更可靠）或 "aec"。
+asr_probe_source = "microphone"
+# 冷：只探测不长于此时长的语音段（毫秒），避免持续解码长段音乐。
+asr_probe_max_ms = 8000
 
 [vad]
 enabled = true

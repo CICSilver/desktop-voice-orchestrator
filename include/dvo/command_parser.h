@@ -78,4 +78,17 @@ class CommandParser {
   std::shared_ptr<const Impl> impl_;
 };
 
+// Where a wake word sits in recognized text, counted in word characters
+// (punctuation, whitespace and fillers ignored). The match rule is the one the
+// parser uses: an exact occurrence anywhere, otherwise a near miss sharing all
+// but one character, and only at the very start or end of the text.
+struct WakeTextMatch {
+  std::size_t begin{};
+  std::size_t end{};
+  std::size_t length{};
+  bool exact{};
+};
+[[nodiscard]] std::optional<WakeTextMatch> find_wake_in_text(std::string_view text,
+                                                            std::string_view wake_word);
+
 }  // namespace dvo

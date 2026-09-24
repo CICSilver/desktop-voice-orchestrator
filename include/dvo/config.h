@@ -67,6 +67,11 @@ struct KwsConfig {
   std::int32_t num_trailing_blanks{1};
   float boosting_score{1.0F};
   float threshold{0.25F};
+  // Second-stage wake: idle speech segments without a KWS hit are decoded by
+  // the offline final decoder and searched for the wake word.
+  bool asr_probe{false};
+  std::string asr_probe_source{"microphone"};  // microphone | aec
+  std::uint32_t asr_probe_max_ms{8000};
 };
 
 struct VadConfig {

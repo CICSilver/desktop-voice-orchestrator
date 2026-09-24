@@ -32,6 +32,7 @@
 #include "dvo/spsc_queue.h"
 #include "dvo/streaming_recognizer.h"
 #include "dvo/utterance_lifecycle.h"
+#include "dvo/wake_probe.h"
 #include "dvo/wasapi_capture.h"
 
 namespace dvo {
@@ -111,6 +112,8 @@ class VoiceFrontendRuntime {
   void process_keyword_hit(KwsHit hit, bool capture_blocked,
                            bool processed_speech_present,
                            std::string_view detector);
+  void submit_wake_probe(const VadInterval& interval);
+  void handle_wake_probe(WakeProbeResult result, std::uint64_t frame_end);
   [[nodiscard]] bool drain_audio_assemblies();
   void complete_backfill(BackfillAssemblyResult result);
   void complete_candidate(CandidateAssemblyResult result);
@@ -313,6 +316,9 @@ class VoiceFrontendRuntime {
   // The processing clock intentionally survives device resets. UI timelines
   // are relative to the current live/replay view and use this separate origin.
   std::optional<std::uint64_t> view_sample_origin_;
+  // Declared after the rings it reads so that it is destroyed first.
+  std::unique_ptr<WakeProbe> wake_probe_;
+  std::uint64_t next_wake_probe_id_{1};
 };
 
 }  // namespace dvo

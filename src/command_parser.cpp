@@ -4,6 +4,7 @@
 #include <array>
 #include <charconv>
 #include <cstdint>
+#include <span>
 #include <stdexcept>
 #include <utility>
 #include <unordered_map>
@@ -427,6 +428,147 @@ void append_rules(const std::vector<std::string>& phrases, std::string_view cate
   }
 }
 
+// ---- tolerant readings -----------------------------------------------------
+// Every reading below is only a candidate: it must still parse completely under
+// the strict grammar, so none of them can turn arbitrary speech into a command.
+
+[[nodiscard]] std::vector<char32_t> codepoints(std::string_view text) {
+  std::vector<char32_t> result;
+  for (std::size_t offset = 0; offset < text.size();) {
+    const auto decoded = decode_one(text, offset);
+    if (!decoded) break;  // normalize() has already rejected invalid UTF-8
+    result.push_back(decoded->first);
+    offset += decoded->second;
+  }
+  return result;
+}
+
+[[nodiscard]] std::string to_utf8(std::span<const char32_t> text) {
+  std::string result;
+  for (const auto cp : text) append_utf8(result, cp);
+  return result;
+}
+
+// Hesitations carry no command meaning, and recognizers sometimes emit stray
+// markup symbols (for example a leading '<').
+[[nodiscard]] bool is_filler(char32_t cp) {
+  switch (cp) {
+    case U'啊': case U'呃': case U'嗯': case U'哦': case U'唉': case U'诶': case U'呀':
+    case U'<': case U'>': case U'|': case U'*': case U'#': case U'~': case U'"':
+    case U'\'': case U'(': case U')': case U'[': case U']': case U'{': case U'}':
+    case U'-': case U'_': case U'=': case U'@': case U'/': case U'\\': case U'`':
+    case U'^':
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Drops fillers together with separators directly next to them ("增加音量，啊，
+// 小助手"). Other punctuation is left alone so that genuinely empty clauses
+// such as "播放音乐，，暂停音乐" stay rejectable.
+[[nodiscard]] std::string remove_fillers(std::string_view text) {
+  const auto cps = codepoints(text);
+  std::vector<bool> removed(cps.size());
+  for (std::size_t index = 0; index < cps.size(); ++index) removed[index] = is_filler(cps[index]);
+  std::vector<char32_t> kept;
+  for (std::size_t index = 0; index < cps.size(); ++index) {
+    if (removed[index]) continue;
+    const bool next_to_filler = (index > 0 && removed[index - 1]) ||
+                                (index + 1 < cps.size() && removed[index + 1]);
+    if (cps[index] == U';' && next_to_filler) continue;
+    kept.push_back(cps[index]);
+  }
+  return to_utf8(kept);
+}
+
+// The separator between a wake word and the command belongs to the wake word.
+[[nodiscard]] std::span<const char32_t> trim_separators(std::span<const char32_t> text) {
+  while (!text.empty() && text.front() == U';') text = text.subspan(1);
+  while (!text.empty() && text.back() == U';') text = text.first(text.size() - 1);
+  return text;
+}
+
+// "暂停暂停音乐" -> "暂停音乐": a two-character word repeated back to back is
+// a stutter, not two commands.
+[[nodiscard]] std::string collapse_repeats(std::string_view text) {
+  auto cps = codepoints(text);
+  std::vector<char32_t> result;
+  for (std::size_t index = 0; index < cps.size();) {
+    if (index + 3 < cps.size() && cps[index] != U';' && cps[index + 1] != U';' &&
+        cps[index] == cps[index + 2] && cps[index + 1] == cps[index + 3]) {
+      index += 2;
+      continue;
+    }
+    result.push_back(cps[index]);
+    ++index;
+  }
+  return to_utf8(result);
+}
+
+[[nodiscard]] std::size_t common_subsequence(std::span<const char32_t> left,
+                                             std::span<const char32_t> right) {
+  std::vector<std::size_t> previous(right.size() + 1), current(right.size() + 1);
+  for (const auto cp : left) {
+    for (std::size_t j = 1; j <= right.size(); ++j) {
+      current[j] = cp == right[j - 1] ? previous[j - 1] + 1
+                                      : std::max(previous[j], current[j - 1]);
+    }
+    std::swap(previous, current);
+  }
+  return previous.back();
+}
+
+// Locates the confirmed wake word in recognized text: an exact occurrence
+// anywhere, otherwise a near miss ("小叔手", "小助", "助手") at the very start
+// or end of the utterance, where a prefix or suffix wake word sits. A near miss
+// must share all but one character with the wake word in order.
+[[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> locate_wake(
+    std::span<const char32_t> text, std::span<const char32_t> wake) {
+  if (wake.empty() || text.size() < wake.size() - 1) return std::nullopt;
+  if (const auto found = std::ranges::search(text, wake); !found.empty()) {
+    const auto begin = static_cast<std::size_t>(found.begin() - text.begin());
+    return std::pair{begin, begin + wake.size()};
+  }
+  if (wake.size() < 3) return std::nullopt;
+  std::optional<std::pair<std::size_t, std::size_t>> best;
+  std::size_t best_score{};
+  for (std::size_t length = wake.size() - 1; length <= wake.size() + 1; ++length) {
+    if (length > text.size()) break;
+    for (const bool at_start : {true, false}) {
+      const auto begin = at_start ? 0 : text.size() - length;
+      const auto window = text.subspan(begin, length);
+      if (std::ranges::find(window, U';') != window.end()) continue;
+      const auto score = common_subsequence(window, wake);
+      if (score + 1 < wake.size() || score <= best_score) continue;
+      best_score = score;
+      best = std::pair{begin, begin + length};
+    }
+  }
+  return best;
+}
+
+[[nodiscard]] std::size_t word_length(std::span<const char32_t> text) {
+  return static_cast<std::size_t>(
+      std::ranges::count_if(text, [](char32_t cp) { return cp != U';'; }));
+}
+
+// Text on the far side of the wake word may be dropped only when it is short
+// residue (recognizer noise or background speech) that does not itself parse
+// as a command, so a real command on that side is never discarded silently.
+constexpr std::size_t kMaxDroppedResidue = 3;
+
+struct ActionDraft {
+  ActionType type;
+  std::optional<int> delta;
+  std::string canonical;
+};
+
+struct DraftParse {
+  std::vector<ActionDraft> drafts;
+  std::optional<CommandParseError> error;
+};
+
 }  // namespace
 
 struct CommandParser::Impl {
@@ -495,126 +637,176 @@ CommandParseResult CommandParser::parse(std::string_view text,
   }
   auto normalized = normalize(text);
   if (normalized.error) return {{}, normalized.error};
-  // KWS can occasionally miss a repeated wake word while an activation is
-  // already armed, causing the utterance to arrive through the follow-up
-  // path. Strip the activation's confirmed wake word in either origin so an
-  // otherwise exact command is not rejected solely because of that routing.
-  bool wake_confirmed_in_text{};
+
+  std::string wake_value;
   if (!context.wake_word.empty()) {
-    auto wake = normalize(context.wake_word);
-    if (!wake.error) {
-      while (!wake.value.empty() && wake.value.front() == '@') {
-        wake.value.erase(wake.value.begin());
+    if (auto wake = normalize(context.wake_word); !wake.error) {
+      wake_value = std::move(wake.value);
+      while (!wake_value.empty() && wake_value.front() == '@') {
+        wake_value.erase(wake_value.begin());
       }
-      if (!wake.value.empty()) {
-        const auto position = normalized.value.find(wake.value);
-        if (position != std::string::npos) {
-          wake_confirmed_in_text = true;
-          auto erase_start = position;
-          auto erase_size = wake.value.size();
-          if (erase_start > 0 && normalized.value[erase_start - 1] == ';') {
-            --erase_start;
-            ++erase_size;
-          } else if (erase_start + erase_size < normalized.value.size() &&
-                     normalized.value[erase_start + erase_size] == ';') {
-            ++erase_size;
-          } else if (position > 0) {
-            // A weak utterance tail can make exact-final ASR append one
-            // spurious Chinese character after a suffix wake word (for
-            // example "小助手两"). Remove only one complete UTF-8 codepoint,
-            // only when it is the entire residual tail. Longer residual text
-            // stays rejectable.
-            const auto tail = position + wake.value.size();
-            if (const auto decoded = decode_one(normalized.value, tail);
-                decoded && tail + decoded->second == normalized.value.size()) {
-              erase_size += decoded->second;
-            }
-          }
-          normalized.value.erase(erase_start, erase_size);
+    }
+  }
+
+  // The strict reading. KWS can occasionally miss a repeated wake word while
+  // an activation is already armed, causing the utterance to arrive through
+  // the follow-up path. Strip the activation's confirmed wake word in either
+  // origin so an otherwise exact command is not rejected solely because of
+  // that routing.
+  std::string strict = normalized.value;
+  bool wake_confirmed_in_text{};
+  if (!wake_value.empty()) {
+    const auto position = strict.find(wake_value);
+    if (position != std::string::npos) {
+      wake_confirmed_in_text = true;
+      auto erase_start = position;
+      auto erase_size = wake_value.size();
+      if (erase_start > 0 && strict[erase_start - 1] == ';') {
+        --erase_start;
+        ++erase_size;
+      } else if (erase_start + erase_size < strict.size() &&
+                 strict[erase_start + erase_size] == ';') {
+        ++erase_size;
+      } else if (position > 0) {
+        // A weak utterance tail can make exact-final ASR append one
+        // spurious Chinese character after a suffix wake word (for
+        // example "小助手两"). Remove only one complete UTF-8 codepoint,
+        // only when it is the entire residual tail.
+        const auto tail = position + wake_value.size();
+        if (const auto decoded = decode_one(strict, tail);
+            decoded && tail + decoded->second == strict.size()) {
+          erase_size += decoded->second;
         }
       }
+      strict.erase(erase_start, erase_size);
     }
   }
-  // Polite lead-ins do not change command semantics. Remove one known prefix,
-  // then continue to require the remainder to match the configured grammar
-  // exactly; arbitrary filler and trailing residual text remain rejected.
-  strip_polite_prefix(normalized.value);
-  correct_wake_confirmed_asr_confusions(
-      normalized.value, impl_->rules, wake_confirmed_in_text);
-  if (normalized.value.empty()) {
-    return failure("empty_text", "ASR text does not contain a command", 0);
-  }
-  if (normalized.value.front() == ';') {
-    return failure("empty_clause", "command text must not start with a separator", 0);
-  }
-  std::size_t position{};
+  // Polite lead-ins do not change command semantics.
+  strip_polite_prefix(strict);
+  correct_wake_confirmed_asr_confusions(strict, impl_->rules, wake_confirmed_in_text);
 
-  // If ASR loses the first action of a multi-command utterance, do not reject
-  // a later action merely because its connector is now at the beginning. A
-  // chain also tolerates boundary duplications such as "然后后再".
-  while (const auto connector_end = consume_connector(normalized.value, position,
-                                                        impl_->connectors)) {
-    position = *connector_end;
-    if (position == normalized.value.size()) {
-      return failure("trailing_connector", "a connector must be followed by a command",
-                     position);
+  const auto parse_drafts = [this](std::string_view value) -> DraftParse {
+    const auto fail = [](std::string code, std::string message, std::size_t offset) {
+      return DraftParse{{}, CommandParseError{std::move(code), std::move(message), offset}};
+    };
+    if (value.empty()) {
+      return fail("empty_text", "ASR text does not contain a command", 0);
     }
-  }
-
-  struct ActionDraft {
-    ActionType type;
-    std::optional<int> delta;
-    std::string canonical;
-  };
-  std::vector<ActionDraft> drafts;
-
-  while (position < normalized.value.size()) {
-    const auto parsed = parse_action(normalized.value, position,
-                                     default_volume_delta_percent_,
-                                     maximum_volume_delta_percent_, impl_->rules,
-                                     !drafts.empty());
-    if (parsed.error) return {{}, parsed.error};
-    drafts.push_back({parsed.type, parsed.delta, parsed.canonical});
-    if (drafts.size() > max_actions_per_utterance_) {
-      return failure("too_many_actions", "command plan exceeds the configured action limit", position);
+    if (value.front() == ';') {
+      return fail("empty_clause", "command text must not start with a separator", 0);
     }
-    position = parsed.end;
-    if (position == normalized.value.size()) break;
+    std::size_t position{};
 
-    bool had_punctuation = false;
-    if (normalized.value[position] == ';') {
-      had_punctuation = true;
-      ++position;
-      if (position < normalized.value.size() && normalized.value[position] == ';') {
-        return failure("empty_clause", "consecutive separators create an empty command clause",
+    // If ASR loses the first action of a multi-command utterance, do not reject
+    // a later action merely because its connector is now at the beginning. A
+    // chain also tolerates boundary duplications such as "然后后再".
+    while (const auto connector_end = consume_connector(value, position,
+                                                          impl_->connectors)) {
+      position = *connector_end;
+      if (position == value.size()) {
+        return fail("trailing_connector", "a connector must be followed by a command",
                        position);
       }
-      if (position == normalized.value.size()) break;  // one terminal punctuation is harmless
     }
 
-    bool had_connector = false;
-    while (const auto connector_end = consume_connector(normalized.value, position,
-                                                          impl_->connectors)) {
-      had_connector = true;
-      position = *connector_end;
-      if (position < normalized.value.size() && normalized.value[position] == ';') {
+    std::vector<ActionDraft> drafts;
+
+    while (position < value.size()) {
+      const auto parsed = parse_action(value, position,
+                                       default_volume_delta_percent_,
+                                       maximum_volume_delta_percent_, impl_->rules,
+                                       !drafts.empty());
+      if (parsed.error) return DraftParse{{}, parsed.error};
+      drafts.push_back({parsed.type, parsed.delta, parsed.canonical});
+      if (drafts.size() > max_actions_per_utterance_) {
+        return fail("too_many_actions", "command plan exceeds the configured action limit", position);
+      }
+      position = parsed.end;
+      if (position == value.size()) break;
+
+      bool had_punctuation = false;
+      if (value[position] == ';') {
+        had_punctuation = true;
         ++position;
-        if (position < normalized.value.size() && normalized.value[position] == ';') {
-          return failure("empty_clause", "consecutive separators create an empty command clause",
+        if (position < value.size() && value[position] == ';') {
+          return fail("empty_clause", "consecutive separators create an empty command clause",
+                         position);
+        }
+        if (position == value.size()) break;  // one terminal punctuation is harmless
+      }
+
+      bool had_connector = false;
+      while (const auto connector_end = consume_connector(value, position,
+                                                            impl_->connectors)) {
+        had_connector = true;
+        position = *connector_end;
+        if (position < value.size() && value[position] == ';') {
+          ++position;
+          if (position < value.size() && value[position] == ';') {
+            return fail("empty_clause", "consecutive separators create an empty command clause",
+                           position);
+          }
+        }
+        if (position == value.size()) {
+          return fail("trailing_connector", "a connector must be followed by another command",
                          position);
         }
       }
-      if (position == normalized.value.size()) {
-        return failure("trailing_connector", "a connector must be followed by another command",
-                       position);
+
+      // With neither punctuation nor a connector, adjacency is intentional and
+      // parse_action() below must consume the next command in full.
+      (void)had_punctuation;
+      (void)had_connector;
+    }
+    return DraftParse{std::move(drafts), {}};
+  };
+
+  // Tolerant readings, tried in order only when the strict reading does not
+  // parse: hesitations and stray symbols removed, stutters collapsed, and the
+  // command taken from one side of the wake word when the other side is short
+  // residue that is not itself a command. Each must still parse completely.
+  std::vector<std::string> readings{strict};
+  const auto add_reading = [&](std::string value, bool wake_confirmed) {
+    value = remove_fillers(value);
+    strip_polite_prefix(value);
+    correct_wake_confirmed_asr_confusions(value, impl_->rules, wake_confirmed);
+    if (value.empty() || std::ranges::find(readings, value) != readings.end()) return;
+    readings.push_back(std::move(value));
+  };
+  add_reading(strict, wake_confirmed_in_text);
+  add_reading(collapse_repeats(remove_fillers(strict)), wake_confirmed_in_text);
+  if (!wake_value.empty()) {
+    const auto cleaned = codepoints(remove_fillers(normalized.value));
+    const auto wake = codepoints(wake_value);
+    if (const auto span = locate_wake(cleaned, wake)) {
+      const auto all = std::span<const char32_t>(cleaned);
+      const auto before = trim_separators(all.first(span->first));
+      const auto after = trim_separators(all.subspan(span->second));
+      for (const auto& [kept, dropped] :
+           {std::pair{before, after}, std::pair{after, before}}) {
+        const auto dropped_length = word_length(dropped);
+        if (dropped_length > kMaxDroppedResidue) continue;
+        if (dropped_length > 0 && !parse_drafts(remove_fillers(to_utf8(dropped))).error) {
+          continue;
+        }
+        add_reading(to_utf8(kept), true);
+        add_reading(collapse_repeats(to_utf8(kept)), true);
       }
     }
-
-    // With neither punctuation nor a connector, adjacency is intentional and
-    // parse_action() below must consume the next command in full.
-    (void)had_punctuation;
-    (void)had_connector;
   }
+
+  std::optional<DraftParse> accepted;
+  std::optional<CommandParseError> first_error;
+  for (const auto& reading : readings) {
+    auto parsed = parse_drafts(reading);
+    if (!parsed.error) {
+      accepted = std::move(parsed);
+      break;
+    }
+    if (!first_error) first_error = std::move(parsed.error);
+  }
+  if (!accepted) return {{}, first_error};
+  const auto& drafts = accepted->drafts;
 
   CommandPlan plan;
   plan.command_id = "cmd:" + std::to_string(context.runtime_session_id.size()) + ":" +
@@ -653,6 +845,28 @@ CommandParseResult CommandParser::parse(std::string_view text,
     plan.actions.push_back(std::move(action));
   }
   return {std::move(plan), {}};
+}
+
+std::optional<WakeTextMatch> find_wake_in_text(std::string_view text,
+                                               std::string_view wake_word) {
+  const auto normalized_text = normalize(text);
+  auto normalized_wake = normalize(wake_word);
+  if (normalized_text.error || normalized_wake.error) return std::nullopt;
+  while (!normalized_wake.value.empty() && normalized_wake.value.front() == '@') {
+    normalized_wake.value.erase(normalized_wake.value.begin());
+  }
+  const auto words_only = [](std::string_view value) {
+    auto cps = codepoints(remove_fillers(value));
+    std::erase(cps, U';');
+    return cps;
+  };
+  const auto cps = words_only(normalized_text.value);
+  const auto wake = words_only(normalized_wake.value);
+  const auto span = locate_wake(cps, wake);
+  if (!span) return std::nullopt;
+  const bool exact = span->second - span->first == wake.size() &&
+                     std::equal(wake.begin(), wake.end(), cps.begin() + span->first);
+  return WakeTextMatch{span->first, span->second, cps.size(), exact};
 }
 
 }  // namespace dvo

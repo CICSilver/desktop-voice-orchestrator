@@ -65,9 +65,18 @@ TEST_CASE("checked-in default configuration is valid") {
   CHECK_FALSE(store.validate(decoders).ok());
   decoders = config;
   decoders.asr.final_decoder = "streaming";  // fallback needs an offline primary
+  decoders.kws.asr_probe = false;
   CHECK_FALSE(store.validate(decoders).ok());
   decoders.asr.fallback_decoder = "none";
   CHECK(store.validate(decoders).ok());
+  decoders.kws.asr_probe = true;  // the wake probe needs an offline decoder too
+  CHECK_FALSE(store.validate(decoders).ok());
+
+  CHECK(config.kws.asr_probe);
+  CHECK(config.kws.asr_probe_source == "microphone");
+  auto probe = config;
+  probe.kws.asr_probe_source = "loopback";
+  CHECK_FALSE(store.validate(probe).ok());
 }
 
 TEST_CASE("AEC calibration patch is validated exposed and persisted") {

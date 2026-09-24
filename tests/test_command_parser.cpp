@@ -200,7 +200,45 @@ TEST_CASE("Wake text, plus separators and one-character ASR omissions remain exe
         dvo::ActionType::media_pause);
 
   CHECK_FALSE(parser.parse("再连音乐", wake_context).ok());
-  CHECK_FALSE(parser.parse("再连音乐小助手两次", wake_context).ok());
+}
+
+TEST_CASE("Wake-confirmed readings tolerate residue, fillers and a misheard wake word") {
+  const dvo::CommandParser parser;
+  auto wake_context = context("tolerant");
+  wake_context.wake_word = "小助手";
+  const auto actions_of = [&](const char* text) {
+    const auto result = parser.parse(text, wake_context);
+    return result.ok() ? result.plan->normalized_text : std::string("REJECTED");
+  };
+
+  // Short residue that is not itself a command, on the far side of the wake
+  // word, is recognizer noise or background speech.
+  CHECK(actions_of("再连音乐小助手两次") == "暂停音乐");
+  CHECK(actions_of("播放音乐小助手动我心") == "播放音乐");
+  CHECK(actions_of("回小助手暂停音乐") == "暂停音乐");
+  // Hesitations and stray recognizer symbols.
+  CHECK(actions_of("增加音量啊小助手") == "增加音量5%");
+  CHECK(actions_of("<播放音乐小助手") == "播放音乐");
+  // A wake word misheard by one character at either edge.
+  CHECK(actions_of("小叔手，增加音量，再播放音乐") == "增加音量5%;播放音乐");
+  CHECK(actions_of("暂停音乐，小助") == "暂停音乐");
+  // A stuttered word.
+  CHECK(actions_of("小助手暂停暂停音乐然后降低音量百分之十") == "暂停音乐;降低音量10%");
+
+  // Longer residue, residue that is itself a command, unknown requests and a
+  // near miss in the middle of the sentence all stay rejected or intact.
+  CHECK(actions_of("再连音乐小助手两次暂停") == "REJECTED");
+  CHECK(actions_of("暂停音小助手播放音乐") == "暂停音乐;播放音乐");
+  CHECK(actions_of("小助手今天天气怎么样") == "REJECTED");
+  CHECK(actions_of("今天天气怎么样小助手") == "REJECTED");
+  CHECK(actions_of("小助手播放音乐然后下一首") == "REJECTED");
+  CHECK(actions_of("播放小叔手音乐") == "REJECTED");
+  CHECK(actions_of("暂停音乐小说") == "REJECTED");
+
+  // Without a confirmed wake word only fillers are tolerated.
+  const auto followup = context("tolerant-followup");
+  CHECK(parser.parse("增加音量啊", followup).ok());
+  CHECK_FALSE(parser.parse("播放音乐动我心", followup).ok());
 }
 
 TEST_CASE("Natural multi-command connectors are accepted") {
