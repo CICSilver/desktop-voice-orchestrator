@@ -135,6 +135,16 @@ max_pending_audio_ms = 60000
 emit_partials = true
 # 固定：候选完成后，用包含完整连续话语的PCM重新解码一次作为权威结果；解析前再剥离唤醒词文本。
 exact_final_redecode = true
+# 冷：权威整句识别使用非流式模型。流式Paraformer对解码起点敏感，会丢句尾字；
+# 在52条标注录音上，命令正确数从22提高到31（SenseVoice）。"streaming" 恢复旧行为。
+# 上面的流式模型仍用于调试台的实时部分文本。
+final_decoder = "sense_voice"
+final_model = "models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/model.int8.onnx"
+final_tokens = "models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/tokens.txt"
+# 冷：主识别文本解析失败时，才改用此模型的文本；它同样必须完整匹配命令语法。"none" 关闭。
+fallback_decoder = "zipformer_ctc"
+fallback_model = "models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/model.int8.onnx"
+fallback_tokens = "models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt"
 
 [commands]
 enabled = true

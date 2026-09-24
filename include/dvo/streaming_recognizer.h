@@ -19,6 +19,16 @@ namespace dvo {
 // or wait for the recognizer worker.
 using SharedPcm = std::shared_ptr<const std::vector<float>>;
 
+// A non-streaming recognizer used for the authoritative exact-final decode.
+// Decoding the complete candidate at once avoids the streaming model's
+// sensitivity to where the candidate starts. type is one of "sense_voice",
+// "paraformer" or "zipformer_ctc".
+struct FinalDecoderConfig {
+  std::string type;
+  std::filesystem::path model;
+  std::filesystem::path tokens;
+};
+
 struct StreamingRecognizerConfig {
   bool enabled{true};
   std::filesystem::path encoder;
@@ -33,6 +43,10 @@ struct StreamingRecognizerConfig {
   std::size_t queue_capacity{256};
   std::size_t max_active_streams{2};
   std::uint32_t max_pending_audio_ms{60000};
+  // Empty: the streaming model re-decodes the candidate itself. Otherwise the
+  // first decoder produces the authoritative text and each later one an
+  // alternative the command parser may fall back to.
+  std::vector<FinalDecoderConfig> final_decoders;
 };
 
 struct RecognitionBegin {
@@ -67,11 +81,20 @@ struct RecognitionCancel {
   std::string reason{"cancelled"};
 };
 
+struct AsrAlternative {
+  std::string decoder;
+  std::string text;
+};
+
 struct AsrHypothesis {
   std::string text;
   std::vector<std::string> tokens;
   std::vector<float> token_timestamps_seconds;
   std::string json;
+  // Which recognizer produced text ("streaming" or a final decoder type).
+  std::string decoder;
+  // Exact-final texts from secondary final decoders, in configured order.
+  std::vector<AsrAlternative> alternatives;
 };
 
 enum class RecognitionResultKind {
@@ -185,13 +208,30 @@ class IOnlineAsrEngine {
   virtual std::unique_ptr<IOnlineAsrSession> create_session() = 0;
 };
 
+// Decodes one complete utterance at once.
+class IOfflineAsrEngine {
+ public:
+  virtual ~IOfflineAsrEngine() = default;
+  [[nodiscard]] virtual std::string name() const = 0;
+  virtual AsrHypothesis decode(std::span<const float> samples,
+                               std::uint32_t sample_rate) = 0;
+};
+
 using RecognitionResultCallback = std::function<void(RecognitionResult)>;
 
-// Passing an engine is intended for deterministic tests. Production callers
-// omit it and receive the sherpa-onnx Online Paraformer implementation.
+// Passing engines is intended for deterministic tests. Production callers
+// omit them and receive the sherpa-onnx Online Paraformer implementation plus
+// the configured final decoders, loaded on the worker thread.
 std::unique_ptr<IStreamingRecognizer> create_streaming_recognizer(
     StreamingRecognizerConfig config, RecognitionResultCallback callback,
-    std::unique_ptr<IOnlineAsrEngine> engine = {});
+    std::unique_ptr<IOnlineAsrEngine> engine = {},
+    std::vector<std::unique_ptr<IOfflineAsrEngine>> final_engines = {});
+
+// Throws when the decoder type is unknown, a model file is missing, or the
+// build lacks sherpa-onnx.
+std::unique_ptr<IOfflineAsrEngine> create_offline_asr_engine(
+    const FinalDecoderConfig& decoder, const std::string& provider,
+    std::int32_t num_threads);
 
 // Synchronous engine for offline analysis such as evaluation reference
 // decodes. Throws when the configuration or model files are invalid, or when

@@ -112,6 +112,15 @@ struct AsrConfig {
   std::uint32_t max_pending_audio_ms{60000};
   bool emit_partials{true};
   bool exact_final_redecode{true};
+  // Non-streaming decoder for the authoritative exact-final pass; "streaming"
+  // keeps the Online Paraformer above. A fallback decoder's text is used only
+  // when the primary text does not parse as a command.
+  std::string final_decoder{"streaming"};
+  std::filesystem::path final_model;
+  std::filesystem::path final_tokens;
+  std::string fallback_decoder{"none"};
+  std::filesystem::path fallback_model;
+  std::filesystem::path fallback_tokens;
 };
 
 struct CommandsConfig {

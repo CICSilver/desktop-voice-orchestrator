@@ -36,6 +36,10 @@
 
 namespace dvo {
 
+// The command grammar the runtime builds from configuration; shared with the
+// offline `parse` CLI so both accept exactly the same sentences.
+[[nodiscard]] CommandGrammar command_grammar(const CommandsConfig& config);
+
 class VoiceFrontendRuntime {
  public:
   VoiceFrontendRuntime(AppConfig config, ConfigStore store);

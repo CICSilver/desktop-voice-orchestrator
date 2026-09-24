@@ -205,17 +205,6 @@ nlohmann::json action_result_json(const ActionResult& result) {
   return value;
 }
 
-CommandGrammar command_grammar(const CommandsConfig& config) {
-  CommandGrammar grammar;
-  grammar.play_phrases = config.play_phrases;
-  grammar.pause_phrases = config.pause_phrases;
-  grammar.volume_up_phrases = config.volume_up_phrases;
-  grammar.volume_down_phrases = config.volume_down_phrases;
-  grammar.connectors = config.connectors;
-  grammar.max_actions_per_utterance = config.max_actions_per_utterance;
-  return grammar;
-}
-
 nlohmann::json preprocess_json(const PreprocessDiagnostics& diagnostics) {
   auto value = nlohmann::json{
           {"state", to_string(diagnostics.state)}, {"enabled", diagnostics.aec_requested},
@@ -341,6 +330,17 @@ std::optional<nlohmann::json> inspect_session_directory(
 
 }  // namespace
 
+CommandGrammar command_grammar(const CommandsConfig& config) {
+  CommandGrammar grammar;
+  grammar.play_phrases = config.play_phrases;
+  grammar.pause_phrases = config.pause_phrases;
+  grammar.volume_up_phrases = config.volume_up_phrases;
+  grammar.volume_down_phrases = config.volume_down_phrases;
+  grammar.connectors = config.connectors;
+  grammar.max_actions_per_utterance = config.max_actions_per_utterance;
+  return grammar;
+}
+
 VoiceFrontendRuntime::VoiceFrontendRuntime(AppConfig config, ConfigStore store)
     : config_(std::move(config)), config_store_(std::move(store)),
       recorder_(std::max<std::size_t>(256,
@@ -388,6 +388,15 @@ void VoiceFrontendRuntime::initialize_pipeline() {
   asr_config.queue_capacity = config_.asr.queue_capacity;
   asr_config.max_active_streams = config_.asr.max_active_streams;
   asr_config.max_pending_audio_ms = config_.asr.max_pending_audio_ms;
+  if (config_.asr.final_decoder != "streaming") {
+    asr_config.final_decoders.push_back(
+        {config_.asr.final_decoder, config_.asr.final_model, config_.asr.final_tokens});
+    if (config_.asr.fallback_decoder != "none") {
+      asr_config.final_decoders.push_back({config_.asr.fallback_decoder,
+                                           config_.asr.fallback_model,
+                                           config_.asr.fallback_tokens});
+    }
+  }
   asr_ = create_streaming_recognizer(
       std::move(asr_config), [this](RecognitionResult result) {
         handle_recognition_result(std::move(result));
@@ -1914,6 +1923,14 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
   if (command_snapshot) {
     payload["command_config_revision"] = command_snapshot->config_revision;
   }
+  if (!result.hypothesis.decoder.empty()) payload["decoder"] = result.hypothesis.decoder;
+  if (!result.hypothesis.alternatives.empty()) {
+    auto alternatives = nlohmann::json::array();
+    for (const auto& alternative : result.hypothesis.alternatives) {
+      alternatives.push_back({{"decoder", alternative.decoder}, {"text", alternative.text}});
+    }
+    payload["alternatives"] = std::move(alternatives);
+  }
   if (result.kind != RecognitionResultKind::partial || emit_partials) {
     emit_event(type, payload, result.audio_end_sample, source);
   }
@@ -2022,6 +2039,20 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
 
   parse_stage = "parser";
   auto parsed = command_snapshot->parser->parse(result.hypothesis.text, context);
+  // A fallback decoder's text is consulted only when the primary text does
+  // not parse; the first alternative that parses completely is used. Every
+  // alternative still has to satisfy the full grammar on its own.
+  std::string parsed_decoder = result.hypothesis.decoder;
+  if (!parsed.ok()) {
+    for (const auto& alternative : result.hypothesis.alternatives) {
+      auto alternative_parse = command_snapshot->parser->parse(alternative.text, context);
+      if (alternative_parse.ok()) {
+        parsed = std::move(alternative_parse);
+        parsed_decoder = alternative.decoder;
+        break;
+      }
+    }
+  }
   if (!parsed.ok()) {
     const auto code =
         parsed.error ? parsed.error->code : "rule_not_matched";
@@ -2043,10 +2074,10 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
   }
 
   if (source == "replay") {
-    emit_event("parse_debug",
-               parse_debug_success(result.hypothesis.text, context,
-                                   *parsed.plan, "automatic"),
-               result.audio_end_sample, source);
+    auto debug = parse_debug_success(parsed.plan->raw_text, context, *parsed.plan,
+                                     "automatic");
+    debug["decoder"] = parsed_decoder;
+    emit_event("parse_debug", std::move(debug), result.audio_end_sample, source);
     parse_debug_emitted = true;
   }
   auto plan = std::move(*parsed.plan);
@@ -2069,10 +2100,12 @@ void VoiceFrontendRuntime::handle_recognition_result(RecognitionResult result) {
       submitted = action_executor_
                     ? action_executor_->try_submit(
                           std::move(plan),
-                          [this, timestamp = result.audio_end_sample,
-                           source](const CommandPlan& accepted) {
+                          [this, timestamp = result.audio_end_sample, source,
+                           parsed_decoder](const CommandPlan& accepted) {
                             command_plans_.fetch_add(1, std::memory_order_relaxed);
-                            emit_event("command_plan", command_plan_json(accepted), timestamp,
+                            auto plan_json = command_plan_json(accepted);
+                            plan_json["decoder"] = parsed_decoder;
+                            emit_event("command_plan", std::move(plan_json), timestamp,
                                        source);
                             for (const auto& action : accepted.actions) {
                               emit_event("action_queued",

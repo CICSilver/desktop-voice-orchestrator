@@ -102,4 +102,34 @@ dvo_fetch_asr_file("decoder.int8.onnx"
 dvo_fetch_asr_file("tokens.txt"
   "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6")
 
+# Non-streaming final decoders (see [asr_final] / [asr_fallback] in manifest).
+function(dvo_fetch_release_model name archive_sha256 model_sha256 tokens_sha256)
+  set(dir "${DVO_MODEL_DIR}/${name}")
+  if(NOT EXISTS "${dir}/model.int8.onnx" OR NOT EXISTS "${dir}/tokens.txt")
+    set(archive "${DOWNLOAD_DIR}/${name}.tar.bz2")
+    file(DOWNLOAD
+      "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/${name}.tar.bz2"
+      "${archive}"
+      EXPECTED_HASH "SHA256=${archive_sha256}"
+      SHOW_PROGRESS TLS_VERIFY ON
+    )
+    execute_process(
+      COMMAND ${CMAKE_COMMAND} -E tar xjf "${archive}"
+      WORKING_DIRECTORY "${DVO_MODEL_DIR}"
+      COMMAND_ERROR_IS_FATAL ANY
+    )
+  endif()
+  dvo_verify_model_file("${dir}/model.int8.onnx" "${model_sha256}" "${name} model")
+  dvo_verify_model_file("${dir}/tokens.txt" "${tokens_sha256}" "${name} tokens")
+endfunction()
+
+dvo_fetch_release_model("sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17"
+  "257936ea9a64cbe33200274e6367fc26d373ff6ca58b996b15108ffd6b9f6148"
+  "9dc6e72aa8bc6f5966cf2857a0ce3a425b1d72e91500e147d66329f407c017a1"
+  "2db4bb25d046e8849e336c9465e248e1694914d996c58c71bdeca18cfb722992")
+dvo_fetch_release_model("sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03"
+  "f3ad1814fea34c407eab0cc3df6f6b625419ac9a60d8aebd8efe772a8e85ef67"
+  "e291b9c468b651e2697caa09bc684326c3addc6a019e78eb537cfd1a8248ca07"
+  "6fed8c6c248516f38e7faa19404b57413e8ce259f1cbc1fa4aebc86eac32fdfd")
+
 message(STATUS "Pinned models are ready in ${DVO_MODEL_DIR}")

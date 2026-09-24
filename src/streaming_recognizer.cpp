@@ -167,6 +167,78 @@ class SherpaOnlineParaformerEngine final : public IOnlineAsrEngine {
   const SherpaOnnxOnlineRecognizer* recognizer_{};
 };
 
+class SherpaOfflineAsrEngine final : public IOfflineAsrEngine {
+ public:
+  SherpaOfflineAsrEngine(const FinalDecoderConfig& decoder, std::string provider,
+                         std::int32_t num_threads)
+      : type_(decoder.type),
+        model_(decoder.model.string()),
+        tokens_(decoder.tokens.string()),
+        provider_(std::move(provider)) {
+    SherpaOnnxOfflineRecognizerConfig c{};
+    c.feat_config.sample_rate = static_cast<std::int32_t>(kProcessingSampleRate);
+    c.feat_config.feature_dim = 80;
+    c.model_config.tokens = tokens_.c_str();
+    c.model_config.provider = provider_.c_str();
+    c.model_config.num_threads = num_threads;
+    c.decoding_method = "greedy_search";
+    if (type_ == "sense_voice") {
+      c.model_config.sense_voice.model = model_.c_str();
+      c.model_config.sense_voice.language = "zh";
+      // Keep spoken numbers as words ("百分之十"); the parser owns numerals.
+      c.model_config.sense_voice.use_itn = 0;
+    } else if (type_ == "paraformer") {
+      c.model_config.paraformer.model = model_.c_str();
+    } else if (type_ == "zipformer_ctc") {
+      c.model_config.zipformer_ctc.model = model_.c_str();
+    } else {
+      throw std::invalid_argument("unknown final decoder type: " + type_);
+    }
+    recognizer_ = SherpaOnnxCreateOfflineRecognizer(&c);
+    if (!recognizer_) {
+      throw std::runtime_error("SherpaOnnxCreateOfflineRecognizer failed for " + type_);
+    }
+  }
+
+  ~SherpaOfflineAsrEngine() override {
+    if (recognizer_) SherpaOnnxDestroyOfflineRecognizer(recognizer_);
+  }
+
+  [[nodiscard]] std::string name() const override { return type_; }
+
+  AsrHypothesis decode(std::span<const float> samples, std::uint32_t sample_rate) override {
+    const auto* stream = SherpaOnnxCreateOfflineStream(recognizer_);
+    if (!stream) throw std::runtime_error("SherpaOnnxCreateOfflineStream failed");
+    AsrHypothesis value;
+    value.decoder = type_;
+    try {
+      if (samples.size() > static_cast<std::size_t>(std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("candidate is too long for offline decoding");
+      }
+      SherpaOnnxAcceptWaveformOffline(stream, static_cast<std::int32_t>(sample_rate),
+                                      samples.data(),
+                                      static_cast<std::int32_t>(samples.size()));
+      SherpaOnnxDecodeOfflineStream(recognizer_, stream);
+      if (const auto* result = SherpaOnnxGetOfflineStreamResult(stream)) {
+        if (result->text) value.text = result->text;
+        SherpaOnnxDestroyOfflineRecognizerResult(result);
+      }
+    } catch (...) {
+      SherpaOnnxDestroyOfflineStream(stream);
+      throw;
+    }
+    SherpaOnnxDestroyOfflineStream(stream);
+    return value;
+  }
+
+ private:
+  std::string type_;
+  std::string model_;
+  std::string tokens_;
+  std::string provider_;
+  const SherpaOnnxOfflineRecognizer* recognizer_{};
+};
+
 #endif
 
 using RecognitionRequest =
@@ -211,17 +283,23 @@ struct AtomicStats {
 };
 
 using EngineLoader = std::function<std::unique_ptr<IOnlineAsrEngine>()>;
+using FinalEnginesLoader =
+    std::function<std::vector<std::unique_ptr<IOfflineAsrEngine>>()>;
 
 class StreamingRecognizerWorker final : public IStreamingRecognizer {
  public:
   StreamingRecognizerWorker(StreamingRecognizerConfig config,
                             RecognitionResultCallback callback,
                             std::unique_ptr<IOnlineAsrEngine> engine,
-                            EngineLoader engine_loader)
+                            EngineLoader engine_loader,
+                            std::vector<std::unique_ptr<IOfflineAsrEngine>> final_engines,
+                            FinalEnginesLoader final_engines_loader)
       : config_(std::move(config)),
         callback_(std::move(callback)),
         engine_(std::move(engine)),
         engine_loader_(std::move(engine_loader)),
+        final_engines_(std::move(final_engines)),
+        final_engines_loader_(std::move(final_engines_loader)),
         queue_(std::max<std::size_t>(1, config_.queue_capacity)),
         max_pending_audio_samples_(audio_limit_samples(config_)) {
     if (engine_loader_) {
@@ -507,7 +585,9 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
       if (!accepting_.load(std::memory_order_acquire)) return;
       engine_ = std::move(loaded);
       if (engine_ && engine_->available()) {
-        set_state(StreamingRecognizerState::ready, engine_->status());
+        auto status = engine_->status();
+        load_final_engines(status);
+        set_state(StreamingRecognizerState::ready, std::move(status));
       } else {
         set_state(StreamingRecognizerState::unavailable,
                   engine_ ? engine_->status()
@@ -523,6 +603,28 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
       set_state(StreamingRecognizerState::unavailable,
                 "failed to initialize sherpa-onnx Online Paraformer");
     }
+  }
+
+  // A final decoder that fails to load leaves the streaming exact-final path
+  // in place; the reason stays visible in the recognizer status.
+  void load_final_engines(std::string& status) noexcept {
+    if (!final_engines_loader_) return;
+    try {
+      final_engines_ = final_engines_loader_();
+      std::string names;
+      for (const auto& engine : final_engines_) {
+        names += (names.empty() ? "" : " + ") + engine->name();
+      }
+      if (!names.empty()) status += "; final decoder: " + names;
+    } catch (const std::exception& error) {
+      final_engines_.clear();
+      status += std::string{"; final decoder unavailable ("} + error.what() +
+                "), using streaming exact-final";
+    } catch (...) {
+      final_engines_.clear();
+      status += "; final decoder unavailable, using streaming exact-final";
+    }
+    final_engines_loader_ = {};
   }
 
   void emit_unavailable(const QueuedRecognitionRequest& queued) noexcept {
@@ -653,10 +755,23 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
 
     try {
       const auto started = std::chrono::steady_clock::now();
-      auto session = engine_->create_session();
-      if (!session) throw std::runtime_error("exact-final ASR session creation failed");
-      (void)session->accept(request.candidate->pcm, request.candidate->sample_rate);
-      auto hypothesis = session->finish();
+      AsrHypothesis hypothesis;
+      if (!final_engines_.empty()) {
+        const auto& pcm = request.candidate->pcm;
+        const auto rate = request.candidate->sample_rate;
+        hypothesis = final_engines_.front()->decode(pcm, rate);
+        for (std::size_t index = 1; index < final_engines_.size(); ++index) {
+          auto alternative = final_engines_[index]->decode(pcm, rate);
+          hypothesis.alternatives.push_back(
+              {final_engines_[index]->name(), std::move(alternative.text)});
+        }
+      } else {
+        auto session = engine_->create_session();
+        if (!session) throw std::runtime_error("exact-final ASR session creation failed");
+        (void)session->accept(request.candidate->pcm, request.candidate->sample_rate);
+        hypothesis = session->finish();
+        hypothesis.decoder = "streaming";
+      }
       const auto inference_ms = std::chrono::duration<double, std::milli>(
           std::chrono::steady_clock::now() - started).count();
 
@@ -842,6 +957,9 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
   RecognitionResultCallback callback_;
   std::unique_ptr<IOnlineAsrEngine> engine_;
   EngineLoader engine_loader_;
+  // Touched only by the worker thread after construction.
+  std::vector<std::unique_ptr<IOfflineAsrEngine>> final_engines_;
+  FinalEnginesLoader final_engines_loader_;
   std::atomic<StreamingRecognizerState> state_{
       StreamingRecognizerState::unavailable};
   mutable std::mutex state_mutex_;
@@ -897,8 +1015,21 @@ class StreamingRecognizerWorker final : public IStreamingRecognizer {
 
 std::unique_ptr<IStreamingRecognizer> create_streaming_recognizer(
     StreamingRecognizerConfig config, RecognitionResultCallback callback,
-    std::unique_ptr<IOnlineAsrEngine> engine) {
+    std::unique_ptr<IOnlineAsrEngine> engine,
+    std::vector<std::unique_ptr<IOfflineAsrEngine>> final_engines) {
   EngineLoader engine_loader;
+  FinalEnginesLoader final_engines_loader;
+  if (final_engines.empty() && !config.final_decoders.empty()) {
+    final_engines_loader = [decoders = config.final_decoders,
+                            provider = config.provider,
+                            threads = config.num_threads]() {
+      std::vector<std::unique_ptr<IOfflineAsrEngine>> loaded;
+      for (const auto& decoder : decoders) {
+        loaded.push_back(create_offline_asr_engine(decoder, provider, threads));
+      }
+      return loaded;
+    };
+  }
   if (!config.enabled) {
     engine = std::make_unique<UnavailableAsrEngine>(
         "ASR disabled by configuration");
@@ -922,7 +1053,30 @@ std::unique_ptr<IStreamingRecognizer> create_streaming_recognizer(
 
   return std::make_unique<StreamingRecognizerWorker>(
       std::move(config), std::move(callback), std::move(engine),
-      std::move(engine_loader));
+      std::move(engine_loader), std::move(final_engines),
+      std::move(final_engines_loader));
+}
+
+std::unique_ptr<IOfflineAsrEngine> create_offline_asr_engine(
+    const FinalDecoderConfig& decoder, const std::string& provider,
+    std::int32_t num_threads) {
+  if (decoder.type != "sense_voice" && decoder.type != "paraformer" &&
+      decoder.type != "zipformer_ctc") {
+    throw std::invalid_argument("unknown final decoder type: " + decoder.type);
+  }
+  for (const auto* path : {&decoder.model, &decoder.tokens}) {
+    std::error_code error;
+    if (path->empty() || !std::filesystem::is_regular_file(*path, error) || error) {
+      throw std::runtime_error("final decoder file missing: " + path->string());
+    }
+  }
+#if DVO_HAS_SHERPA
+  return std::make_unique<SherpaOfflineAsrEngine>(decoder, provider, num_threads);
+#else
+  (void)provider;
+  (void)num_threads;
+  throw std::runtime_error("built without sherpa-onnx");
+#endif
 }
 
 std::unique_ptr<IOnlineAsrEngine> create_online_asr_engine(

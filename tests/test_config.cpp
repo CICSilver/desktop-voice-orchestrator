@@ -50,6 +50,24 @@ TEST_CASE("checked-in default configuration is valid") {
   unsafe = config;
   unsafe.web.bind = "localhost";
   REQUIRE_FALSE(store.validate(unsafe).ok());
+
+  // The checked-in defaults use offline final decoders with resolved paths.
+  CHECK(config.asr.final_decoder == "sense_voice");
+  CHECK(config.asr.final_model.filename() == "model.int8.onnx");
+  CHECK(config.asr.final_model.is_absolute());
+  CHECK(config.asr.fallback_decoder == "zipformer_ctc");
+
+  auto decoders = config;
+  decoders.asr.final_decoder = "whisper";
+  CHECK_FALSE(store.validate(decoders).ok());
+  decoders = config;
+  decoders.asr.final_model.clear();
+  CHECK_FALSE(store.validate(decoders).ok());
+  decoders = config;
+  decoders.asr.final_decoder = "streaming";  // fallback needs an offline primary
+  CHECK_FALSE(store.validate(decoders).ok());
+  decoders.asr.fallback_decoder = "none";
+  CHECK(store.validate(decoders).ok());
 }
 
 TEST_CASE("AEC calibration patch is validated exposed and persisted") {

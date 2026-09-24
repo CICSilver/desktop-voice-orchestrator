@@ -4,9 +4,11 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <numeric>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -508,5 +510,102 @@ TEST_CASE("downloaded sherpa Online Paraformer model initializes") {
   REQUIRE(recognizer->available());
   CHECK(recognizer->state() == dvo::StreamingRecognizerState::ready);
   CHECK(recognizer->status().find("Online Paraformer ready") != std::string::npos);
+#endif
+}
+
+namespace {
+
+class FakeOfflineEngine final : public dvo::IOfflineAsrEngine {
+ public:
+  FakeOfflineEngine(std::string name, std::string prefix,
+                    std::shared_ptr<std::vector<std::size_t>> decoded)
+      : name_(std::move(name)), prefix_(std::move(prefix)), decoded_(std::move(decoded)) {}
+
+  [[nodiscard]] std::string name() const override { return name_; }
+
+  dvo::AsrHypothesis decode(std::span<const float> samples, std::uint32_t) override {
+    decoded_->push_back(samples.size());
+    dvo::AsrHypothesis value;
+    value.decoder = name_;
+    value.text = prefix_ + std::to_string(samples.size());
+    return value;
+  }
+
+ private:
+  std::string name_;
+  std::string prefix_;
+  std::shared_ptr<std::vector<std::size_t>> decoded_;
+};
+
+}  // namespace
+
+TEST_CASE("final decoders replace the streaming exact-final and report alternatives") {
+  auto state = std::make_shared<FakeEngineState>();
+  auto decoded = std::make_shared<std::vector<std::size_t>>();
+  std::vector<std::unique_ptr<dvo::IOfflineAsrEngine>> finals;
+  finals.push_back(std::make_unique<FakeOfflineEngine>("sense_voice", "sv:", decoded));
+  finals.push_back(std::make_unique<FakeOfflineEngine>("zipformer_ctc", "zc:", decoded));
+  ResultCollector collector;
+  auto recognizer = dvo::create_streaming_recognizer(
+      fake_config(), [&collector](dvo::RecognitionResult result) {
+        collector.push(std::move(result));
+      },
+      std::make_unique<FakeEngine>(state), std::move(finals));
+
+  auto candidate = std::make_shared<dvo::UtteranceCandidate>();
+  candidate->utterance_id = "final-decoders";
+  candidate->pcm = {1.0F, 2.0F, 3.0F};
+  dvo::RecognitionFinalize finalize;
+  finalize.utterance_id = candidate->utterance_id;
+  finalize.generation = 1;
+  finalize.candidate = candidate;
+  REQUIRE(recognizer->try_finalize(std::move(finalize)) ==
+          dvo::RecognitionSubmitStatus::accepted);
+  REQUIRE(collector.wait_for_kind(dvo::RecognitionResultKind::final));
+
+  const auto results = collector.snapshot();
+  const auto final = std::find_if(results.begin(), results.end(), [](const auto& result) {
+    return result.kind == dvo::RecognitionResultKind::final;
+  });
+  REQUIRE(final != results.end());
+  CHECK(final->exact_final);
+  CHECK(final->hypothesis.text == "sv:3");
+  CHECK(final->hypothesis.decoder == "sense_voice");
+  REQUIRE(final->hypothesis.alternatives.size() == 1);
+  CHECK(final->hypothesis.alternatives[0].decoder == "zipformer_ctc");
+  CHECK(final->hypothesis.alternatives[0].text == "zc:3");
+  CHECK((*decoded == std::vector<std::size_t>{3, 3}));
+  // The streaming engine is not used for the authoritative pass.
+  std::lock_guard lock(state->mutex);
+  CHECK(state->sessions.empty());
+}
+
+TEST_CASE("unknown final decoder types and missing files are rejected") {
+  CHECK_THROWS_AS(dvo::create_offline_asr_engine({"whisper", "model.onnx", "tokens.txt"},
+                                                 "cpu", 1),
+                  std::invalid_argument);
+  CHECK_THROWS_AS(dvo::create_offline_asr_engine({"sense_voice", "missing/model.onnx",
+                                                  "missing/tokens.txt"},
+                                                 "cpu", 1),
+                  std::runtime_error);
+}
+
+TEST_CASE("downloaded SenseVoice final decoder recognizes silence without error") {
+#if !DVO_HAS_SHERPA
+  SKIP("core-only build does not include sherpa-onnx");
+#else
+  const auto model = std::filesystem::path(DVO_PROJECT_ROOT) /
+                     "models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17";
+  if (!std::filesystem::is_regular_file(model / "model.int8.onnx") ||
+      !std::filesystem::is_regular_file(model / "tokens.txt")) {
+    SKIP("run fetch_models to enable the SenseVoice integration test");
+  }
+  auto engine = dvo::create_offline_asr_engine(
+      {"sense_voice", model / "model.int8.onnx", model / "tokens.txt"}, "cpu", 1);
+  REQUIRE(engine);
+  CHECK(engine->name() == "sense_voice");
+  const std::vector<float> silence(16000, 0.0F);
+  const auto hypothesis = engine->decode(silence, 16000);
+  CHECK(hypothesis.decoder == "sense_voice");
 #endif
 }

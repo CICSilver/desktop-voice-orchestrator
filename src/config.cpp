@@ -54,6 +54,12 @@ std::filesystem::path resolve(const std::filesystem::path& root,
   return value.is_absolute() ? value : root / value;
 }
 
+// For optional model paths an unset value must stay empty, not become root.
+std::filesystem::path resolve_optional(const std::filesystem::path& root,
+                                       const std::filesystem::path& value) {
+  return value.empty() ? value : resolve(root, value);
+}
+
 template <typename T>
 void assign_if(const nlohmann::json& object, const char* key, T& value) {
   if (const auto it = object.find(key); it != object.end()) value = it->get<T>();
@@ -185,6 +191,12 @@ AppConfig ConfigStore::load() const {
   c.asr.max_pending_audio_ms = read<std::int64_t>(table, "asr.max_pending_audio_ms", 60000);
   c.asr.emit_partials = read<bool>(table, "asr.emit_partials", true);
   c.asr.exact_final_redecode = read<bool>(table, "asr.exact_final_redecode", true);
+  c.asr.final_decoder = read<std::string>(table, "asr.final_decoder", "streaming");
+  c.asr.final_model = resolve_optional(project_root_, read_path(table, "asr.final_model", {}));
+  c.asr.final_tokens = resolve_optional(project_root_, read_path(table, "asr.final_tokens", {}));
+  c.asr.fallback_decoder = read<std::string>(table, "asr.fallback_decoder", "none");
+  c.asr.fallback_model = resolve_optional(project_root_, read_path(table, "asr.fallback_model", {}));
+  c.asr.fallback_tokens = resolve_optional(project_root_, read_path(table, "asr.fallback_tokens", {}));
 
   c.commands.enabled = read<bool>(table, "commands.enabled", true);
   c.commands.default_volume_step_percent =
@@ -310,6 +322,21 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
         "asr.max_pending_audio_ms must be in [1000, 300000]");
   range(c.asr.exact_final_redecode,
         "asr.exact_final_redecode must remain true: only exact candidate PCM may execute commands");
+  const auto offline_decoder = [](const std::string& type) {
+    return type == "sense_voice" || type == "paraformer" || type == "zipformer_ctc";
+  };
+  range(c.asr.final_decoder == "streaming" || offline_decoder(c.asr.final_decoder),
+        "asr.final_decoder must be 'streaming', 'sense_voice', 'paraformer' or 'zipformer_ctc'");
+  range(c.asr.final_decoder == "streaming" ||
+            (!c.asr.final_model.empty() && !c.asr.final_tokens.empty()),
+        "asr.final_model and asr.final_tokens are required for an offline final decoder");
+  range(c.asr.fallback_decoder == "none" || offline_decoder(c.asr.fallback_decoder),
+        "asr.fallback_decoder must be 'none', 'sense_voice', 'paraformer' or 'zipformer_ctc'");
+  range(c.asr.fallback_decoder == "none" || c.asr.final_decoder != "streaming",
+        "asr.fallback_decoder requires an offline asr.final_decoder");
+  range(c.asr.fallback_decoder == "none" ||
+            (!c.asr.fallback_model.empty() && !c.asr.fallback_tokens.empty()),
+        "asr.fallback_model and asr.fallback_tokens are required for a fallback decoder");
   range(c.commands.default_volume_step_percent >= 1 &&
             c.commands.default_volume_step_percent <= c.commands.max_spoken_volume_step_percent,
         "commands.default_volume_step_percent must be within the spoken volume range");
@@ -408,7 +435,9 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                {"provider", c.asr.provider}, {"num_threads", c.asr.num_threads},
                {"feed_chunk_ms", c.asr.feed_chunk_ms},
                {"encoder", c.asr.encoder.string()}, {"decoder", c.asr.decoder.string()},
-               {"tokens", c.asr.tokens.string()}}},
+               {"tokens", c.asr.tokens.string()},
+               {"final_decoder", c.asr.final_decoder},
+               {"fallback_decoder", c.asr.fallback_decoder}}},
       {"commands", {{"enabled", c.commands.enabled},
                     {"default_volume_step_percent", c.commands.default_volume_step_percent},
                     {"max_spoken_volume_step_percent", c.commands.max_spoken_volume_step_percent},
@@ -512,7 +541,13 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                {"queue_capacity", c.asr.queue_capacity},
                {"max_pending_audio_ms", c.asr.max_pending_audio_ms},
                {"emit_partials", c.asr.emit_partials},
-               {"exact_final_redecode", c.asr.exact_final_redecode}}},
+               {"exact_final_redecode", c.asr.exact_final_redecode},
+               {"final_decoder", c.asr.final_decoder},
+               {"final_model", c.asr.final_model.string()},
+               {"final_tokens", c.asr.final_tokens.string()},
+               {"fallback_decoder", c.asr.fallback_decoder},
+               {"fallback_model", c.asr.fallback_model.string()},
+               {"fallback_tokens", c.asr.fallback_tokens.string()}}},
       {"commands", {{"enabled", c.commands.enabled},
                     {"default_volume_step_percent", c.commands.default_volume_step_percent},
                     {"max_spoken_volume_step_percent", c.commands.max_spoken_volume_step_percent},

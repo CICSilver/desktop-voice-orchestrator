@@ -31,3 +31,19 @@ tokens = "tokens.txt"
 encoder_sha256 = "81a70226a8934e6ed92aa1d4fc486b428b5398e2f2619ed4897b7294cab90e9a"
 decoder_sha256 = "f3cca9f77bb9d93c8fcbfb63ae617b6b1ee96818df3aa3b151c40658fe38594f"
 tokens_sha256 = "59aba8873a2ed1e122c25fee421e25f283b63290efbde85c1f01a853d83cb6e6"
+
+# 权威整句识别（非流式）。转换自 FunAudioLLM/Fun-ASR-Nano-2512。
+[asr_final]
+name = "sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17"
+url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17.tar.bz2"
+sha256 = "257936ea9a64cbe33200274e6367fc26d373ff6ca58b996b15108ffd6b9f6148"
+model_sha256 = "9dc6e72aa8bc6f5966cf2857a0ce3a425b1d72e91500e147d66329f407c017a1"
+tokens_sha256 = "2db4bb25d046e8849e336c9465e248e1694914d996c58c71bdeca18cfb722992"
+
+# 主识别文本无法解析时的备选整句识别。
+[asr_fallback]
+name = "sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03"
+url = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03.tar.bz2"
+sha256 = "f3ad1814fea34c407eab0cc3df6f6b625419ac9a60d8aebd8efe772a8e85ef67"
+model_sha256 = "e291b9c468b651e2697caa09bc684326c3addc6a019e78eb537cfd1a8248ca07"
+tokens_sha256 = "6fed8c6c248516f38e7faa19404b57413e8ce259f1cbc1fa4aebc86eac32fdfd"

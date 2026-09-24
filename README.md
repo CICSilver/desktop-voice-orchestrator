@@ -17,8 +17,9 @@
 
 第一、二部分的 C++20 主链路已经接通：双路 WASAPI 采集、双设备时钟对齐、WebRTC
 AEC3、sherpa-onnx KWS、Silero VAD、20 秒环形缓冲、三类候选话段提取、按唤醒创建的
-在线 Paraformer 会话、严格命令解析、Windows 媒体/音量控制，以及诊断录制、确定性回放
-和本地 Web 调试台。未编译 AEC3、模型缺失或参考流失效时会显式降级，KWS/VAD 仍可工作，
+在线 Paraformer 会话（仅用于调试台的实时部分文本）、非流式整句识别（SenseVoice，
+解析失败时再试 Zipformer-CTC）、严格命令解析、Windows 媒体/音量控制，以及诊断录制、
+确定性回放和本地 Web 调试台。未编译 AEC3、模型缺失或参考流失效时会显式降级，KWS/VAD 仍可工作，
 但不可信候选不会执行系统动作。
 
 AEC 支持选择多通道麦克风中的指定通道，并用真实 loopback/mic 互相关自动估计外部延迟；
@@ -59,7 +60,8 @@ USB 音箱 WASAPI Loopback ─┐
                                 prefix / suffix / embedded / follow-up
                                      （输出连续整句 PCM，文本层剥离唤醒词）
                                                     │
-                                         Online Paraformer worker
+                        ASR worker：Online Paraformer（部分文本）
+                        + SenseVoice / Zipformer-CTC（整句权威结果）
                                                     │
                               严格规则解析 → 保序 Windows 执行器
                                                     │
@@ -126,7 +128,7 @@ AEC、流式识别、命令语法和执行边界见
 | 回声消除 | WebRTC AEC3 | 软件 AEC 优先，实测失败后才考虑带硬件 AEC 的麦克风阵列 |
 | 音频前端 | C++ | 负责低延迟采集、时钟对齐、AEC、重采样和环形缓冲区 |
 | 唤醒词 | sherpa-onnx 开放词表 KWS | 通过文字或拼音配置短语，无需为每个唤醒词重新训练模型 |
-| 语音识别 | FunASR 来源的 Online Paraformer，由 sherpa-onnx 运行 | 复用同一套 ONNX Runtime，KWS 命中后才创建会话 |
+| 语音识别 | 整句：SenseVoice（Fun-ASR-Nano 转换）+ Zipformer-CTC 备选；部分文本：Online Paraformer，均由 sherpa-onnx 运行 | 复用同一套 ONNX Runtime，KWS 命中后才创建会话；选型依据见 docs/EVALUATION.md |
 | 编排层 | C++ 确定性规则 | 完整消费文本，先形成计划再严格保序执行 |
 | Windows 控制 | GSMTC、IAudioEndpointVolume | 使用显式 Play/Pause 和相对音量百分点，不发送媒体键 |
 

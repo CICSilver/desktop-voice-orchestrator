@@ -265,13 +265,50 @@ bool spot_keyword(IKeywordSpotter& spotter, std::span<const float> samples) {
   return false;
 }
 
-std::string decode_text(IOnlineAsrEngine& engine, std::span<const float> samples) {
-  if (samples.empty()) return {};
-  auto session = engine.create_session();
-  if (!session) return {};
-  (void)session->accept(samples, static_cast<std::uint32_t>(kRate));
-  return session->finish().text;
-}
+// Reference decodes use the same recognizer as the pipeline's authoritative
+// exact-final pass, so "would more audio recover this character" is answered
+// by the model that dropped it.
+class ReferenceDecoder {
+ public:
+  explicit ReferenceDecoder(const AppConfig& config) {
+    try {
+      if (config.asr.final_decoder != "streaming") {
+        offline_ = create_offline_asr_engine(
+            {config.asr.final_decoder, config.asr.final_model, config.asr.final_tokens},
+            config.asr.provider, config.asr.num_threads);
+      } else {
+        StreamingRecognizerConfig asr;
+        asr.enabled = config.asr.enabled;
+        asr.encoder = config.asr.encoder;
+        asr.decoder = config.asr.decoder;
+        asr.tokens = config.asr.tokens;
+        asr.provider = config.asr.provider;
+        asr.num_threads = config.asr.num_threads;
+        asr.sample_rate = static_cast<std::uint32_t>(kRate);
+        online_ = create_online_asr_engine(asr);
+      }
+    } catch (const std::exception&) {
+      offline_.reset();
+      online_.reset();
+    }
+  }
+
+  [[nodiscard]] bool available() const { return offline_ || online_; }
+
+  std::string decode(std::span<const float> samples) {
+    if (samples.empty()) return {};
+    if (offline_) return offline_->decode(samples, static_cast<std::uint32_t>(kRate)).text;
+    if (!online_) return {};
+    auto session = online_->create_session();
+    if (!session) return {};
+    (void)session->accept(samples, static_cast<std::uint32_t>(kRate));
+    return session->finish().text;
+  }
+
+ private:
+  std::unique_ptr<IOfflineAsrEngine> offline_;
+  std::unique_ptr<IOnlineAsrEngine> online_;
+};
 
 // -------------------------------------------------------------- scoring --
 
@@ -462,20 +499,7 @@ SessionReference compute_session_reference(const std::filesystem::path& session,
 
   const auto spotter = create_keyword_spotter(config.kws);
   const bool kws_ready = spotter && spotter->available();
-  std::unique_ptr<IOnlineAsrEngine> engine;
-  try {
-    StreamingRecognizerConfig asr;
-    asr.enabled = config.asr.enabled;
-    asr.encoder = config.asr.encoder;
-    asr.decoder = config.asr.decoder;
-    asr.tokens = config.asr.tokens;
-    asr.provider = config.asr.provider;
-    asr.num_threads = config.asr.num_threads;
-    asr.sample_rate = static_cast<std::uint32_t>(kRate);
-    engine = create_online_asr_engine(asr);
-  } catch (const std::exception&) {
-    engine.reset();
-  }
+  ReferenceDecoder decoder(config);
 
   for (std::size_t index = 0; index < labels.takes.size(); ++index) {
     const auto& take = labels.takes[index];
@@ -490,10 +514,10 @@ SessionReference compute_session_reference(const std::filesystem::path& session,
         result.kws_processed = spot_keyword(*spotter, slice(processed, from, to));
       }
     }
-    if (engine) {
-      result.asr_microphone = decode_text(*engine, slice(microphone, from, to));
+    if (decoder.available()) {
+      result.asr_microphone = decoder.decode(slice(microphone, from, to));
       if (!processed.empty()) {
-        result.asr_processed = decode_text(*engine, slice(processed, from, to));
+        result.asr_processed = decoder.decode(slice(processed, from, to));
       }
     }
     result.speech_dbfs =
@@ -527,12 +551,12 @@ SessionReference compute_session_reference(const std::filesystem::path& session,
         if (!head.empty()) result.head_db = *std::ranges::max_element(head) - *speech;
       }
     }
-    if (engine) {
-      result.text = decode_text(*engine, slice(signal, start, end));
+    if (decoder.available()) {
+      result.text = decoder.decode(slice(signal, start, end));
       result.text_head_extended =
-          decode_text(*engine, slice(signal, start - kExtensionSeconds, end));
+          decoder.decode(slice(signal, start - kExtensionSeconds, end));
       result.text_tail_extended =
-          decode_text(*engine, slice(signal, start, end + kExtensionSeconds));
+          decoder.decode(slice(signal, start, end + kExtensionSeconds));
     }
     reference.candidates[string_field(utterance, "utterance_id")] = std::move(result);
   }
