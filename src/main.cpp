@@ -61,17 +61,30 @@ void write_text(const std::filesystem::path& path, const std::string& text) {
   if (!output) throw std::runtime_error("cannot write " + path.string());
 }
 
+// Training recordings (labels "purpose": "train") must never be scored, or the
+// evaluation would measure data the models were fitted to.
+bool training_session(const std::filesystem::path& session) {
+  try {
+    std::ifstream stream(session / "labels.json", std::ios::binary);
+    const auto labels = nlohmann::json::parse(stream);
+    return labels.is_object() && labels.value("purpose", "") == "train";
+  } catch (const std::exception&) {
+    return false;  // load_evaluation_labels() reports malformed files
+  }
+}
+
 std::vector<std::filesystem::path> labeled_sessions(const std::filesystem::path& target) {
   std::vector<std::filesystem::path> sessions;
   if (std::filesystem::is_regular_file(target / "labels.json")) {
-    sessions.push_back(target);
+    if (!training_session(target)) sessions.push_back(target);
     return sessions;
   }
   if (!std::filesystem::is_directory(target)) {
     throw std::invalid_argument(target.string() + " is not a directory");
   }
   for (const auto& entry : std::filesystem::directory_iterator(target)) {
-    if (entry.is_directory() && std::filesystem::is_regular_file(entry.path() / "labels.json")) {
+    if (entry.is_directory() && std::filesystem::is_regular_file(entry.path() / "labels.json") &&
+        !training_session(entry.path())) {
       sessions.push_back(entry.path());
     }
   }
@@ -152,7 +165,8 @@ int run_evaluation(int argc, char** argv, const dvo::AppConfig& config,
     });
   }
   if (sessions.empty()) {
-    std::cerr << "no session with labels.json under " << argv[2] << "\n";
+    std::cerr << "no evaluation session with labels.json under " << argv[2]
+              << " (training sessions are skipped)\n";
     return 1;
   }
   std::vector<nlohmann::json> reports;
@@ -160,9 +174,16 @@ int run_evaluation(int argc, char** argv, const dvo::AppConfig& config,
     std::cerr << "evaluating " << session.filename().string() << " ..." << std::endl;
     const auto labels = dvo::load_evaluation_labels(session / "labels.json");
     dvo::VoiceFrontendRuntime runtime(config, store);
-    auto run = runtime.run_benchmark_detailed(session);
+    // The "after AEC" reference must come from this replay's AEC, not the
+    // processed.wav recorded under whatever configuration was live then.
+    const auto processed = std::filesystem::temp_directory_path() /
+                           ("dvo-processed-" + session.filename().string() + ".wav");
+    auto run = runtime.run_benchmark_detailed(session, processed);
     const auto& utterances = run.metrics["utterances"];
-    const auto reference = dvo::compute_session_reference(session, labels, config, utterances);
+    const auto reference =
+        dvo::compute_session_reference(session, labels, config, utterances, processed);
+    std::error_code removed;
+    std::filesystem::remove(processed, removed);
     auto report = dvo::evaluate_labeled_session(labels, utterances, reference);
     report["session"]["name"] = session.filename().string();
     report["session"]["path"] = session.string();

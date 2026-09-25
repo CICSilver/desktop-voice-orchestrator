@@ -48,6 +48,7 @@ code { color: var(--cyan); font: 12px Consolas, monospace; }
 .background-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .background-row label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
 .background-row input { width: 80px; }
+.background-row select { width: auto; }
 .background-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .background-stats div { display: grid; gap: 4px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: #0b1118; }
 .background-stats span, .background-stats small { color: var(--muted); font-size: 12px; }

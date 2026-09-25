@@ -44,6 +44,103 @@ const NEGATIVES = [
   {key: 'neg-chat', kind: 'negative', say: '今天晚上吃点什么好呢', note: '这条不要说唤醒词'}
 ];
 
+// Personal training data: randomized prompts covering every command phrase,
+// spoken amounts, both wake positions, two-command chains and the two-step
+// flow (the wake word alone, then a command without it). These sessions are
+// labelled purpose "train": evaluate skips them, so the evaluation batches
+// stay unseen by training.
+const TRAINING_GROUPS = {
+  quiet: {id: 'train-quiet', title: '训练数据 · 安静', condition: 'quiet', distance_m: 0.5,
+    script: 'train', purpose: 'train',
+    intro: '关掉音乐和视频，在平时用电脑的位置说话。句子是随机生成的，照着念；语气和快慢自然变化就好，有提示时按提示说。'},
+  music: {id: 'train-music', title: '训练数据 · 播放音乐', condition: 'music', distance_m: 0.5,
+    script: 'train', purpose: 'train',
+    intro: '用音箱播放你平时听的音乐（带人声的歌也要有），音量调到平时习惯的大小，照着念。'}
+};
+const TRAIN_PHRASES = [
+  {say: '播放音乐', action: 'play'}, {say: '打开音乐', action: 'play'},
+  {say: '暂停音乐', action: 'pause'},
+  {say: '增加音量', action: 'up', sign: 1}, {say: '降低音量', action: 'down', sign: -1}
+];
+const TRAIN_CONNECTORS = ['，然后', '，再', '，然后再', '，接着'];
+// Common amounts weighted up; every value the parser accepts can appear.
+const TRAIN_AMOUNTS = [5, 5, 10, 10, 10, 20, 15, 3, 8, 2, 1, 12, 6, 18];
+const TRAIN_STYLES = ['说快一点', '声音轻一点', '稍微大声一点', '像随口一说', '慢一点说'];
+const DIGITS = '零一二三四五六七八九';
+
+function chineseNumber(value) {
+  if (value < 10) return DIGITS[value];
+  if (value === 10) return '十';
+  return value < 20 ? `十${DIGITS[value - 10]}` : '二十';
+}
+
+// Deterministic per collection, so a batch's prompts can be regenerated.
+function seededRandom(seed) {
+  let h = 1779033703 ^ seed.length;
+  for (const ch of seed) {
+    h = Math.imul(h ^ ch.charCodeAt(0), 3432918353);
+    h = (h << 13) | (h >>> 19);
+  }
+  return () => {
+    h = (h + 0x6D2B79F5) | 0;
+    let t = Math.imul(h ^ (h >>> 15), 1 | h);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+function trainingPhrase(random, previousAction) {
+  const pick = (list) => list[Math.floor(random() * list.length)];
+  let phrase;
+  do phrase = pick(TRAIN_PHRASES);
+  while (phrase.action === previousAction);
+  if (!phrase.sign) {
+    return {say: phrase.say, action: phrase.action, actions: [phrase.action === 'play' ? PLAY : PAUSE]};
+  }
+  if (random() < 0.4) return {say: phrase.say, action: phrase.action, actions: [volume(5 * phrase.sign)]};
+  const amount = pick(TRAIN_AMOUNTS);
+  return {say: `${phrase.say}百分之${chineseNumber(amount)}`, action: phrase.action,
+    actions: [volume(amount * phrase.sign)]};
+}
+
+function buildTrainingScript(group) {
+  const random = seededRandom(`${state.collectionId}-${group.id}`);
+  const pick = (list) => list[Math.floor(random() * list.length)];
+  // Exact proportions, shuffled: 10% wake word alone, 15% without it.
+  const wakeCount = Math.round(group.count * 0.1);
+  const bareCount = Math.round(group.count * 0.15);
+  const kinds = Array.from({length: group.count}, (_, index) =>
+    index < wakeCount ? 'wake' : index < wakeCount + bareCount ? 'bare' : 'command');
+  for (let index = kinds.length - 1; index > 0; index -= 1) {
+    const other = Math.floor(random() * (index + 1));
+    [kinds[index], kinds[other]] = [kinds[other], kinds[index]];
+  }
+  const script = [];
+  for (const kind of kinds) {
+    let item;
+    if (kind === 'wake') {
+      item = {key: 'wake', kind: 'wake', position: 'none', say: state.wake, actions: []};
+    } else if (kind === 'bare') {
+      const phrase = trainingPhrase(random);
+      item = {key: 'bare', kind: 'bare_command', position: 'none', say: phrase.say,
+        actions: phrase.actions, note: '这条不说唤醒词'};
+    } else {
+      const parts = [trainingPhrase(random)];
+      if (random() < 0.3) parts.push(trainingPhrase(random, parts[0].action));
+      const body = parts.map((part, i) => (i ? pick(TRAIN_CONNECTORS) : '') + part.say).join('');
+      const prefix = random() < 0.5;
+      item = {key: prefix ? 'prefix' : 'suffix', kind: 'command', position: prefix ? 'prefix' : 'suffix',
+        say: prefix ? `${state.wake}，${body}` : `${body}，${state.wake}`,
+        actions: parts.flatMap((part) => part.actions)};
+    }
+    if (!item.note && random() < 0.3) item.note = pick(TRAIN_STYLES);
+    script.push(item);
+  }
+  return script;
+}
+
+const KIND_LABELS = {negative: '不带唤醒词', bare_command: '不带唤醒词', wake: '只说唤醒词', silence: '静默'};
+
 // Pause before each prompt appears. Together with reading time it keeps
 // consecutive takes in separate VAD segments (endpoint silence is 0.9 s).
 const GAP_S = 1.5;
@@ -81,6 +178,7 @@ const state = {
   takeStart: 0,
   saved: [],
   background: null,
+  trainingOnly: false,
   recording: false,
   mic: -120,
   loop: -120
@@ -210,7 +308,7 @@ function renderGroups() {
 function buildTakes(group) {
   const rotation = ((group.rotation || 0) * 5) % COMMANDS.length;
   const commands = COMMANDS.slice(rotation).concat(COMMANDS.slice(0, rotation));
-  const script = [
+  const script = group.script === 'train' ? buildTrainingScript(group) : [
     {key: 'silence', kind: 'silence', position: 'none', say: '', actions: [], auto_s: group.silence_s,
       note: group.condition === 'music' ? '让音乐继续播放，不要说话' : '不要说话'},
     ...NEGATIVES.map((item) => ({...item, position: 'none', actions: []})),
@@ -296,7 +394,7 @@ function beginTake() {
   $('take-group').textContent = state.group.title;
   $('take-kind').textContent = take.kind === 'command'
     ? (take.wake_position === 'prefix' ? '唤醒词在前' : '唤醒词在后')
-    : take.kind === 'negative' ? '不带唤醒词' : '静默';
+    : KIND_LABELS[take.kind] || '';
   $('take-progress-bar').style.width = `${(state.takeIndex / state.takes.length * 100).toFixed(1)}%`;
   $('take-prompt').textContent = '准备…';
   $('take-prompt').className = 'prompt waiting';
@@ -373,6 +471,7 @@ function labelsDocument(complete) {
     schema: 'dvo-eval-labels',
     schema_version: 1,
     collection_id: state.collectionId,
+    purpose: state.group.purpose || 'evaluate',
     group: {
       id: state.group.id,
       title: state.group.title,
@@ -465,6 +564,9 @@ async function finish() {
   $('evaluate-command').textContent =
     '.\\build\\windows-x64\\Release\\voice_frontend.exe evaluate data\\sessions ' +
     `--since=${state.collectionId} --out=data\\evaluation-${state.collectionId}.json`;
+  $('finished-lead').hidden = state.trainingOnly;
+  $('evaluate-command').hidden = state.trainingOnly;
+  $('finished-training').hidden = !state.trainingOnly;
   show('finished');
 }
 
@@ -496,6 +598,21 @@ async function startCollection() {
     return;
   }
   if (!await prepareCollection()) return;
+  state.trainingOnly = false;
+  state.groupIndex = 0;
+  showIntro();
+}
+
+async function startTraining() {
+  const count = Math.round(Number($('training-count').value));
+  if (!(count >= 10 && count <= 200)) {
+    $('setup-message').textContent = '训练数据每轮 10 到 200 条。';
+    return;
+  }
+  const group = TRAINING_GROUPS[$('training-condition').value];
+  if (!await prepareCollection()) return;
+  state.trainingOnly = true;
+  state.plan = [{...group, count}];
   state.groupIndex = 0;
   showIntro();
 }
@@ -580,6 +697,7 @@ async function startBackground() {
     return;
   }
   state.group = BACKGROUND_GROUP;
+  state.trainingOnly = false;
   state.background = {targetMs: minutes * 60000, recordedMs: 0, segment: 0, saved: 0,
     exclusions: [], busy: true};
   const result = await beginRecording();
@@ -684,10 +802,12 @@ async function init() {
   setDryRun(Boolean(info.live_dry_run));
   $('start-collection').disabled = false;
   $('start-background').disabled = false;
+  $('start-training').disabled = false;
 }
 
 $('start-collection').addEventListener('click', startCollection);
 $('start-background').addEventListener('click', startBackground);
+$('start-training').addEventListener('click', startTraining);
 $('bg-exclude').addEventListener('click', excludeRecent);
 $('bg-stop').addEventListener('click', () => stopBackground(false));
 $('start-group').addEventListener('click', startGroup);

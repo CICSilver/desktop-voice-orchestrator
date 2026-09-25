@@ -190,6 +190,7 @@ AEC、流式识别、命令语法和执行边界见
 - [项目计划](docs/PROJECT_PLAN.md)
 - [系统架构](docs/ARCHITECTURE.md)
 - [识别评估：采集、指标与标注格式](docs/EVALUATION.md)
+- [个性化训练：数据与计划](docs/PERSONALIZATION.md)
 - [ADR-0001：软件 AEC 优先](docs/adr/0001-software-aec-first.md)
 - [ADR-0002：开放词表 KWS 与录音校准](docs/adr/0002-open-vocabulary-kws.md)
 

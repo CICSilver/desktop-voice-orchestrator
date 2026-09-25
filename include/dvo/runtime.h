@@ -32,6 +32,7 @@
 #include "dvo/spsc_queue.h"
 #include "dvo/streaming_recognizer.h"
 #include "dvo/utterance_lifecycle.h"
+#include "dvo/wav_file.h"
 #include "dvo/wake_probe.h"
 #include "dvo/wasapi_capture.h"
 
@@ -58,8 +59,11 @@ class VoiceFrontendRuntime {
     std::uint64_t first_frame_sample{};
   };
   [[nodiscard]] nlohmann::json run_benchmark(const std::filesystem::path& session);
+  // processed_dump, when set, receives the replay's preprocessed (AEC) mono
+  // 16 kHz stream, starting at first_frame_sample.
   [[nodiscard]] BenchmarkRun run_benchmark_detailed(
-      const std::filesystem::path& session);
+      const std::filesystem::path& session,
+      const std::filesystem::path& processed_dump = {});
   void stop();
   [[nodiscard]] bool running() const { return running_.load(std::memory_order_acquire); }
   [[nodiscard]] std::string debug_url() const { return debug_.url(); }
@@ -280,6 +284,9 @@ class VoiceFrontendRuntime {
   std::atomic<bool> benchmark_capture_enabled_{};
   mutable std::mutex benchmark_events_mutex_;
   std::vector<nlohmann::json> benchmark_events_;
+  // Opened before a benchmark replay starts and closed after stop() joins the
+  // processing thread, which is its only writer.
+  FloatWavWriter processed_dump_;
 
   mutable std::mutex capture_events_mutex_;
   std::deque<std::pair<std::string, std::string>> capture_events_;

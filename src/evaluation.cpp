@@ -494,15 +494,18 @@ TextCoverage text_coverage(std::string_view expected, std::string_view recognize
 SessionReference compute_session_reference(const std::filesystem::path& session,
                                            const EvaluationLabels& labels,
                                            const AppConfig& config,
-                                           const nlohmann::json& utterance_summary) {
+                                           const nlohmann::json& utterance_summary,
+                                           const std::filesystem::path& processed_audio) {
   SessionReference reference;
   reference.takes.resize(labels.takes.size());
 
   const auto microphone = microphone_16k(session / "mic.wav", config);
   std::vector<float> processed;
-  if (std::filesystem::is_regular_file(session / "processed.wav")) {
+  const auto processed_path =
+      processed_audio.empty() ? session / "processed.wav" : processed_audio;
+  if (std::filesystem::is_regular_file(processed_path)) {
     std::uint32_t rate{};
-    processed = read_mono(session / "processed.wav", &rate);
+    processed = read_mono(processed_path, &rate);
     if (rate != static_cast<std::uint32_t>(kRate)) processed.clear();
   }
   reference.processed_audio = !processed.empty();

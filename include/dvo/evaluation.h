@@ -103,10 +103,13 @@ struct SessionReference {
 
 // Decodes reference results for every scored take and measures the edge
 // levels of every replayed candidate listed in utterance_summary (the output
-// of summarize_replayed_utterances).
+// of summarize_replayed_utterances). processed_audio replaces the session's
+// recorded processed.wav, typically with the AEC output of the replay just
+// scored, so that the reference reflects the configuration under test.
 [[nodiscard]] SessionReference compute_session_reference(
     const std::filesystem::path& session, const EvaluationLabels& labels,
-    const AppConfig& config, const nlohmann::json& utterance_summary);
+    const AppConfig& config, const nlohmann::json& utterance_summary,
+    const std::filesystem::path& processed_audio = {});
 
 // Scores a replayed session against its labels. Pure: all audio analysis is
 // supplied through reference.

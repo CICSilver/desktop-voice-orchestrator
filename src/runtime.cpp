@@ -606,18 +606,38 @@ nlohmann::json VoiceFrontendRuntime::run_benchmark(const std::filesystem::path& 
 }
 
 VoiceFrontendRuntime::BenchmarkRun VoiceFrontendRuntime::run_benchmark_detailed(
-    const std::filesystem::path& session) {
+    const std::filesystem::path& session,
+    const std::filesystem::path& processed_dump) {
   {
     std::scoped_lock lock(benchmark_events_mutex_);
     benchmark_events_.clear();
   }
+  if (!processed_dump.empty()) {
+    processed_dump_.open(processed_dump, {kProcessingSampleRate, 1});
+  }
   benchmark_capture_enabled_.store(true, std::memory_order_release);
   struct CaptureGuard {
     std::atomic<bool>& enabled;
-    ~CaptureGuard() { enabled.store(false, std::memory_order_release); }
-  } capture_guard{benchmark_capture_enabled_};
+    FloatWavWriter& dump;
+    ~CaptureGuard() {
+      enabled.store(false, std::memory_order_release);
+      if (dump.is_open()) dump.close();
+    }
+  } capture_guard{benchmark_capture_enabled_, processed_dump_};
+  // Analysis-speed replay runs several times faster than real time; allow a
+  // long background recording at least its own duration.
+  auto budget = std::chrono::milliseconds(std::chrono::minutes(5));
+  try {
+    FloatWavReader microphone(session / "mic.wav");
+    if (const auto rate = microphone.format().sample_rate; rate != 0) {
+      budget = std::max(budget, std::chrono::milliseconds(
+                                    microphone.frame_count() * 1000 / rate));
+    }
+  } catch (const std::exception&) {
+    // start_replay() reports an unreadable session below.
+  }
   const auto started = std::chrono::steady_clock::now();
-  const auto deadline = started + std::chrono::minutes(5);
+  const auto deadline = started + budget;
   const auto remaining = [&] {
     const auto now = std::chrono::steady_clock::now();
     return now >= deadline
@@ -695,8 +715,10 @@ VoiceFrontendRuntime::BenchmarkRun VoiceFrontendRuntime::run_benchmark_detailed(
       std::filesystem::exists(session / "events.ndjson");
   metrics["comparison"]["event_read_errors"] = event_read_errors;
   // stop() joins the processing thread, which is the only writer of
-  // first_frame_sample_ (it may still be running if the replay timed out).
+  // first_frame_sample_ and processed_dump_ (it may still be running if the
+  // replay timed out).
   stop();
+  if (processed_dump_.is_open()) processed_dump_.close();
   const auto first_frame_sample = first_frame_sample_.value_or(0);
   metrics["replay_first_frame_sample"] = first_frame_sample;
   metrics["utterances"] =
@@ -1067,6 +1089,7 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
   ring_->push(frame.first_sample, frame.samples);
   processed_frames_.fetch_add(1, std::memory_order_relaxed);
   if (recorder_.active()) recorder_.try_enqueue(frame);
+  if (processed_dump_.is_open()) processed_dump_.write(frame.samples);
 
   if (asr_) {
     const auto asr_state = asr_->state();

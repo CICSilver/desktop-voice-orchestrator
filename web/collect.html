@@ -49,6 +49,16 @@
         <button id="start-collection" class="primary" disabled>开始录制所选的组</button>
       </div>
       <div class="background-setup">
+        <h3>个性化训练数据</h3>
+        <p>随机生成的命令句子，也有只说唤醒词、不带唤醒词的，用来拿你的声音微调唤醒和识别模型。这些会话不参与评估。
+          建议安静和放音乐各录几轮，每轮换换坐姿和说话状态。同样遵循上面“停用系统动作”的选项。</p>
+        <div class="background-row">
+          <label>环境 <select id="training-condition"><option value="quiet">安静</option><option value="music">播放音乐</option></select></label>
+          <label>条数 <input id="training-count" type="number" min="10" max="200" step="10" value="60"></label>
+          <button id="start-training" disabled>开始录训练数据</button>
+        </div>
+      </div>
+      <div class="background-setup">
         <h3>日常背景录音（统计长时间误唤醒）</h3>
         <p>照常使用电脑一段时间，全程不说唤醒词。每 15 分钟自动保存成一个会话，可以随时结束。
           同样遵循上面“停用系统动作”的选项。</p>
@@ -131,8 +141,9 @@
       <p class="section-label">DONE</p>
       <h2>采集完成</h2>
       <ul id="saved-list" class="saved-list"></ul>
-      <p class="lead">在项目根目录运行下面的命令，就能得到统计结果（逐条明细写在每个会话的 <code>evaluation.json</code> 里）：</p>
+      <p class="lead" id="finished-lead">在项目根目录运行下面的命令，就能得到统计结果（逐条明细写在每个会话的 <code>evaluation.json</code> 里）：</p>
       <pre id="evaluate-command" class="command-line"></pre>
+      <p class="lead" id="finished-training" hidden>训练数据已保存，不参与评估。可以换个环境或状态再录一轮。</p>
       <div class="stage-actions">
         <button id="restart" class="primary">再录一轮</button>
       </div>
