@@ -4,18 +4,17 @@ const token = new URLSearchParams(location.search).get('token') || '';
 const $ = (id) => document.getElementById(id);
 
 // Each group is recorded as its own session. The command script is the same
-// for every group (rotated so no command is always first or last), which
-// keeps groups comparable when only the environment changes.
+// for every command group, rotated by the group's fixed `rotation` so no
+// command is always first or last and each group's order never changes
+// between batches.
 const GROUPS = [
   {id: 'quiet-near', title: '安静 · 近距离（约 0.5 米）', condition: 'quiet', distance_m: 0.5, silence_s: 15,
-    intro: '关掉音乐和视频，坐在离麦克风约 0.5 米的位置，用平时说话的音量。'},
-  {id: 'quiet-far', title: '安静 · 2 米', condition: 'quiet', distance_m: 2.0, silence_s: 15,
-    intro: '保持安静，站或坐在离麦克风约 2 米的位置，用你平时对电脑说话的音量，不要刻意提高嗓门。'},
-  {id: 'music-far', title: '播放音乐 · 2 米', condition: 'music', distance_m: 2.0, silence_s: 30,
-    intro: '用任意播放器通过音箱播放音乐，音量调到平时习惯的大小，然后在约 2 米处说话。第一条是纯音乐静默段，用来统计误唤醒。'},
-  {id: 'music-near', title: '播放音乐 · 近距离（约 0.5 米）', condition: 'music', distance_m: 0.5, silence_s: 20, optional: true,
-    intro: '继续播放音乐，回到离麦克风约 0.5 米的位置说话。'}
+    rotation: 0, intro: '关掉音乐和视频，坐在离麦克风约 0.5 米的位置，用平时说话的音量。'},
+  {id: 'music-near', title: '播放音乐 · 近距离（约 0.5 米）', condition: 'music', distance_m: 0.5, silence_s: 30,
+    rotation: 3, intro: '用任意播放器通过音箱播放音乐，音量调到平时习惯的大小，坐在离麦克风约 0.5 米的位置说话。第一条是纯音乐静默段，用来统计误唤醒。'}
 ];
+
+const BACKGROUND_GROUP = {id: 'background', title: '日常背景', condition: 'background', distance_m: 0};
 
 const PAUSE = {type: 'media.pause'};
 const PLAY = {type: 'media.play'};
@@ -49,6 +48,19 @@ const NEGATIVES = [
 // consecutive takes in separate VAD segments (endpoint silence is 0.9 s).
 const GAP_S = 1.5;
 const MIN_TAKE_MS = 600;
+// Keep recording briefly after the last take: its command is only closed
+// about a second after speech ends (VAD silence + endpoint), and replay has
+// no audio beyond the end of the recording.
+const TAIL_MS = 2500;
+
+// Background recording is split into sessions of this length, so a closed
+// tab or a crash loses at most one segment and evaluate never has to hold
+// hours of audio in memory at once.
+const BACKGROUND_SEGMENT_MS = 15 * 60 * 1000;
+// "Exclude" covers what was just said and the follow-up window it may have
+// opened (6 s idle after the utterance is processed).
+const EXCLUDE_BEFORE_MS = 30000;
+const EXCLUDE_AFTER_MS = 10000;
 
 const state = {
   wake: '',
@@ -68,6 +80,7 @@ const state = {
   timer: null,
   takeStart: 0,
   saved: [],
+  background: null,
   recording: false,
   mic: -120,
   loop: -120
@@ -92,7 +105,7 @@ async function command(action, payload = {}) {
 }
 
 function show(section) {
-  for (const id of ['setup', 'group-intro', 'take', 'group-done', 'finished']) {
+  for (const id of ['setup', 'group-intro', 'take', 'group-done', 'background', 'finished']) {
     $(id).hidden = id !== section;
   }
 }
@@ -156,9 +169,15 @@ function connect() {
       setMeter('intro-mic-bar', 'intro-mic-db', state.mic);
       setMeter('intro-loop-bar', 'intro-loop-db', state.loop);
       setMeter('take-mic-bar', 'take-mic-db', state.mic);
+      setMeter('bg-mic-bar', 'bg-mic-db', state.mic);
+      setMeter('bg-loop-bar', 'bg-loop-db', state.loop);
       updateConditionCheck();
     } else if (type === 'live_dry_run_state') {
       setDryRun(Boolean(payload.enabled));
+    } else if (type === 'recording_state' && !payload.active && state.recording &&
+               state.phase === 'background' && state.background && !state.background.busy &&
+               sessionName(payload.session) === sessionName(state.session)) {
+      stopBackground(true);
     } else if (type === 'recording_state' && !payload.active && state.recording &&
                ['countdown', 'speak'].includes(state.phase)) {
       // Another page stopped the recording underneath us.
@@ -188,8 +207,8 @@ function renderGroups() {
   }));
 }
 
-function buildTakes(group, groupIndex) {
-  const rotation = (groupIndex * 5) % COMMANDS.length;
+function buildTakes(group) {
+  const rotation = ((group.rotation || 0) * 5) % COMMANDS.length;
   const commands = COMMANDS.slice(rotation).concat(COMMANDS.slice(0, rotation));
   const script = [
     {key: 'silence', kind: 'silence', position: 'none', say: '', actions: [], auto_s: group.silence_s,
@@ -228,29 +247,43 @@ function showIntro() {
   updateConditionCheck();
 }
 
-async function startGroup() {
-  $('start-group').disabled = true;
-  showMessage('正在开始录音…');
+async function beginRecording() {
   let result = await command('recording.start');
   if (!result.ok && String(result.error || '').includes('live mode')) {
     await command('live.resume');
     result = await command('recording.start');
   }
+  if (result.ok) {
+    state.session = result.session;
+    state.startedAt = Number(result.started_at_ms) || Date.now();
+    setRecording(true);
+  }
+  return result;
+}
+
+async function saveLabels() {
+  let saved = {ok: false};
+  for (let attempt = 0; attempt < 3 && !saved.ok; attempt += 1) {
+    saved = await command('recording.save_labels', {session: state.session, labels: labelsDocument(true)});
+    if (!saved.ok) await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return saved;
+}
+
+async function startGroup() {
+  $('start-group').disabled = true;
+  showMessage('正在开始录音…');
+  const result = await beginRecording();
   if (!result.ok) {
     $('start-group').disabled = false;
     showMessage(`无法开始录音：${result.error || '未知错误'}`, 'error');
     return;
   }
   showMessage('');
-  state.session = result.session;
-  state.startedAt = Number(result.started_at_ms) || Date.now();
-  // Rotate by the group's fixed position so each group's order is the same
-  // whichever subset of groups is selected.
-  state.takes = buildTakes(state.group, GROUPS.indexOf(state.group));
+  state.takes = buildTakes(state.group);
   state.takeIndex = 0;
   state.attempt = 1;
   state.labels = [];
-  setRecording(true);
   show('take');
   beginTake();
 }
@@ -364,20 +397,15 @@ async function endGroup() {
   $('take-countdown').textContent = '';
   $('take-progress-bar').style.width = '100%';
   for (const id of ['next-take', 'redo-take', 'skip-take', 'abort-group']) $(id).disabled = true;
+  await new Promise((resolve) => setTimeout(resolve, TAIL_MS));
   const stopped = await command('recording.stop');
   setRecording(false);
-  let saved = {ok: false, error: stopped.error};
-  if (stopped.ok) {
-    for (let attempt = 0; attempt < 3 && !saved.ok; attempt += 1) {
-      saved = await command('recording.save_labels', {session: state.session, labels: labelsDocument(true)});
-      if (!saved.ok) await new Promise((resolve) => setTimeout(resolve, 500));
-    }
-  }
+  const saved = stopped.ok ? await saveLabels() : {ok: false, error: stopped.error};
   $('abort-group').disabled = false;
   const name = sessionName(state.session);
   const scored = state.labels.filter((take) => take.status === 'ok').length;
   if (saved.ok) {
-    state.saved.push({title: state.group.title, session: name, takes: scored});
+    state.saved.push({title: state.group.title, session: name, detail: `${scored} 条`});
     $('done-title').textContent = `${state.group.title} 已保存`;
     $('done-text').textContent = `会话 ${name}，有效 ${scored} 条（重录/跳过的不计）。`;
     showMessage('');
@@ -429,13 +457,35 @@ async function finish() {
     if (item.session) {
       const code = document.createElement('code');
       code.textContent = item.session;
-      li.append(code, `（${item.takes} 条）`);
+      li.append(code, `（${item.detail}）`);
     }
     return li;
   }));
+  // --since limits the report to sessions recorded in this run of the page.
   $('evaluate-command').textContent =
-    '.\\build\\windows-x64\\Release\\voice_frontend.exe evaluate data\\sessions --out=data\\evaluation-report.json';
+    '.\\build\\windows-x64\\Release\\voice_frontend.exe evaluate data\\sessions ' +
+    `--since=${state.collectionId} --out=data\\evaluation-${state.collectionId}.json`;
   show('finished');
+}
+
+async function prepareCollection() {
+  $('setup-message').textContent = '';
+  state.speaker = $('speaker').value.trim() || '未命名';
+  const now = new Date();
+  const pad = (value) => String(value).padStart(2, '0');
+  state.collectionId = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-` +
+    `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  state.saved = [];
+  if ($('use-dry-run').checked) {
+    const info = await command('evaluation.info');
+    const result = await command('commands.live_dry_run', {enabled: true});
+    if (!result.ok) {
+      $('setup-message').textContent = `无法停用系统动作：${result.error || '未知错误'}`;
+      return false;
+    }
+    state.previousDryRun = Boolean(info.live_dry_run);
+  }
+  return true;
 }
 
 async function startCollection() {
@@ -445,23 +495,154 @@ async function startCollection() {
     $('setup-message').textContent = '至少选择一组。';
     return;
   }
-  state.speaker = $('speaker').value.trim() || '未命名';
-  const now = new Date();
-  const pad = (value) => String(value).padStart(2, '0');
-  state.collectionId = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-` +
-    `${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  state.saved = [];
+  if (!await prepareCollection()) return;
   state.groupIndex = 0;
-  if ($('use-dry-run').checked) {
-    const info = await command('evaluation.info');
-    const result = await command('commands.live_dry_run', {enabled: true});
-    if (!result.ok) {
-      $('setup-message').textContent = `无法停用系统动作：${result.error || '未知错误'}`;
-      return;
-    }
-    state.previousDryRun = Boolean(info.live_dry_run);
-  }
   showIntro();
+}
+
+// ------------------------------------------------------------ background --
+
+function formatDuration(ms) {
+  const total = Math.floor(Math.max(0, ms) / 1000);
+  const pad = (value) => String(value).padStart(2, '0');
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor(total / 60) % 60;
+  return hours ? `${hours}:${pad(minutes)}:${pad(total % 60)}` : `${minutes}:${pad(total % 60)}`;
+}
+
+// The current segment is one background take, except where the speaker
+// excluded a moment: that becomes a discarded take, so evaluate ignores any
+// wake or command inside it.
+function backgroundTakes(endAt) {
+  const start = state.startedAt;
+  const clip = (value) => Math.min(Math.max(value, start), endAt) - start;
+  const spans = state.background.exclusions
+    .map(({from, to}) => [clip(from), clip(to)])
+    .filter(([from, to]) => to > from)
+    .sort((a, b) => a[0] - b[0]);
+  const takes = [];
+  const push = (status, from, to) => {
+    if (to <= from) return;
+    takes.push({id: `background-${String(takes.length + 1).padStart(2, '0')}`, kind: 'background',
+      status, attempt: 1, prompt: '日常背景', text: '', wake_position: 'none', expected_actions: [],
+      start_ms: from, end_ms: to});
+  };
+  let cursor = 0;
+  for (const [from, to] of spans) {
+    push('ok', cursor, from);
+    push('discarded', Math.max(cursor, from), to);
+    cursor = Math.max(cursor, to);
+  }
+  push('ok', cursor, endAt - start);
+  return takes;
+}
+
+function renderBackground() {
+  const background = state.background;
+  if (!background) return 0;
+  const elapsed = background.recordedMs + (state.recording ? Date.now() - state.startedAt : 0);
+  $('bg-elapsed').textContent = formatDuration(elapsed);
+  $('bg-saved').textContent = `${background.saved} 段`;
+  $('bg-excluded').textContent = `${background.exclusions.length} 处`;
+  $('bg-progress-bar').style.width = `${Math.min(100, elapsed / background.targetMs * 100).toFixed(1)}%`;
+  return elapsed;
+}
+
+async function closeBackgroundSegment(alreadyStopped) {
+  const background = state.background;
+  const endAt = Date.now();
+  const stopped = alreadyStopped ? {ok: true} : await command('recording.stop');
+  setRecording(false);
+  background.recordedMs += endAt - state.startedAt;
+  background.segment += 1;
+  state.labels = backgroundTakes(endAt);
+  const saved = stopped.ok ? await saveLabels() : {ok: false, error: stopped.error};
+  const name = sessionName(state.session);
+  if (saved.ok) {
+    background.saved += 1;
+    state.saved.push({title: `日常背景第 ${background.segment} 段`, session: name,
+      detail: `${((endAt - state.startedAt) / 60000).toFixed(1)} 分钟`});
+  } else {
+    showMessage(`第 ${background.segment} 段的标注没有保存（${saved.error || '未知错误'}），录音在 ${name}。`, 'error');
+  }
+  renderBackground();
+}
+
+async function startBackground() {
+  const minutes = Number($('background-minutes').value);
+  if (!(minutes >= 5)) {
+    $('setup-message').textContent = '背景录音至少 5 分钟。';
+    return;
+  }
+  $('start-background').disabled = true;
+  if (!await prepareCollection()) {
+    $('start-background').disabled = false;
+    return;
+  }
+  state.group = BACKGROUND_GROUP;
+  state.background = {targetMs: minutes * 60000, recordedMs: 0, segment: 0, saved: 0,
+    exclusions: [], busy: true};
+  const result = await beginRecording();
+  $('start-background').disabled = false;
+  if (!result.ok) {
+    state.background = null;
+    await restoreDryRun();
+    $('setup-message').textContent = `无法开始录音：${result.error || '未知错误'}`;
+    return;
+  }
+  state.background.busy = false;
+  state.phase = 'background';
+  $('bg-target').textContent = `目标 ${minutes} 分钟`;
+  $('bg-stop').disabled = false;
+  showMessage('');
+  renderBackground();
+  show('background');
+  clearTimer();
+  state.timer = setInterval(backgroundTick, 1000);
+}
+
+async function backgroundTick() {
+  const background = state.background;
+  if (!background || background.busy) return;
+  if (renderBackground() >= background.targetMs) {
+    await stopBackground(false);
+    return;
+  }
+  if (Date.now() - state.startedAt < BACKGROUND_SEGMENT_MS) return;
+  background.busy = true;
+  await closeBackgroundSegment(false);
+  const result = await beginRecording();
+  background.busy = false;
+  if (!result.ok) {
+    showMessage(`无法开始下一段录音：${result.error || '未知错误'}。已录的段都已保存。`, 'error');
+    background.busy = true;
+    await endBackground();
+  }
+}
+
+function excludeRecent() {
+  if (state.phase !== 'background' || !state.background) return;
+  const now = Date.now();
+  state.background.exclusions.push({from: now - EXCLUDE_BEFORE_MS, to: now + EXCLUDE_AFTER_MS});
+  renderBackground();
+  showMessage('已排除：前 30 秒到之后 10 秒不计入统计。', 'success');
+}
+
+async function stopBackground(alreadyStopped) {
+  const background = state.background;
+  if (!background || background.busy) return;
+  background.busy = true;
+  clearTimer();
+  $('bg-stop').disabled = true;
+  if (state.recording) await closeBackgroundSegment(alreadyStopped);
+  if (alreadyStopped) showMessage('录音被其他页面停止了，已保存到停止时为止的部分。', 'error');
+  await endBackground();
+}
+
+async function endBackground() {
+  clearTimer();
+  state.background = null;
+  await finish();
 }
 
 function handleKey(event) {
@@ -481,6 +662,9 @@ function handleKey(event) {
   } else if (state.phase === 'done' && key === 'Enter') {
     event.preventDefault();
     $('next-group').click();
+  } else if (state.phase === 'background' && (key === 'x' || key === 'X')) {
+    event.preventDefault();
+    excludeRecent();
   }
 }
 
@@ -493,15 +677,19 @@ async function init() {
     $('setup-message').textContent = `无法连接运行时：${info.error || '未知错误'}。请从调试台的链接打开本页。`;
     return;
   }
-  state.wake = (info.wake_words && info.wake_words[0]) || '小助手';
+  state.wake = (info.wake_words && info.wake_words[0]) || '小克';
   $('wake-word').textContent = (info.wake_words && info.wake_words.length)
     ? info.wake_words.join(' / ')
     : `${state.wake}（未在关键词文件里找到，使用默认）`;
   setDryRun(Boolean(info.live_dry_run));
   $('start-collection').disabled = false;
+  $('start-background').disabled = false;
 }
 
 $('start-collection').addEventListener('click', startCollection);
+$('start-background').addEventListener('click', startBackground);
+$('bg-exclude').addEventListener('click', excludeRecent);
+$('bg-stop').addEventListener('click', () => stopBackground(false));
 $('start-group').addEventListener('click', startGroup);
 $('finish-early').addEventListener('click', finish);
 $('next-take').addEventListener('click', () => finishTake('ok'));

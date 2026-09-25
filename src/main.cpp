@@ -40,6 +40,7 @@ void print_usage() {
                "[--no-browser] [--web-port=<port>]\n"
                "  benchmark <session> [--events=<file.ndjson>]\n"
                "  evaluate <labeled session | directory of sessions> [--out=<report.json>]\n"
+               "           [--since=<YYYYMMDD-HHMMSS>]   (only sessions recorded from then on)\n"
                "  parse [--wake=<wake word>]   (one recognized text per stdin line)\n";
 }
 
@@ -142,7 +143,14 @@ int run_parse(const dvo::AppConfig& config) {
 int run_evaluation(int argc, char** argv, const dvo::AppConfig& config,
                    const dvo::ConfigStore& store) {
   if (argc < 3) throw std::invalid_argument("evaluate requires a session or directory path");
-  const auto sessions = labeled_sessions(argv[2]);
+  auto sessions = labeled_sessions(argv[2]);
+  // Session names start with their creation time, so a batch recorded later
+  // can be scored apart from the tuning batch without moving files around.
+  if (const auto since = option_value(argc, argv, "--since")) {
+    std::erase_if(sessions, [&](const std::filesystem::path& session) {
+      return session.filename().string() < *since;
+    });
+  }
   if (sessions.empty()) {
     std::cerr << "no session with labels.json under " << argv[2] << "\n";
     return 1;

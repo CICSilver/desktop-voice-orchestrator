@@ -42,6 +42,18 @@ code { color: var(--cyan); font: 12px Consolas, monospace; }
 .take-note { min-height: 22px; color: var(--amber); text-align: center; }
 .take-meter { margin-top: 18px; }
 
+.background-setup { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--line); }
+.background-setup h3 { margin: 0 0 8px; font-size: 15px; }
+.background-setup p { margin: 0 0 12px; color: #b8c7d8; font-size: 13px; line-height: 1.7; }
+.background-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.background-row label { display: flex; align-items: center; gap: 8px; color: var(--muted); }
+.background-row input { width: 80px; }
+.background-stats { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.background-stats div { display: grid; gap: 4px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: #0b1118; }
+.background-stats span, .background-stats small { color: var(--muted); font-size: 12px; }
+.background-stats b { color: #f3f8ff; font: 700 26px Consolas, monospace; }
+.background-meters { margin-top: 18px; }
+
 .saved-list { margin: 0 0 16px; padding-left: 20px; color: #b8c7d8; line-height: 1.8; }
 .saved-list code { color: var(--text); }
 .command-line { margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: #0b1118; color: var(--cyan); font: 13px Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
@@ -56,5 +68,6 @@ code { color: var(--cyan); font: 12px Consolas, monospace; }
   .stage { padding: 18px 16px; }
   .setup-grid { grid-template-columns: 1fr; }
   .prompt { font-size: 30px; }
+  .background-stats { grid-template-columns: 1fr; }
   .topbar { flex-wrap: wrap; gap: 10px; padding: 16px; }
 }

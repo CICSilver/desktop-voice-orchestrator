@@ -46,7 +46,16 @@
         采集期间停用系统动作（推荐：否则“暂停音乐”会真的把音乐停掉）</label>
       <div class="stage-actions">
         <span id="setup-message" class="control-message-inline"></span>
-        <button id="start-collection" class="primary" disabled>开始</button>
+        <button id="start-collection" class="primary" disabled>开始录制所选的组</button>
+      </div>
+      <div class="background-setup">
+        <h3>日常背景录音（统计长时间误唤醒）</h3>
+        <p>照常使用电脑一段时间，全程不说唤醒词。每 15 分钟自动保存成一个会话，可以随时结束。
+          同样遵循上面“停用系统动作”的选项。</p>
+        <div class="background-row">
+          <label>时长 <input id="background-minutes" type="number" min="5" max="180" step="5" value="60"> 分钟</label>
+          <button id="start-background" disabled>开始背景录音</button>
+        </div>
       </div>
     </section>
 
@@ -91,6 +100,30 @@
       <div class="stage-actions">
         <button id="finish-now">结束采集</button>
         <button id="next-group" class="primary">下一组 <kbd>Enter</kbd></button>
+      </div>
+    </section>
+
+    <section id="background" class="panel stage" hidden>
+      <p class="section-label">BACKGROUND</p>
+      <h2>日常背景录音</h2>
+      <p class="lead">
+        照常用电脑：看视频、听歌、打电话、和人聊天、自言自语都可以，只是<strong>不要说唤醒词</strong>。
+        本页可以切到后台，但不要关掉它，也别让电脑睡眠。
+      </p>
+      <div class="background-stats">
+        <div><span>已录</span><b id="bg-elapsed">0:00</b><small id="bg-target"></small></div>
+        <div><span>已保存</span><b id="bg-saved">0 段</b><small>每 15 分钟一段</small></div>
+        <div><span>已排除</span><b id="bg-excluded">0 处</b><small>说了唤醒词时点排除</small></div>
+      </div>
+      <div class="progress"><i id="bg-progress-bar"></i></div>
+      <div class="meters background-meters">
+        <div class="meter"><span>麦克风</span><div class="bar"><i id="bg-mic-bar"></i></div><b id="bg-mic-db">— dBFS</b></div>
+        <div class="meter"><span>音箱输出</span><div class="bar"><i id="bg-loop-bar"></i></div><b id="bg-loop-db">— dBFS</b></div>
+      </div>
+      <p class="take-note">不小心说了唤醒词，或者真的对它说了话？点“排除刚才”，前 30 秒到之后 10 秒不计入统计。</p>
+      <div class="stage-actions">
+        <button id="bg-exclude">排除刚才 <kbd>X</kbd></button>
+        <button id="bg-stop" class="primary">结束并保存</button>
       </div>
     </section>
 

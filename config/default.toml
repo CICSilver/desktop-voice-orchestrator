@@ -95,8 +95,9 @@ enabled = true
 model = "models/silero_vad.int8.onnx"
 provider = "cpu"
 num_threads = 1
-# 热：语音概率阈值，范围0..1。
-threshold = 0.25
+# 热：语音概率阈值，范围0..1。语音在概率低于 threshold-0.15 持续 min_silence_ms 后才结束；
+# 0.25 时房间底噪和按键声会让一段语音拖到下一句，把相邻命令并成一个候选（2026-09-24 实测）。
+threshold = 0.5
 window_size = 512
 min_speech_ms = 150
 min_silence_ms = 600

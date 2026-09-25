@@ -240,9 +240,20 @@ void correct_wake_confirmed_asr_confusions(
   auto amount = default_delta;
   bool explicit_amount = false;
 
+  std::optional<std::size_t> percent_number_start;
   if (starts_with_at(text, result.end, "百分之")) {
+    percent_number_start = result.end + std::string_view{"百分之"}.size();
+  } else if (starts_with_at(text, result.end, "百分")) {
+    // Exact-final ASR sometimes drops the unstressed "之" ("百分十").
+    const auto start = result.end + std::string_view{"百分"}.size();
+    if (const auto decoded = decode_one(text, start);
+        decoded && is_numeric_codepoint(decoded->first)) {
+      percent_number_start = start;
+    }
+  }
+  if (percent_number_start) {
     explicit_amount = true;
-    const auto number_start = result.end + std::string_view{"百分之"}.size();
+    const auto number_start = *percent_number_start;
     const auto number = scan_number(text, number_start);
     if (!number.value) {
       result.error = {"invalid_volume_amount", "volume percentage is not a supported integer",
@@ -523,17 +534,27 @@ void append_rules(const std::vector<std::string>& phrases, std::string_view cate
 // anywhere, otherwise a near miss ("小叔手", "小助", "助手") at the very start
 // or end of the utterance, where a prefix or suffix wake word sits. A near miss
 // must share all but one character with the wake word in order.
+//
+// For a two-character wake word that leaves a single shared character, which
+// many ordinary words satisfy ("小可爱", "小心"). Such a near miss must be
+// exactly two characters long, and only a caller whose wake word is already
+// confirmed acoustically (the parser, after KWS or the probe fired) may ask
+// for one; the probe itself needs the exact wake word.
 [[nodiscard]] std::optional<std::pair<std::size_t, std::size_t>> locate_wake(
-    std::span<const char32_t> text, std::span<const char32_t> wake) {
+    std::span<const char32_t> text, std::span<const char32_t> wake,
+    bool short_near_miss) {
   if (wake.empty() || text.size() < wake.size() - 1) return std::nullopt;
   if (const auto found = std::ranges::search(text, wake); !found.empty()) {
     const auto begin = static_cast<std::size_t>(found.begin() - text.begin());
     return std::pair{begin, begin + wake.size()};
   }
-  if (wake.size() < 3) return std::nullopt;
+  const bool short_wake = wake.size() < 3;
+  if (wake.size() < 2 || (short_wake && !short_near_miss)) return std::nullopt;
+  const auto min_length = short_wake ? wake.size() : wake.size() - 1;
+  const auto max_length = short_wake ? wake.size() : wake.size() + 1;
   std::optional<std::pair<std::size_t, std::size_t>> best;
   std::size_t best_score{};
-  for (std::size_t length = wake.size() - 1; length <= wake.size() + 1; ++length) {
+  for (std::size_t length = min_length; length <= max_length; ++length) {
     if (length > text.size()) break;
     for (const bool at_start : {true, false}) {
       const auto begin = at_start ? 0 : text.size() - length;
@@ -778,7 +799,7 @@ CommandParseResult CommandParser::parse(std::string_view text,
   if (!wake_value.empty()) {
     const auto cleaned = codepoints(remove_fillers(normalized.value));
     const auto wake = codepoints(wake_value);
-    if (const auto span = locate_wake(cleaned, wake)) {
+    if (const auto span = locate_wake(cleaned, wake, true)) {
       const auto all = std::span<const char32_t>(cleaned);
       const auto before = trim_separators(all.first(span->first));
       const auto after = trim_separators(all.subspan(span->second));
@@ -862,7 +883,7 @@ std::optional<WakeTextMatch> find_wake_in_text(std::string_view text,
   };
   const auto cps = words_only(normalized_text.value);
   const auto wake = words_only(normalized_wake.value);
-  const auto span = locate_wake(cps, wake);
+  const auto span = locate_wake(cps, wake, false);
   if (!span) return std::nullopt;
   const bool exact = span->second - span->first == wake.size() &&
                      std::equal(wake.begin(), wake.end(), cps.begin() + span->first);

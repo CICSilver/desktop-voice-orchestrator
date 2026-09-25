@@ -61,7 +61,8 @@ EvaluationTake parse_take(const nlohmann::json& value, std::size_t index) {
   take.id = string_field(value, "id");
   if (take.id.empty()) throw std::invalid_argument(where + " has no id");
   take.kind = string_field(value, "kind");
-  if (take.kind != "command" && take.kind != "negative" && take.kind != "silence") {
+  if (take.kind != "command" && take.kind != "negative" && take.kind != "silence" &&
+      take.kind != "background") {
     throw std::invalid_argument(where + " has an unknown kind");
   }
   take.status = string_field(value, "status");
@@ -357,7 +358,15 @@ std::string wake_position_label(std::string_view position) {
 std::string condition_label(std::string_view condition) {
   if (condition == "quiet") return "安静";
   if (condition == "music") return "播放音乐";
+  if (condition == "background") return "日常背景";
   return std::string(condition.empty() ? "未知环境" : condition);
+}
+
+std::string format_clock(double seconds) {
+  const auto total = static_cast<long long>(std::max(0.0, seconds));
+  std::ostringstream stream;
+  stream << total / 60 << ":" << (total % 60 < 10 ? "0" : "") << total % 60;
+  return stream.str();
 }
 
 std::string format_fixed(double value, int decimals) {
@@ -510,7 +519,9 @@ SessionReference compute_session_reference(const std::filesystem::path& session,
   for (std::size_t index = 0; index < labels.takes.size(); ++index) {
     const auto& take = labels.takes[index];
     auto& result = reference.takes[index];
-    if (take.status != "ok") continue;
+    // Background takes run for many minutes and have no expected text; only
+    // the candidates the pipeline produced inside them are re-decoded below.
+    if (take.status != "ok" || take.kind == "background") continue;
     const auto from = take.start_s - kReferencePadBefore;
     const auto to = take.end_s + kReferencePadAfter;
     result.available = true;
@@ -636,6 +647,7 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
   nlohmann::json negatives = {{"total", 0U}, {"false_wakes", 0U}, {"false_plans", 0U},
                               {"followup_plans", 0U},
                               {"duration_s", 0.0}};
+  nlohmann::json background = {{"false_wakes", 0U}, {"false_plans", 0U}, {"duration_s", 0.0}};
   auto results = nlohmann::json::array();
 
   for (std::size_t index = 0; index < takes.size(); ++index) {
@@ -707,6 +719,33 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
                            {"music_detected", music}};
     result["utterances"] = utterance_results;
     result["actions"] = actions;
+
+    if (take.kind == "background") {
+      // Nobody addresses the assistant in background audio, so every wake is
+      // false, and so is every plan: a follow-up window here can only have
+      // been opened by a false wake. Moments where the speaker did say the
+      // wake word are recorded as discarded takes and never reach this point.
+      std::uint64_t wakes{};
+      auto events = nlohmann::json::array();
+      for (const auto& hit : take_hits[index]) {
+        if (!hit["suppressed"].is_null()) continue;
+        ++wakes;
+        events.push_back(hit);
+      }
+      std::uint64_t plans{};
+      for (const auto& utterance : utterance_results) {
+        if (utterance.value("outcome", "") == "plan") ++plans;
+      }
+      background["duration_s"] = background.value("duration_s", 0.0) + (take.end_s - take.start_s);
+      background["false_wakes"] = counter(background, "false_wakes") + wakes;
+      background["false_plans"] = counter(background, "false_plans") + plans;
+      result["keyword_hits"] = std::move(events);
+      result["wake"] = {{"detected", wakes > 0}, {"detectors", detectors},
+                        {"verdict", wakes > 0 ? "false_wake" : "none"}};
+      result["verdict"] = plans > 0 ? "false_plan" : wakes > 0 ? "false_wake" : "ok";
+      results.push_back(std::move(result));
+      continue;
+    }
 
     if (take.kind != "command") {
       negatives["total"] = counter(negatives, "total") + 1;
@@ -863,6 +902,7 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
            {{"commands", std::move(commands)},
             {"by_position", std::move(by_position)},
             {"negatives", std::move(negatives)},
+            {"background", std::move(background)},
             {"unassigned_keyword_hits", unassigned_hits}}},
           {"takes", std::move(results)}};
 }
@@ -895,52 +935,67 @@ std::string format_evaluation_summary(const std::vector<nlohmann::json>& session
     const auto& commands = block.value("commands", nlohmann::json::object());
     const auto& positions = block.value("by_position", nlohmann::json::object());
     const auto& negatives = block.value("negatives", nlohmann::json::object());
+    const auto& background = block.value("background", nlohmann::json::object());
     const auto total = counter(commands, "total");
-    // Recall counts only takes that needed a wake word.
-    out << "    唤醒召回    "
-        << ratio(counter(commands, "wake_detected"),
-                 total - counter(commands, "followup_covered"));
-    for (const char* position : {"prefix", "suffix"}) {
-      if (!positions.contains(position)) continue;
-      const auto& part = positions[position];
-      out << "   " << wake_position_label(position) << " "
-          << ratio(counter(part, "wake_detected"),
-                   counter(part, "total") - counter(part, "followup_covered"));
+    if (total > 0) {
+      // Recall counts only takes that needed a wake word.
+      out << "    唤醒召回    "
+          << ratio(counter(commands, "wake_detected"),
+                   total - counter(commands, "followup_covered"));
+      for (const char* position : {"prefix", "suffix"}) {
+        if (!positions.contains(position)) continue;
+        const auto& part = positions[position];
+        out << "   " << wake_position_label(position) << " "
+            << ratio(counter(part, "wake_detected"),
+                     counter(part, "total") - counter(part, "followup_covered"));
+      }
+      out << "   （另有 " << counter(commands, "followup_covered")
+          << " 条落在上一条的激活窗口内，无需唤醒）";
+      out << "\n    离线参考    麦克风 " << ratio(counter(commands, "reference_kws_microphone"), total)
+          << "   AEC后 " << ratio(counter(commands, "reference_kws_processed"), total) << "\n";
+      out << "    漏唤醒原因  流水线 " << counter(commands, "wake_missed_pipeline")
+          << "   模型 " << counter(commands, "wake_missed_model")
+          << "   被抑制 " << counter(commands, "wake_suppressed") << "\n";
+      out << "    命令正确    " << ratio(counter(commands, "correct"), total);
+      for (const char* position : {"prefix", "suffix"}) {
+        if (!positions.contains(position)) continue;
+        const auto& part = positions[position];
+        out << "   " << wake_position_label(position) << " "
+            << ratio(counter(part, "correct"), counter(part, "total"));
+      }
+      out << "\n    失败分布    解析拒绝 " << counter(commands, "rejected")
+          << "   动作不符 " << counter(commands, "wrong_actions")
+          << "   无识别结果 " << counter(commands, "no_asr")
+          << "   无候选 " << counter(commands, "no_candidate") + counter(commands, "candidate_rejected")
+          << "   未唤醒 " << counter(commands, "no_wake") << "\n";
+      out << "    缺字        切分截断（尾/头） " << counter(commands, "tail_cut") << "/"
+          << counter(commands, "head_cut") << "   模型丢字（延长也补不回） "
+          << counter(commands, "asr_drop") << "\n";
     }
-    out << "   （另有 " << counter(commands, "followup_covered")
-        << " 条落在上一条的激活窗口内，无需唤醒）";
-    out << "\n    离线参考    麦克风 " << ratio(counter(commands, "reference_kws_microphone"), total)
-        << "   AEC后 " << ratio(counter(commands, "reference_kws_processed"), total) << "\n";
-    out << "    漏唤醒原因  流水线 " << counter(commands, "wake_missed_pipeline")
-        << "   模型 " << counter(commands, "wake_missed_model")
-        << "   被抑制 " << counter(commands, "wake_suppressed") << "\n";
-    out << "    命令正确    " << ratio(counter(commands, "correct"), total);
-    for (const char* position : {"prefix", "suffix"}) {
-      if (!positions.contains(position)) continue;
-      const auto& part = positions[position];
-      out << "   " << wake_position_label(position) << " "
-          << ratio(counter(part, "correct"), counter(part, "total"));
+    if (counter(negatives, "total") > 0) {
+      out << "    误唤醒      " << counter(negatives, "false_wakes") << " 次 / "
+          << counter(negatives, "total") << " 条负样本（"
+          << format_fixed(negatives.value("duration_s", 0.0), 0) << " 秒）   误执行 "
+          << counter(negatives, "false_plans") << "   （激活窗口内按后续话语执行 "
+          << counter(negatives, "followup_plans") << "）\n";
     }
-    out << "\n    失败分布    解析拒绝 " << counter(commands, "rejected")
-        << "   动作不符 " << counter(commands, "wrong_actions")
-        << "   无识别结果 " << counter(commands, "no_asr")
-        << "   无候选 " << counter(commands, "no_candidate") + counter(commands, "candidate_rejected")
-        << "   未唤醒 " << counter(commands, "no_wake") << "\n";
-    out << "    缺字        切分截断（尾/头） " << counter(commands, "tail_cut") << "/"
-        << counter(commands, "head_cut") << "   模型丢字（延长也补不回） "
-        << counter(commands, "asr_drop") << "\n";
-    out << "    误唤醒      " << counter(negatives, "false_wakes") << " 次 / "
-        << counter(negatives, "total") << " 条负样本（"
-        << format_fixed(negatives.value("duration_s", 0.0), 0) << " 秒）   误执行 "
-        << counter(negatives, "false_plans") << "   （激活窗口内按后续话语执行 "
-        << counter(negatives, "followup_plans") << "）\n";
+    const auto background_s = background.value("duration_s", 0.0);
+    if (background_s > 0.0) {
+      const auto wakes = counter(background, "false_wakes");
+      out << "    日常背景    " << format_fixed(background_s / 60.0, 0) << " 分钟   误唤醒 "
+          << wakes << " 次（约 " << format_fixed(static_cast<double>(wakes) * 3600.0 / background_s, 1)
+          << " 次/小时）   误执行 " << counter(background, "false_plans") << "\n";
+    }
   };
 
   out << "================ 评估汇总 ================\n";
   for (const auto& group : aggregate.value("groups", nlohmann::json::array())) {
-    out << "[" << condition_label(group.value("condition", "")) << " · "
-        << format_fixed(group.value("distance_m", 0.0), 1) << " 米]  会话 "
-        << counter(group, "sessions") << "\n";
+    const auto condition = group.value("condition", "");
+    out << "[" << condition_label(condition);
+    if (condition != "background") {
+      out << " · " << format_fixed(group.value("distance_m", 0.0), 1) << " 米";
+    }
+    out << "]  会话 " << counter(group, "sessions") << "\n";
     describe(group);
   }
   if (aggregate.value("groups", nlohmann::json::array()).size() > 1) {
@@ -974,6 +1029,28 @@ std::string format_evaluation_summary(const std::vector<nlohmann::json>& session
         out << session.value("group_title", session.value("group_id", "")) << "  ("
             << session.value("speaker", "") << ")\n";
         header = true;
+      }
+      if (take.value("kind", "") == "background") {
+        const auto hits = take.value("keyword_hits", nlohmann::json::array());
+        std::size_t plans{};
+        for (const auto& utterance : take.value("utterances", nlohmann::json::array())) {
+          if (utterance.value("outcome", "") == "plan") ++plans;
+        }
+        out << "  ✗ " << take.value("id", "") << " 日常背景 "
+            << format_fixed((take.value("end_s", 0.0) - take.value("start_s", 0.0)) / 60.0, 1)
+            << " 分钟：误唤醒 " << hits.size() << " 次，误执行 " << plans << " 次\n";
+        // Times are in the session's own clock, so they can be found in mic.wav.
+        for (const auto& hit : hits) {
+          out << "     " << format_clock(number_field(hit, "wake_end_s", 0.0)) << " 唤醒（"
+              << string_field(hit, "detector") << "）\n";
+        }
+        for (const auto& utterance : take.value("utterances", nlohmann::json::array())) {
+          const auto candidate = utterance.value("candidate", nlohmann::json::object());
+          out << "     " << format_clock(number_field(candidate, "start_s", 0.0)) << " 识别「"
+              << string_field(utterance, "asr_text") << "」"
+              << (utterance.value("outcome", "") == "plan" ? " → 会执行" : "") << "\n";
+        }
+        continue;
       }
       out << "  ✗ " << take.value("id", "") << " [" << wake_position_label(take.value("wake_position", ""))
           << "] 「" << take.value("prompt", "") << "」\n     ";

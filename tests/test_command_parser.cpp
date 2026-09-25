@@ -87,6 +87,12 @@ TEST_CASE("Volume amounts accept deterministic Chinese and Arabic forms from 1 t
   const auto chinese_suffix = parser.parse("降低音量二十%", context("zh-suffix"));
   REQUIRE(chinese_suffix.ok());
   CHECK(chinese_suffix.plan->actions[0].volume_delta_percent == -20);
+
+  // ASR may drop the unstressed "之".
+  const auto without_zhi = parser.parse("降低音量百分十", context("no-zhi"));
+  REQUIRE(without_zhi.ok());
+  CHECK(without_zhi.plan->actions[0].volume_delta_percent == -10);
+  CHECK_FALSE(parser.parse("降低音量百分", context("no-number")).ok());
 }
 
 TEST_CASE("Normalization handles whitespace punctuation and full-width percentages") {
@@ -239,6 +245,33 @@ TEST_CASE("Wake-confirmed readings tolerate residue, fillers and a misheard wake
   const auto followup = context("tolerant-followup");
   CHECK(parser.parse("增加音量啊", followup).ok());
   CHECK_FALSE(parser.parse("播放音乐动我心", followup).ok());
+}
+
+TEST_CASE("A two-character wake word allows only a same-length near miss at an edge") {
+  const dvo::CommandParser parser;
+  auto wake_context = context("short-wake");
+  wake_context.wake_word = "小克";
+  const auto actions_of = [&](const char* text) {
+    const auto result = parser.parse(text, wake_context);
+    return result.ok() ? result.plan->normalized_text : std::string("REJECTED");
+  };
+
+  CHECK(actions_of("小克，暂停音乐") == "暂停音乐");
+  CHECK(actions_of("增加音量小克") == "增加音量5%");
+  // The recognizer writes a homophone once KWS has confirmed the wake word.
+  CHECK(actions_of("小可，暂停音乐") == "暂停音乐");
+  CHECK(actions_of("播放音乐，小科") == "播放音乐");
+  // "克" dropped: the edge pair absorbs "暂", which the one-character
+  // omission rule for wake-confirmed commands restores.
+  CHECK(actions_of("小暂停音乐") == "暂停音乐");
+  CHECK(actions_of("小可爱暂停音乐") == "REJECTED");
+  CHECK(actions_of("播放小可音乐") == "REJECTED");
+
+  // The ASR wake probe has no acoustic confirmation and needs the exact word.
+  REQUIRE(dvo::find_wake_in_text("小克，暂停音乐", "小克"));
+  CHECK(dvo::find_wake_in_text("小克，暂停音乐", "小克")->exact);
+  CHECK_FALSE(dvo::find_wake_in_text("小可，暂停音乐", "小克"));
+  CHECK_FALSE(dvo::find_wake_in_text("小可爱快来吃饭", "小克"));
 }
 
 TEST_CASE("Natural multi-command connectors are accepted") {

@@ -1109,10 +1109,17 @@ void VoiceFrontendRuntime::process_frame(const NormalizedFrame& frame,
     begin_recognition(*start);
   }
   std::vector<VadInterval> probe_intervals;
+  const bool replay = replay_mode_.load(std::memory_order_acquire);
   for (const auto& interval : vad_update.completed) {
     if (suppress_current_vad_interval_) continue;
     segmenter_->add_vad_interval(interval);
     if (wake_probe_) probe_intervals.push_back(interval);
+    // Segmentation diagnostics for recorded sessions only; live telemetry
+    // already carries the VAD state.
+    if (replay) {
+      emit_event("vad_interval", {{"speech", span_json(interval.span)}},
+                 interval.span.end, "replay");
+    }
   }
   if (!vad_update.speech && !vad_update.completed.empty()) {
     suppress_current_vad_interval_ = false;

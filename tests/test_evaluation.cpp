@@ -268,3 +268,44 @@ TEST_CASE("plans on negative takes are split into false executions and follow-up
   CHECK(report["summary"]["negatives"]["false_plans"] == 1);
   CHECK(report["summary"]["negatives"]["followup_plans"] == 1);
 }
+
+TEST_CASE("background takes count every wake and plan, except in excluded spans") {
+  auto document = labels_document();
+  document["group"] = {{"id", "background"}, {"title", "日常背景"},
+                       {"condition", "background"}, {"distance_m", 0.0}};
+  document["takes"] = nlohmann::json::array(
+      {take("b1", "background", "", "none", nlohmann::json::array(), 0.0, 600.0),
+       take("b2", "background", "", "none", nlohmann::json::array(), 600.0, 640.0,
+            "discarded"),
+       take("b3", "background", "", "none", nlohmann::json::array(), 640.0, 1200.0)});
+  const auto labels = dvo::parse_evaluation_labels(document);
+  auto probe_hit = hit(125.0);
+  probe_hit["detector"] = "asr_probe";
+  auto followup = utterance("f1", 127.0, 129.0, "暂停一下", "plan",
+                            nlohmann::json::array({{{"type", "media.pause"},
+                                                    {"volume_delta_percent", nullptr}}}));
+  followup["origin"] = "followup";
+  const nlohmann::json summary{
+      {"keyword_hits", nlohmann::json::array({probe_hit, hit(620.0), hit(900.0)})},
+      {"utterances", nlohmann::json::array({followup})}};
+  dvo::SessionReference reference;
+  reference.takes.resize(3);
+
+  const auto report = dvo::evaluate_labeled_session(labels, summary, reference);
+  const auto& background = report["summary"]["background"];
+  // The hit at 620 s is inside the span the speaker excluded.
+  CHECK(background["false_wakes"] == 2);
+  // A follow-up in background audio exists only because of a false wake.
+  CHECK(background["false_plans"] == 1);
+  CHECK(background["duration_s"].get<double>() == Catch::Approx(1160.0));
+  CHECK(report["takes"][0]["verdict"] == "false_plan");
+  CHECK(report["takes"][2]["verdict"] == "false_wake");
+  CHECK(report["summary"]["negatives"]["total"] == 0);
+
+  const std::vector<nlohmann::json> reports{report};
+  const auto text = dvo::format_evaluation_summary(reports, dvo::aggregate_evaluations(reports));
+  CHECK(text.find("[日常背景]") != std::string::npos);
+  CHECK(text.find("误唤醒 2 次（约 6.2 次/小时）") != std::string::npos);
+  CHECK(text.find("2:05 唤醒（asr_probe）") != std::string::npos);
+  CHECK(text.find("唤醒召回") == std::string::npos);
+}
