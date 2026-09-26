@@ -45,6 +45,7 @@ add_library(dvo_core STATIC
   src/command.cpp
   src/command_parser.cpp
   src/netease.cpp
+  src/netease_cdp.cpp
   src/action_executor.cpp
   src/benchmark_report.cpp
   src/evaluation.cpp

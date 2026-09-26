@@ -1,6 +1,7 @@
 #include <Windows.h>
 #include <shellapi.h>
 
+#include <array>
 #include <atomic>
 #include <algorithm>
 #include <chrono>
@@ -43,7 +44,15 @@ void print_usage() {
                "  evaluate <labeled session | directory of sessions> [--out=<report.json>]\n"
                "           [--since=<YYYYMMDD-HHMMSS>]   (only sessions recorded from then on)\n"
                "  parse [--wake=<wake word>]   (one recognized text per stdin line)\n"
-               "  act <next|like>   (runs one action for real, bypassing speech)\n";
+               "  act <next|like|daily|order|list-loop|single-loop|shuffle>\n"
+               "      (runs one action for real, bypassing speech)\n"
+               "  netease-start [--restart]   (starts NetEase Cloud Music with its control channel;\n"
+               "      --restart closes a client running without it first)\n";
+}
+
+dvo::NeteaseActionConfig netease_action_config(const dvo::AppConfig& config) {
+  return {config.netease.ncm_cli,    config.netease.node,     config.netease.client_data,
+          config.netease.timeout_ms, config.netease.cdp_port, config.netease.executable};
 }
 
 std::optional<std::string> option_value(int argc, char** argv, std::string_view name) {
@@ -121,17 +130,21 @@ int run_action(const dvo::AppConfig& config, std::string_view name) {
   dvo::PlannedAction action;
   action.action_id = "act-cli";
   action.sequence = 1;
-  if (name == "next") {
-    action.type = dvo::ActionType::media_next;
-  } else if (name == "like") {
-    action.type = dvo::ActionType::media_like;
-  } else {
-    throw std::invalid_argument("act supports next and like");
-  }
+  const std::array<std::pair<std::string_view, dvo::ActionType>, 7> actions{{
+      {"next", dvo::ActionType::media_next},
+      {"like", dvo::ActionType::media_like},
+      {"daily", dvo::ActionType::media_play_daily},
+      {"order", dvo::ActionType::media_mode_order},
+      {"list-loop", dvo::ActionType::media_mode_list_loop},
+      {"single-loop", dvo::ActionType::media_mode_single_loop},
+      {"shuffle", dvo::ActionType::media_mode_shuffle},
+  }};
+  const auto found = std::ranges::find(actions, name, &decltype(actions)::value_type::first);
+  if (found == actions.end()) throw std::invalid_argument("unknown action for act");
+  action.type = found->second;
   const auto backend = dvo::create_windows_action_backend(
       {config.audio.loopback_device, config.commands.action_timeout_ms,
-       {config.netease.ncm_cli, config.netease.node, config.netease.client_data,
-        config.netease.timeout_ms}});
+       netease_action_config(config)});
   const auto started = std::chrono::steady_clock::now();
   const auto result = backend->execute(action, std::stop_source{}.get_token());
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -283,8 +296,19 @@ int main(int argc, char** argv) {
     if (mode == "evaluate") return run_evaluation(argc, argv, config, store);
     if (mode == "parse") return run_parse(config);
     if (mode == "act") {
-      if (argc < 3) throw std::invalid_argument("act requires next or like");
+      if (argc < 3) throw std::invalid_argument("act requires an action name");
       return run_action(config, argv[2]);
+    }
+    if (mode == "netease-start") {
+      const bool restart = argc > 2 && std::string_view(argv[2]) == "--restart";
+      if (dvo::start_netease_with_control(netease_action_config(config), restart)) {
+        std::cout << "NetEase Cloud Music is running with its control channel on 127.0.0.1:"
+                  << config.netease.cdp_port << "\n";
+        return 0;
+      }
+      std::cout << "NetEase Cloud Music is running without its control channel; "
+                   "run netease-start --restart to restart it with the channel\n";
+      return 1;
     }
     if (mode == "replay") {
       if (argc < 3) throw std::invalid_argument("replay requires a session path");

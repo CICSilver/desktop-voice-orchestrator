@@ -17,7 +17,15 @@ struct NeteaseActionConfig {
   // Covers the whole action: reading the client's history plus up to five
   // ncm-cli calls of about 1.3 s each (search, verify after the hotkey, like).
   std::uint32_t timeout_ms{10000};
+  std::uint16_t cdp_port{9223};
+  std::filesystem::path executable;
 };
+
+// Starts cloudmusic.exe with its local DevTools channel (minimized, without
+// taking the focus) and waits until the channel answers. With `restart`, a
+// client running without the channel is closed first; otherwise such a
+// client is left alone and false is returned.
+[[nodiscard]] bool start_netease_with_control(const NeteaseActionConfig& config, bool restart);
 
 struct WindowsActionConfig {
   // "default" resolves eRender/eConsole for each action. An explicit value is

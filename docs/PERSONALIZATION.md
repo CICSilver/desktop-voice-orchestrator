@@ -114,6 +114,14 @@ python tools/export_dataset.py
 再用“歌名 + 歌手”搜索，只收藏 ID 完全一致的那条（同名同歌手的不同版本 ID 不同），已收藏的不重复操作。
 ncm-cli 的收藏是“设为喜欢”而不是切换，不会误取消。`voice_frontend act like|next` 可以不说话直接执行一次。
 
+“播放每日推荐 / 每日推荐”和“顺序播放 / 列表循环 / 单曲循环 / 随机播放”通过网易云客户端的本机控制通道（Chrome DevTools
+协议，做法参考 github.com/Seraph310/cloudmusic-desktop-mcp）：在客户端页面里调用它自己的按钮所用的操作——每日推荐是首页
+每日推荐卡片的“播放全部”，播放方式是直接设为指定模式。不弹窗、不抢焦点，3.1.41 上实测约 0.3 秒 / 30 毫秒。
+控制通道需要网易云以 `--remote-debugging-address=127.0.0.1 --remote-debugging-port=9223` 启动：
+`voice_frontend netease-start`（已用普通方式启动时加 `--restart`）；网易云没在运行时这两类命令会自动以控制模式启动它。
+该通道只接受本机连接、没有认证，本机任何程序都能借它操作已登录的客户端。客户端内部的模块编号随版本变化，脚本按特征在运行时
+查找状态对象；网易云更新若改动内部操作名，命令会失败而不会误操作。
+
 ## 模型
 
 - **唤醒**：`sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20`。训练代码见 k2-fsa/icefall#1428，上游提供可微调的

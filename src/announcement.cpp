@@ -65,6 +65,16 @@ namespace {
       return "下一首";
     case ActionType::media_like:
       return "收藏这首歌";
+    case ActionType::media_play_daily:
+      return "播放每日推荐";
+    case ActionType::media_mode_order:
+      return "顺序播放";
+    case ActionType::media_mode_list_loop:
+      return "列表循环";
+    case ActionType::media_mode_single_loop:
+      return "单曲循环";
+    case ActionType::media_mode_shuffle:
+      return "随机播放";
   }
   return "未知操作";
 }

@@ -636,6 +636,16 @@ CommandParser::CommandParser(int default_volume_delta_percent,
                false, implementation->rules, owners, true);
   append_rules(grammar.like_phrases, "commands.phrases.like", ActionType::media_like,
                false, implementation->rules, owners, true);
+  append_rules(grammar.daily_phrases, "commands.phrases.daily", ActionType::media_play_daily,
+               false, implementation->rules, owners, true);
+  append_rules(grammar.mode_order_phrases, "commands.phrases.mode_order",
+               ActionType::media_mode_order, false, implementation->rules, owners, true);
+  append_rules(grammar.mode_list_loop_phrases, "commands.phrases.mode_list_loop",
+               ActionType::media_mode_list_loop, false, implementation->rules, owners, true);
+  append_rules(grammar.mode_single_loop_phrases, "commands.phrases.mode_single_loop",
+               ActionType::media_mode_single_loop, false, implementation->rules, owners, true);
+  append_rules(grammar.mode_shuffle_phrases, "commands.phrases.mode_shuffle",
+               ActionType::media_mode_shuffle, false, implementation->rules, owners, true);
   std::ranges::sort(implementation->rules, {}, [](const PhraseRule& rule) {
     return rule.phrase.size();
   });

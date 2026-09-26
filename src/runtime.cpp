@@ -359,6 +359,11 @@ CommandGrammar command_grammar(const CommandsConfig& config) {
   grammar.volume_down_phrases = config.volume_down_phrases;
   grammar.next_phrases = config.next_phrases;
   grammar.like_phrases = config.like_phrases;
+  grammar.daily_phrases = config.daily_phrases;
+  grammar.mode_order_phrases = config.mode_order_phrases;
+  grammar.mode_list_loop_phrases = config.mode_list_loop_phrases;
+  grammar.mode_single_loop_phrases = config.mode_single_loop_phrases;
+  grammar.mode_shuffle_phrases = config.mode_shuffle_phrases;
   grammar.connectors = config.connectors;
   grammar.max_actions_per_utterance = config.max_actions_per_utterance;
   return grammar;
@@ -465,7 +470,8 @@ void VoiceFrontendRuntime::initialize_pipeline() {
       create_windows_action_backend(
           {config_.audio.loopback_device, config_.commands.action_timeout_ms,
            {config_.netease.ncm_cli, config_.netease.node, config_.netease.client_data,
-            config_.netease.timeout_ms}}),
+            config_.netease.timeout_ms, config_.netease.cdp_port,
+            config_.netease.executable}}),
       ActionExecutorConfig{config_.commands.queue_capacity, 4096, ExecutionMode::live},
       [this](const ActionResult& result) { handle_action_result(result); },
       [this](const CommandPlan& plan) { handle_plan_started(plan); });
@@ -3032,6 +3038,11 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         active.commands.volume_down_phrases != current.commands.volume_down_phrases ||
         active.commands.next_phrases != current.commands.next_phrases ||
         active.commands.like_phrases != current.commands.like_phrases ||
+        active.commands.daily_phrases != current.commands.daily_phrases ||
+        active.commands.mode_order_phrases != current.commands.mode_order_phrases ||
+        active.commands.mode_list_loop_phrases != current.commands.mode_list_loop_phrases ||
+        active.commands.mode_single_loop_phrases != current.commands.mode_single_loop_phrases ||
+        active.commands.mode_shuffle_phrases != current.commands.mode_shuffle_phrases ||
         active.commands.connectors != current.commands.connectors;
     const bool pipeline_changed = aec_changed || kws_changed || vad_changed ||
                                   segmentation_changed || activation_changed;

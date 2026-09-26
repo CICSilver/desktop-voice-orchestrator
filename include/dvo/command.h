@@ -20,6 +20,13 @@ enum class ActionType {
   media_next,
   // Marks the NetEase Cloud Music client's current song as liked.
   media_like,
+  // NetEase Cloud Music client controls through its local DevTools channel:
+  // play today's daily recommendations, and set the play mode.
+  media_play_daily,
+  media_mode_order,
+  media_mode_list_loop,
+  media_mode_single_loop,
+  media_mode_shuffle,
 };
 
 enum class ExecutionSource {

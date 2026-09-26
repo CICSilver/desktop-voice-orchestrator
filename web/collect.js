@@ -20,6 +20,11 @@ const PAUSE = {type: 'media.pause'};
 const PLAY = {type: 'media.play'};
 const NEXT = {type: 'media.next'};
 const LIKE = {type: 'media.like'};
+const DAILY = {type: 'media.play_daily'};
+const MODE_ORDER = {type: 'media.mode.order'};
+const MODE_LIST_LOOP = {type: 'media.mode.list_loop'};
+const MODE_SINGLE_LOOP = {type: 'media.mode.single_loop'};
+const MODE_SHUFFLE = {type: 'media.mode.shuffle'};
 const volume = (delta) => ({type: 'audio.volume.adjust', volume_delta_percent: delta});
 
 const COMMANDS = [
@@ -93,9 +98,14 @@ const TRAIN_PHRASINGS = {
   up: ['增加音量', '调大音量', '音量调大', '音量大一点', '声音大一点', '大声一点', '大声点'],
   down: ['降低音量', '调小音量', '音量调小', '音量小一点', '声音小一点', '小声一点', '小声点'],
   next: ['切歌', '换歌', '换一首', '换一首歌', '下一首', '下一首歌'],
-  like: ['喜欢这首歌', '我喜欢这首歌', '喜欢这个', '我喜欢这个', '收藏一下']
+  like: ['喜欢这首歌', '我喜欢这首歌', '喜欢这个', '我喜欢这个', '收藏一下'],
+  daily: ['播放每日推荐', '放每日推荐', '打开每日推荐', '每日推荐'],
+  // The four play modes share one draw, so modes do not outweigh other actions.
+  mode: ['顺序播放', '列表循环', '单曲循环', '随机播放']
 };
-const FIXED_ACTIONS = {play: PLAY, pause: PAUSE, next: NEXT, like: LIKE};
+const FIXED_ACTIONS = {play: PLAY, pause: PAUSE, next: NEXT, like: LIKE, daily: DAILY};
+const MODE_ACTIONS = {'顺序播放': MODE_ORDER, '列表循环': MODE_LIST_LOOP, '单曲循环': MODE_SINGLE_LOOP,
+  '随机播放': MODE_SHUFFLE};
 const AMOUNT_PHRASINGS = new Set(['增加音量', '调大音量', '音量调大', '降低音量', '调小音量', '音量调小']);
 const TRAIN_CONNECTORS = ['，然后', '，再', '，然后再', '，接着'];
 // Common amounts weighted up; every value the parser accepts can appear.
@@ -131,6 +141,7 @@ function trainingPhrase(random, previousAction) {
   while (action === previousAction);
   const say = pick(TRAIN_PHRASINGS[action]);
   if (FIXED_ACTIONS[action]) return {say, action, actions: [FIXED_ACTIONS[action]]};
+  if (action === 'mode') return {say, action, actions: [MODE_ACTIONS[say]]};
   const sign = action === 'up' ? 1 : -1;
   if (!AMOUNT_PHRASINGS.has(say) || random() < 0.4) return {say, action, actions: [volume(5 * sign)]};
   const amount = pick(TRAIN_AMOUNTS);

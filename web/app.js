@@ -62,6 +62,11 @@ function parseActionLabel(action) {
   if (action.type === 'media.pause') return '暂停';
   if (action.type === 'media.next') return '下一首';
   if (action.type === 'media.like') return '收藏';
+  if (action.type === 'media.play_daily') return '每日推荐';
+  if (action.type === 'media.mode.order') return '顺序播放';
+  if (action.type === 'media.mode.list_loop') return '列表循环';
+  if (action.type === 'media.mode.single_loop') return '单曲循环';
+  if (action.type === 'media.mode.shuffle') return '随机播放';
   if (action.type === 'audio.volume.adjust') {
     const delta = Number(action.volume_delta_percent || 0);
     return `音量${delta >= 0 ? '+' : ''}${delta}%`;

@@ -9,6 +9,11 @@ const char* to_string(ActionType type) {
     case ActionType::master_volume_adjust: return "audio.volume.adjust";
     case ActionType::media_next: return "media.next";
     case ActionType::media_like: return "media.like";
+    case ActionType::media_play_daily: return "media.play_daily";
+    case ActionType::media_mode_order: return "media.mode.order";
+    case ActionType::media_mode_list_loop: return "media.mode.list_loop";
+    case ActionType::media_mode_single_loop: return "media.mode.single_loop";
+    case ActionType::media_mode_shuffle: return "media.mode.shuffle";
   }
   return "unknown";
 }

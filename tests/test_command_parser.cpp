@@ -515,6 +515,42 @@ TEST_CASE("The shipped grammar skips to the next song and likes the current one"
   CHECK(actions_of("我喜欢这首歌的前奏") == "REJECTED");
 }
 
+TEST_CASE("The shipped grammar plays daily recommendations and sets play modes") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  dvo::ConfigStore store(root / "config/default.toml",
+                         std::filesystem::temp_directory_path() / "dvo-no-overrides.toml", root);
+  const auto config = store.load();
+  const dvo::CommandParser parser(config.commands.default_volume_step_percent,
+                                  config.commands.max_spoken_volume_step_percent,
+                                  dvo::command_grammar(config.commands));
+  auto wake = context("daily-mode");
+  wake.wake_word = "小克";
+  const auto type_of = [&](const char* text) {
+    const auto result = parser.parse(text, wake);
+    REQUIRE(result.ok());
+    REQUIRE(result.plan->actions.size() == 1);
+    return result.plan->actions.front().type;
+  };
+
+  for (const char* text : {"小克播放每日推荐", "放每日推荐，小克", "小克打开每日推荐", "小克每日推荐吧"}) {
+    CAPTURE(text);
+    CHECK(type_of(text) == dvo::ActionType::media_play_daily);
+  }
+  CHECK(type_of("小克顺序播放") == dvo::ActionType::media_mode_order);
+  CHECK(type_of("列表循环小克") == dvo::ActionType::media_mode_list_loop);
+  CHECK(type_of("小克，单曲循环") == dvo::ActionType::media_mode_single_loop);
+  CHECK(type_of("小克随机播放") == dvo::ActionType::media_mode_shuffle);
+
+  const auto chained = parser.parse("小克随机播放然后播放每日推荐", wake);
+  REQUIRE(chained.ok());
+  REQUIRE(chained.plan->actions.size() == 2);
+  CHECK(chained.plan->actions[0].type == dvo::ActionType::media_mode_shuffle);
+  CHECK(chained.plan->actions[1].type == dvo::ActionType::media_play_daily);
+
+  CHECK_FALSE(parser.parse("每日推荐的歌挺好听", wake).ok());
+  CHECK_FALSE(parser.parse("小克随机", wake).ok());
+}
+
 TEST_CASE("Empty next and like phrase lists disable those actions") {
   dvo::CommandGrammar grammar;
   CHECK(dvo::CommandParser(5, 20, grammar).parse("下一首", context()).ok());

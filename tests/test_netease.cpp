@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "dvo/netease.h"
+#include "dvo/netease_cdp.h"
 
 TEST_CASE("NetEase play-history rows parse into id, name and artists") {
   const auto track = dvo::parse_netease_history_track(
@@ -38,6 +39,42 @@ TEST_CASE("ncm-cli responses need code 200") {
   CHECK(rejected.error.find("需要登录") != std::string::npos);
   CHECK_FALSE(dvo::parse_ncm_response("").ok());
   CHECK_FALSE(dvo::parse_ncm_response("{broken").ok());
+}
+
+TEST_CASE("The DevTools channel targets the client's main page") {
+  // As listed by client 3.1.41 while starting and once loaded.
+  const auto starting = nlohmann::json::parse(R"([{"type":"page","url":"orpheus://native/start.html",
+      "webSocketDebuggerUrl":"ws://127.0.0.1:9223/devtools/page/A1"}])");
+  CHECK_FALSE(dvo::netease_cdp_page_path(starting));
+  const auto loaded = nlohmann::json::parse(R"([
+      {"type":"page","url":"orpheus://orpheus/pub/subApp.html","webSocketDebuggerUrl":"ws://127.0.0.1:9223/devtools/page/B2"},
+      {"type":"page","url":"orpheus://orpheus/pub/app.html","webSocketDebuggerUrl":"ws://127.0.0.1:9223/devtools/page/EB2C"}])");
+  CHECK(dvo::netease_cdp_page_path(loaded) == "/devtools/page/EB2C");
+  CHECK_FALSE(dvo::netease_cdp_page_path(nlohmann::json::object()));
+}
+
+TEST_CASE("DevTools evaluate replies yield the value or the page's error") {
+  const auto value = dvo::netease_cdp_result(nlohmann::json::parse(
+      R"({"id":1,"result":{"result":{"type":"object","value":{"ok":true,"mode":"playRandom"}}}})"));
+  CHECK(value["mode"] == "playRandom");
+  try {
+    (void)dvo::netease_cdp_result(nlohmann::json::parse(
+        R"({"id":1,"result":{"result":{"type":"object"},"exceptionDetails":{"text":"Uncaught",
+            "exception":{"description":"Error: NetEase store not found"}}}})"));
+    FAIL("a page exception must throw");
+  } catch (const dvo::NeteaseCdpError& error) {
+    CHECK(error.kind() == dvo::NeteaseCdpError::Kind::script);
+    CHECK(std::string(error.what()).find("store not found") != std::string::npos);
+  }
+  CHECK_THROWS_AS(dvo::netease_cdp_result(nlohmann::json::parse(R"({"id":1,"error":{"code":-32000}})")),
+                  dvo::NeteaseCdpError);
+}
+
+TEST_CASE("Play mode scripts embed the mode as a JavaScript string") {
+  const auto script = dvo::netease_play_mode_script("playOneCycle");
+  CHECK(script.find(R"(const target = "playOneCycle";)") != std::string::npos);
+  CHECK(script.find("playing/switchPlayingMode") != std::string::npos);
+  CHECK(dvo::netease_play_daily_script().find("'dailyRecommend'") != std::string::npos);
 }
 
 TEST_CASE("Only the search record with the exact original id is used") {

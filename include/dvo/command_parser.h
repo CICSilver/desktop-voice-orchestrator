@@ -50,6 +50,11 @@ struct CommandGrammar {
   // Optional actions: an empty list disables the action.
   std::vector<std::string> next_phrases{"下一首"};
   std::vector<std::string> like_phrases{"喜欢这首歌"};
+  std::vector<std::string> daily_phrases{"播放每日推荐"};
+  std::vector<std::string> mode_order_phrases{"顺序播放"};
+  std::vector<std::string> mode_list_loop_phrases{"列表循环"};
+  std::vector<std::string> mode_single_loop_phrases{"单曲循环"};
+  std::vector<std::string> mode_shuffle_phrases{"随机播放"};
   std::vector<std::string> connectors{"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"};
   std::size_t max_actions_per_utterance{kMaxCommandActions};
 };

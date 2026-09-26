@@ -32,6 +32,10 @@ TEST_CASE("checked-in default configuration is valid") {
   REQUIRE(has(config.commands.pause_phrases, "别放了"));
   REQUIRE(has(config.commands.next_phrases, "切歌"));
   REQUIRE(has(config.commands.like_phrases, "收藏一下"));
+  REQUIRE(has(config.commands.daily_phrases, "每日推荐"));
+  REQUIRE(has(config.commands.mode_single_loop_phrases, "单曲循环"));
+  CHECK(config.netease.cdp_port == 9223);
+  CHECK(config.netease.executable.empty());
   // Empty NetEase paths are resolved when the action runs.
   CHECK(config.netease.ncm_cli.empty());
   CHECK(config.netease.client_data.empty());
@@ -159,6 +163,8 @@ TEST_CASE("saved overrides keep a replaced final decoder and the wake probe sett
   config.netease.timeout_ms = 15000;
   config.commands.next_phrases = {"切歌"};
   config.commands.like_phrases = {};
+  config.commands.mode_shuffle_phrases = {"随机放歌"};
+  config.netease.cdp_port = 9333;
 
   store.save_overrides(config);
   const auto reloaded = store.load();
@@ -168,6 +174,17 @@ TEST_CASE("saved overrides keep a replaced final decoder and the wake probe sett
   CHECK(reloaded.netease.timeout_ms == 15000);
   CHECK(reloaded.commands.next_phrases == std::vector<std::string>{"切歌"});
   CHECK(reloaded.commands.like_phrases.empty());
+  CHECK(reloaded.commands.mode_shuffle_phrases == std::vector<std::string>{"随机放歌"});
+  CHECK(reloaded.commands.daily_phrases == config.commands.daily_phrases);
+  CHECK(reloaded.netease.cdp_port == 9333);
+  // The console edits optional phrase lists through the same patch fields.
+  auto patched = reloaded;
+  REQUIRE(store.apply_patch(patched, {{"commands", {{"daily_phrases", {"来点每日推荐"}},
+                                                     {"phrases", {{"mode_order", {"按顺序放"}}}}}}})
+              .ok());
+  CHECK(patched.commands.daily_phrases == std::vector<std::string>{"来点每日推荐"});
+  CHECK(patched.commands.mode_order_phrases == std::vector<std::string>{"按顺序放"});
+  CHECK(store.to_public_json(patched)["commands"]["daily_phrases"][0] == "来点每日推荐");
   CHECK(reloaded.asr.final_decoder == config.asr.final_decoder);
   CHECK(std::filesystem::equivalent(reloaded.asr.final_model, config.asr.final_model));
   CHECK(std::filesystem::equivalent(reloaded.asr.final_tokens, config.asr.final_tokens));

@@ -5,6 +5,7 @@
 #endif
 
 #include <Windows.h>
+#include <TlHelp32.h>
 #include <endpointvolume.h>
 #include <mmdeviceapi.h>
 #include <roapi.h>
@@ -31,6 +32,7 @@
 #include <winrt/base.h>
 
 #include "dvo/netease.h"
+#include "dvo/netease_cdp.h"
 #include "dvo/volume_math.h"
 
 namespace dvo {
@@ -142,6 +144,11 @@ template <typename AsyncOperation>
   switch (type) {
     case ActionType::master_volume_adjust: return "windows.endpoint_volume";
     case ActionType::media_like: return "netease.ncm_cli";
+    case ActionType::media_play_daily:
+    case ActionType::media_mode_order:
+    case ActionType::media_mode_list_loop:
+    case ActionType::media_mode_single_loop:
+    case ActionType::media_mode_shuffle: return "netease.cdp";
     default: return "windows.gsmtc";
   }
 }
@@ -390,6 +397,103 @@ void sleep_for_action(std::chrono::milliseconds duration,
       std::string_view(text, static_cast<std::size_t>(sqlite3_column_bytes(statement.get(), 0))));
 }
 
+[[nodiscard]] std::vector<DWORD> netease_processes() {
+  std::vector<DWORD> result;
+  winrt::handle snapshot{CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)};
+  if (snapshot.get() == INVALID_HANDLE_VALUE) {
+    snapshot.detach();
+    return result;
+  }
+  PROCESSENTRY32W entry{};
+  entry.dwSize = sizeof(entry);
+  for (auto more = Process32FirstW(snapshot.get(), &entry); more;
+       more = Process32NextW(snapshot.get(), &entry)) {
+    if (_wcsicmp(entry.szExeFile, L"cloudmusic.exe") == 0) {
+      result.push_back(entry.th32ProcessID);
+    }
+  }
+  return result;
+}
+
+// cloudmusic.exe as configured, else the program registered for orpheus:// links.
+[[nodiscard]] std::filesystem::path netease_executable(const NeteaseActionConfig& config) {
+  if (!config.executable.empty()) return config.executable;
+  DWORD size{};
+  constexpr auto key = L"orpheus\\shell\\open\\command";
+  if (RegGetValueW(HKEY_CLASSES_ROOT, key, nullptr, RRF_RT_REG_SZ, nullptr, nullptr, &size) ==
+      ERROR_SUCCESS) {
+    std::wstring value(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(HKEY_CLASSES_ROOT, key, nullptr, RRF_RT_REG_SZ, nullptr, value.data(),
+                     &size) == ERROR_SUCCESS) {
+      value.resize(wcslen(value.c_str()));
+      std::filesystem::path path = value.starts_with(L'"')
+                                       ? value.substr(1, value.find(L'"', 1) - 1)
+                                       : value.substr(0, value.find(L' '));
+      if (std::filesystem::exists(path)) return path;
+    }
+  }
+  throw std::runtime_error("cloudmusic.exe was not found; set netease.executable");
+}
+
+// Minimized and not activated, so a game or video keeps the focus. The client
+// is not tied to this process: it keeps running after voice_frontend exits.
+void launch_netease(const std::filesystem::path& executable, std::uint16_t port) {
+  auto command_line = quote_argument(executable.wstring()) +
+                      L" --remote-debugging-address=127.0.0.1 --remote-debugging-port=" +
+                      std::to_wstring(port);
+  STARTUPINFOW startup{};
+  startup.cb = sizeof(startup);
+  startup.dwFlags = STARTF_USESHOWWINDOW;
+  startup.wShowWindow = SW_SHOWMINNOACTIVE;
+  PROCESS_INFORMATION information{};
+  const auto directory = executable.parent_path().wstring();
+  DWORD flags = CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB;
+  auto created = CreateProcessW(executable.c_str(), command_line.data(), nullptr, nullptr, FALSE,
+                                flags, nullptr, directory.c_str(), &startup, &information);
+  if (!created && GetLastError() == ERROR_ACCESS_DENIED) {
+    // This process sits in a job that forbids breakaway.
+    flags &= ~static_cast<DWORD>(CREATE_BREAKAWAY_FROM_JOB);
+    created = CreateProcessW(executable.c_str(), command_line.data(), nullptr, nullptr, FALSE,
+                             flags, nullptr, directory.c_str(), &startup, &information);
+  }
+  if (!created) winrt::throw_last_error();
+  CloseHandle(information.hThread);
+  CloseHandle(information.hProcess);
+}
+
+// Polls until the client's store answers through the channel.
+void wait_for_netease_control(std::uint16_t port, std::chrono::steady_clock::time_point deadline,
+                              std::stop_token stop) {
+  const auto script = netease_ready_script();
+  for (;;) {
+    try {
+      const auto attempt = std::min(deadline, std::chrono::steady_clock::now() +
+                                                  std::chrono::seconds(3));
+      (void)netease_cdp_evaluate(port, script, attempt, stop);
+      return;
+    } catch (const NeteaseCdpError& error) {
+      const auto retry = error.kind() == NeteaseCdpError::Kind::unavailable ||
+                         error.kind() == NeteaseCdpError::Kind::starting ||
+                         error.kind() == NeteaseCdpError::Kind::script;
+      if (!retry || std::chrono::steady_clock::now() >= deadline) throw;
+    }
+    sleep_for_action(std::chrono::milliseconds(500), deadline, stop);
+  }
+}
+
+[[nodiscard]] const char* netease_mode_name(ActionType type) {
+  switch (type) {
+    case ActionType::media_mode_order: return "playOrder";
+    case ActionType::media_mode_list_loop: return "playCycle";
+    case ActionType::media_mode_single_loop: return "playOneCycle";
+    case ActionType::media_mode_shuffle: return "playRandom";
+    default: return "";
+  }
+}
+
+// A cold client start takes several seconds before its page is ready.
+constexpr std::chrono::seconds kNeteaseStartTimeout{30};
+
 class WindowsActionBackend final : public IActionBackend {
  public:
   explicit WindowsActionBackend(WindowsActionConfig config) : config_(std::move(config)) {}
@@ -418,6 +522,11 @@ class WindowsActionBackend final : public IActionBackend {
           return adjust_volume(*action.volume_delta_percent);
         case ActionType::media_next: return skip_next(stop);
         case ActionType::media_like: return like_current_song(stop);
+        case ActionType::media_play_daily:
+        case ActionType::media_mode_order:
+        case ActionType::media_mode_list_loop:
+        case ActionType::media_mode_single_loop:
+        case ActionType::media_mode_shuffle: return control_netease(action.type, stop);
       }
     } catch (const ActionTimeoutError& error) {
       return failure(action.type, adapter_for(action.type), "action_timeout", error.what());
@@ -643,6 +752,76 @@ class WindowsActionBackend final : public IActionBackend {
     return result;
   }
 
+  // Daily recommendations and play modes, through the client's DevTools
+  // channel. A client that is not running is started with the channel; one
+  // running without it is left alone, since restarting it would cut off
+  // whatever it is playing.
+  [[nodiscard]] ActionResult control_netease(ActionType type, std::stop_token stop) const {
+    constexpr auto adapter = "netease.cdp";
+    const auto port = config_.netease.cdp_port;
+    const auto script = type == ActionType::media_play_daily
+                            ? netease_play_daily_script()
+                            : netease_play_mode_script(netease_mode_name(type));
+    const auto evaluate = [&](std::chrono::steady_clock::time_point deadline) {
+      return netease_cdp_evaluate(port, script, deadline, stop);
+    };
+    ActionResult result;
+    result.type = type;
+    result.adapter = adapter;
+    nlohmann::json value;
+    try {
+      try {
+        value = evaluate(std::chrono::steady_clock::now() +
+                         std::chrono::milliseconds(config_.netease.timeout_ms));
+      } catch (const NeteaseCdpError& error) {
+        const bool running = !netease_processes().empty();
+        if (error.kind() == NeteaseCdpError::Kind::unavailable && running) {
+          return failure(type, adapter, "netease_control_unavailable",
+                         "the NetEase client is running without its control channel; close it "
+                         "and start it with `voice_frontend netease-start`");
+        }
+        if (error.kind() != NeteaseCdpError::Kind::unavailable &&
+            error.kind() != NeteaseCdpError::Kind::starting) {
+          throw;
+        }
+        const auto deadline = std::chrono::steady_clock::now() + kNeteaseStartTimeout;
+        if (!running) launch_netease(netease_executable(config_.netease), port);
+        wait_for_netease_control(port, deadline, stop);
+        value = evaluate(deadline);
+      }
+    } catch (const NeteaseCdpError& error) {
+      switch (error.kind()) {
+        case NeteaseCdpError::Kind::timeout: throw ActionTimeoutError{};
+        case NeteaseCdpError::Kind::cancelled: throw ActionCancelledError{};
+        default:
+          return failure(type, adapter, "netease_control_failed", error.what());
+      }
+    }
+
+    if (!value.is_object() || !value.value("ok", false)) {
+      return failure(type, adapter, "netease_control_failed",
+                     "the NetEase client did not reach the requested state: " + value.dump());
+    }
+    result.verified = true;
+    if (type == ActionType::media_play_daily) {
+      result.status = ActionStatus::succeeded;
+      result.target_id = value.value("id", "");
+      result.message = "playing daily recommendations (" +
+                       std::to_string(value.value("queue", 0)) + " songs): " +
+                       value.value("name", "");
+      return result;
+    }
+    result.target_id = value.value("mode", "");
+    if (!value.value("changed", false)) {
+      result.status = ActionStatus::noop;
+      result.message = "play mode is already " + result.target_id;
+      return result;
+    }
+    result.status = ActionStatus::succeeded;
+    result.message = "play mode " + value.value("before", "") + " -> " + result.target_id;
+    return result;
+  }
+
   [[nodiscard]] NcmResponse run_ncm_cli(std::vector<std::wstring> arguments,
                                         std::chrono::steady_clock::time_point deadline,
                                         std::stop_token stop) const {
@@ -765,6 +944,37 @@ class WindowsActionBackend final : public IActionBackend {
 };
 
 }  // namespace
+
+bool start_netease_with_control(const NeteaseActionConfig& config, bool restart) {
+  const std::stop_source never;
+  const auto deadline = std::chrono::steady_clock::now() + kNeteaseStartTimeout;
+  try {
+    (void)netease_cdp_evaluate(config.cdp_port, netease_ready_script(),
+                               std::chrono::steady_clock::now() + std::chrono::seconds(3),
+                               never.get_token());
+    return true;
+  } catch (const NeteaseCdpError& error) {
+    if (error.kind() == NeteaseCdpError::Kind::starting) {
+      wait_for_netease_control(config.cdp_port, deadline, never.get_token());
+      return true;
+    }
+  }
+  if (const auto running = netease_processes(); !running.empty()) {
+    if (!restart) return false;
+    for (const auto pid : running) {
+      if (const auto process = OpenProcess(PROCESS_TERMINATE, FALSE, pid)) {
+        TerminateProcess(process, 0);
+        CloseHandle(process);
+      }
+    }
+    for (int wait = 0; wait < 100 && !netease_processes().empty(); ++wait) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+  launch_netease(netease_executable(config), config.cdp_port);
+  wait_for_netease_control(config.cdp_port, deadline, never.get_token());
+  return true;
+}
 
 std::shared_ptr<IActionBackend> create_windows_action_backend(WindowsActionConfig config) {
   return std::make_shared<WindowsActionBackend>(std::move(config));

@@ -142,6 +142,11 @@ struct CommandsConfig {
   // Optional actions: an empty list disables the action.
   std::vector<std::string> next_phrases{"下一首"};
   std::vector<std::string> like_phrases{"喜欢这首歌"};
+  std::vector<std::string> daily_phrases{"播放每日推荐"};
+  std::vector<std::string> mode_order_phrases{"顺序播放"};
+  std::vector<std::string> mode_list_loop_phrases{"列表循环"};
+  std::vector<std::string> mode_single_loop_phrases{"单曲循环"};
+  std::vector<std::string> mode_shuffle_phrases{"随机播放"};
   std::vector<std::string> connectors{"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"};
 };
 
@@ -157,6 +162,12 @@ struct NeteaseConfig {
   // Client data directory; empty = %LOCALAPPDATA%/NetEase/CloudMusic.
   std::filesystem::path client_data;
   std::uint32_t timeout_ms{10000};
+  // Daily recommendations and play modes go through the client's DevTools
+  // channel, which exists only when cloudmusic.exe was started with
+  // --remote-debugging-address=127.0.0.1 --remote-debugging-port=<cdp_port>.
+  std::uint16_t cdp_port{9223};
+  // cloudmusic.exe; empty = the program registered for orpheus:// links.
+  std::filesystem::path executable;
 };
 
 struct AnnouncementsConfig {
