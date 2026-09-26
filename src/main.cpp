@@ -19,6 +19,7 @@
 #include "dvo/evaluation.h"
 #include "dvo/runtime.h"
 #include "dvo/wasapi_capture.h"
+#include "dvo/windows_action_backend.h"
 
 namespace {
 std::atomic<bool> stop_requested{};
@@ -41,7 +42,8 @@ void print_usage() {
                "  benchmark <session> [--events=<file.ndjson>]\n"
                "  evaluate <labeled session | directory of sessions> [--out=<report.json>]\n"
                "           [--since=<YYYYMMDD-HHMMSS>]   (only sessions recorded from then on)\n"
-               "  parse [--wake=<wake word>]   (one recognized text per stdin line)\n";
+               "  parse [--wake=<wake word>]   (one recognized text per stdin line)\n"
+               "  act <next|like>   (runs one action for real, bypassing speech)\n";
 }
 
 std::optional<std::string> option_value(int argc, char** argv, std::string_view name) {
@@ -111,6 +113,39 @@ std::optional<std::string> utf8_option_value(std::string_view name) {
   }
   LocalFree(wide);
   return result;
+}
+
+// Executes one action through the live Windows backend, for checking an
+// adapter (for example the NetEase like) without speaking.
+int run_action(const dvo::AppConfig& config, std::string_view name) {
+  dvo::PlannedAction action;
+  action.action_id = "act-cli";
+  action.sequence = 1;
+  if (name == "next") {
+    action.type = dvo::ActionType::media_next;
+  } else if (name == "like") {
+    action.type = dvo::ActionType::media_like;
+  } else {
+    throw std::invalid_argument("act supports next and like");
+  }
+  const auto backend = dvo::create_windows_action_backend(
+      {config.audio.loopback_device, config.commands.action_timeout_ms,
+       {config.netease.ncm_cli, config.netease.node, config.netease.client_data,
+        config.netease.timeout_ms}});
+  const auto started = std::chrono::steady_clock::now();
+  const auto result = backend->execute(action, std::stop_source{}.get_token());
+  const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+      std::chrono::steady_clock::now() - started);
+  std::cout << nlohmann::json{{"type", dvo::to_string(result.type)},
+                              {"status", dvo::to_string(result.status)},
+                              {"adapter", result.adapter},
+                              {"target_id", result.target_id},
+                              {"error_code", result.error_code},
+                              {"message", result.message},
+                              {"elapsed_ms", elapsed.count()}}
+                   .dump(2, ' ', false, nlohmann::json::error_handler_t::replace)
+            << "\n";
+  return result.status == dvo::ActionStatus::failed ? 1 : 0;
 }
 
 // Runs recognized texts through the configured command parser, dry-run, so
@@ -247,6 +282,10 @@ int main(int argc, char** argv) {
     }
     if (mode == "evaluate") return run_evaluation(argc, argv, config, store);
     if (mode == "parse") return run_parse(config);
+    if (mode == "act") {
+      if (argc < 3) throw std::invalid_argument("act requires next or like");
+      return run_action(config, argv[2]);
+    }
     if (mode == "replay") {
       if (argc < 3) throw std::invalid_argument("replay requires a session path");
       runtime.start_replay(argv[2]);

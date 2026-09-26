@@ -428,8 +428,9 @@ constexpr std::size_t kMinOmissionPhraseCodepoints = 4;
 void append_rules(const std::vector<std::string>& phrases, std::string_view category,
                   ActionType type, bool volume_increase,
                   std::vector<PhraseRule>& output,
-                  std::unordered_map<std::string, std::string>& owners) {
-  if (phrases.empty()) {
+                  std::unordered_map<std::string, std::string>& owners,
+                  bool optional = false) {
+  if (phrases.empty() && !optional) {
     throw std::invalid_argument(std::string(category) + " must contain at least one phrase");
   }
   for (const auto& phrase : phrases) {
@@ -631,6 +632,10 @@ CommandParser::CommandParser(int default_volume_delta_percent,
                ActionType::master_volume_adjust, true, implementation->rules, owners);
   append_rules(grammar.volume_down_phrases, "commands.phrases.volume_down",
                ActionType::master_volume_adjust, false, implementation->rules, owners);
+  append_rules(grammar.next_phrases, "commands.phrases.next", ActionType::media_next,
+               false, implementation->rules, owners, true);
+  append_rules(grammar.like_phrases, "commands.phrases.like", ActionType::media_like,
+               false, implementation->rules, owners, true);
   std::ranges::sort(implementation->rules, {}, [](const PhraseRule& rule) {
     return rule.phrase.size();
   });

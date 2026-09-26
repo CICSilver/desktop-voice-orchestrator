@@ -51,7 +51,7 @@ namespace {
       return "播放音乐";
     case ActionType::media_pause:
       return "暂停音乐";
-    case ActionType::master_volume_adjust:
+    case ActionType::master_volume_adjust: {
       if (!action.volume_delta_percent || *action.volume_delta_percent == 0) {
         return "调整音量";
       }
@@ -60,6 +60,11 @@ namespace {
       }
       const auto magnitude = -static_cast<std::int64_t>(*action.volume_delta_percent);
       return "降低音量 " + std::to_string(magnitude) + "%";
+    }
+    case ActionType::media_next:
+      return "下一首";
+    case ActionType::media_like:
+      return "收藏这首歌";
   }
   return "未知操作";
 }

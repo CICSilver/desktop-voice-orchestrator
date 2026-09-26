@@ -7,6 +7,8 @@ const char* to_string(ActionType type) {
     case ActionType::media_play: return "media.play";
     case ActionType::media_pause: return "media.pause";
     case ActionType::master_volume_adjust: return "audio.volume.adjust";
+    case ActionType::media_next: return "media.next";
+    case ActionType::media_like: return "media.like";
   }
   return "unknown";
 }

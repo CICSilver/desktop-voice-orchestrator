@@ -139,7 +139,24 @@ struct CommandsConfig {
   std::vector<std::string> pause_phrases{"暂停音乐"};
   std::vector<std::string> volume_up_phrases{"增加音量"};
   std::vector<std::string> volume_down_phrases{"降低音量"};
+  // Optional actions: an empty list disables the action.
+  std::vector<std::string> next_phrases{"下一首"};
+  std::vector<std::string> like_phrases{"喜欢这首歌"};
   std::vector<std::string> connectors{"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"};
+};
+
+// "Like the current song" goes through NetEase's official ncm-cli (Open
+// Platform credentials and login are configured in ncm-cli itself) and reads
+// the NetEase client's local play history to identify the song. Empty paths
+// are resolved at execution time.
+struct NeteaseConfig {
+  // ncm-cli's entry script; empty = %APPDATA%/npm/node_modules/@music163/ncm-cli/dist/index.js.
+  std::filesystem::path ncm_cli;
+  // Node.js executable; empty = node.exe on PATH.
+  std::filesystem::path node;
+  // Client data directory; empty = %LOCALAPPDATA%/NetEase/CloudMusic.
+  std::filesystem::path client_data;
+  std::uint32_t timeout_ms{10000};
 };
 
 struct AnnouncementsConfig {
@@ -174,6 +191,7 @@ struct AppConfig {
   ActivationConfig activation;
   AsrConfig asr;
   CommandsConfig commands;
+  NeteaseConfig netease;
   AnnouncementsConfig announcements;
   WebConfig web;
   RecordingConfig recording;

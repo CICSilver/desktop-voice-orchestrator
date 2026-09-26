@@ -44,6 +44,7 @@ add_library(dvo_core STATIC
   src/streaming_recognizer.cpp
   src/command.cpp
   src/command_parser.cpp
+  src/netease.cpp
   src/action_executor.cpp
   src/benchmark_report.cpp
   src/evaluation.cpp
@@ -81,6 +82,8 @@ target_link_libraries(dvo_core
     propsys
     runtimeobject
     bcrypt
+    # The Windows SDK's system SQLite, used read-only on the NetEase client's database.
+    winsqlite3
 )
 
 if(DVO_ENABLE_SHERPA)
@@ -128,6 +131,7 @@ if(BUILD_TESTING AND DVO_BUILD_TESTS)
     tests/test_audio.cpp
     tests/test_streaming_recognizer.cpp
     tests/test_command_parser.cpp
+    tests/test_netease.cpp
     tests/test_action_executor.cpp
     tests/test_benchmark_report.cpp
     tests/test_evaluation.cpp

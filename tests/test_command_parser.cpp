@@ -240,7 +240,7 @@ TEST_CASE("Wake-confirmed readings tolerate residue, fillers and a misheard wake
   CHECK(actions_of("暂停音小助手播放音乐") == "暂停音乐;播放音乐");
   CHECK(actions_of("小助手今天天气怎么样") == "REJECTED");
   CHECK(actions_of("今天天气怎么样小助手") == "REJECTED");
-  CHECK(actions_of("小助手播放音乐然后下一首") == "REJECTED");
+  CHECK(actions_of("小助手播放音乐然后打开窗口") == "REJECTED");
   CHECK(actions_of("播放小叔手音乐") == "REJECTED");
   CHECK(actions_of("暂停音乐小说") == "REJECTED");
 
@@ -469,6 +469,61 @@ TEST_CASE("The shipped grammar accepts everyday phrasings of each command") {
   // Ordinary sentences that merely contain command words stay rejected.
   CHECK(actions_of("这首歌的音乐还挺好听的") == "REJECTED");
   CHECK(actions_of("暂停一下我去倒杯水") == "REJECTED");
+}
+
+TEST_CASE("The shipped grammar skips to the next song and likes the current one") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  dvo::ConfigStore store(root / "config/default.toml",
+                         std::filesystem::temp_directory_path() / "dvo-no-overrides.toml", root);
+  const auto config = store.load();
+  const dvo::CommandParser parser(config.commands.default_volume_step_percent,
+                                  config.commands.max_spoken_volume_step_percent,
+                                  dvo::command_grammar(config.commands));
+  auto wake = context("next-like");
+  wake.wake_word = "小克";
+  const auto actions_of = [&](const char* text) {
+    const auto result = parser.parse(text, wake);
+    return result.ok() ? result.plan->normalized_text : std::string("REJECTED");
+  };
+
+  for (const char* text : {"小克切歌", "换歌，小克", "小克，换一首", "小克换一首歌", "下一首小克",
+                           "小克下一首歌"}) {
+    CAPTURE(text);
+    const auto result = parser.parse(text, wake);
+    REQUIRE(result.ok());
+    REQUIRE(result.plan->actions.size() == 1);
+    CHECK(result.plan->actions.front().type == dvo::ActionType::media_next);
+  }
+  for (const char* text : {"小克喜欢这首歌", "小克，我喜欢这首歌", "喜欢这个，小克", "小克我喜欢这个",
+                           "收藏一下小克", "小克收藏一下吧"}) {
+    CAPTURE(text);
+    const auto result = parser.parse(text, wake);
+    REQUIRE(result.ok());
+    REQUIRE(result.plan->actions.size() == 1);
+    CHECK(result.plan->actions.front().type == dvo::ActionType::media_like);
+  }
+  // Liking runs before skipping: the executor keeps the spoken order.
+  const auto chained = parser.parse("小克收藏一下然后切歌", wake);
+  REQUIRE(chained.ok());
+  REQUIRE(chained.plan->actions.size() == 2);
+  CHECK(chained.plan->actions[0].type == dvo::ActionType::media_like);
+  CHECK(chained.plan->actions[1].type == dvo::ActionType::media_next);
+
+  CHECK(actions_of("小克切") == "REJECTED");
+  CHECK(actions_of("小克我喜欢这个歌手") == "REJECTED");
+  CHECK(actions_of("下一首是什么歌") == "REJECTED");
+  CHECK(actions_of("我喜欢这首歌的前奏") == "REJECTED");
+}
+
+TEST_CASE("Empty next and like phrase lists disable those actions") {
+  dvo::CommandGrammar grammar;
+  CHECK(dvo::CommandParser(5, 20, grammar).parse("下一首", context()).ok());
+  grammar.next_phrases.clear();
+  grammar.like_phrases.clear();
+  const dvo::CommandParser parser(5, 20, std::move(grammar));
+  CHECK_FALSE(parser.parse("下一首", context()).ok());
+  CHECK_FALSE(parser.parse("喜欢这首歌", context()).ok());
+  CHECK(parser.parse("暂停音乐", context()).ok());
 }
 
 TEST_CASE("Configured grammar rejects phrase collisions") {

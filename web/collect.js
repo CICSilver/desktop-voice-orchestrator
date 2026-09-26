@@ -18,6 +18,8 @@ const BACKGROUND_GROUP = {id: 'background', title: '日常背景', condition: 'b
 
 const PAUSE = {type: 'media.pause'};
 const PLAY = {type: 'media.play'};
+const NEXT = {type: 'media.next'};
+const LIKE = {type: 'media.like'};
 const volume = (delta) => ({type: 'audio.volume.adjust', volume_delta_percent: delta});
 
 const COMMANDS = [
@@ -89,8 +91,11 @@ const TRAIN_PHRASINGS = {
   pause: ['暂停音乐', '暂停', '暂停一下', '停一下', '停一下歌', '停一下音乐', '先停一下', '停止播放',
     '别放了', '先别放了', '不要放了', '关掉音乐', '把音乐关掉', '把音乐关了'],
   up: ['增加音量', '调大音量', '音量调大', '音量大一点', '声音大一点', '大声一点', '大声点'],
-  down: ['降低音量', '调小音量', '音量调小', '音量小一点', '声音小一点', '小声一点', '小声点']
+  down: ['降低音量', '调小音量', '音量调小', '音量小一点', '声音小一点', '小声一点', '小声点'],
+  next: ['切歌', '换歌', '换一首', '换一首歌', '下一首', '下一首歌'],
+  like: ['喜欢这首歌', '我喜欢这首歌', '喜欢这个', '我喜欢这个', '收藏一下']
 };
+const FIXED_ACTIONS = {play: PLAY, pause: PAUSE, next: NEXT, like: LIKE};
 const AMOUNT_PHRASINGS = new Set(['增加音量', '调大音量', '音量调大', '降低音量', '调小音量', '音量调小']);
 const TRAIN_CONNECTORS = ['，然后', '，再', '，然后再', '，接着'];
 // Common amounts weighted up; every value the parser accepts can appear.
@@ -125,9 +130,7 @@ function trainingPhrase(random, previousAction) {
   do action = pick(Object.keys(TRAIN_PHRASINGS));
   while (action === previousAction);
   const say = pick(TRAIN_PHRASINGS[action]);
-  if (action === 'play' || action === 'pause') {
-    return {say, action, actions: [action === 'play' ? PLAY : PAUSE]};
-  }
+  if (FIXED_ACTIONS[action]) return {say, action, actions: [FIXED_ACTIONS[action]]};
   const sign = action === 'up' ? 1 : -1;
   if (!AMOUNT_PHRASINGS.has(say) || random() < 0.4) return {say, action, actions: [volume(5 * sign)]};
   const amount = pick(TRAIN_AMOUNTS);

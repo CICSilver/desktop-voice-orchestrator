@@ -60,6 +60,8 @@ function formatDuration(seconds) {
 function parseActionLabel(action) {
   if (action.type === 'media.play') return '播放';
   if (action.type === 'media.pause') return '暂停';
+  if (action.type === 'media.next') return '下一首';
+  if (action.type === 'media.like') return '收藏';
   if (action.type === 'audio.volume.adjust') {
     const delta = Number(action.volume_delta_percent || 0);
     return `音量${delta >= 0 ? '+' : ''}${delta}%`;

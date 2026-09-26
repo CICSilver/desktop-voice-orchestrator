@@ -47,6 +47,9 @@ struct CommandGrammar {
   std::vector<std::string> pause_phrases{"暂停音乐"};
   std::vector<std::string> volume_up_phrases{"增加音量"};
   std::vector<std::string> volume_down_phrases{"降低音量"};
+  // Optional actions: an empty list disables the action.
+  std::vector<std::string> next_phrases{"下一首"};
+  std::vector<std::string> like_phrases{"喜欢这首歌"};
   std::vector<std::string> connectors{"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"};
   std::size_t max_actions_per_utterance{kMaxCommandActions};
 };

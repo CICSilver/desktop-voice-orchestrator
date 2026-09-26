@@ -17,6 +17,9 @@ enum class ActionType {
   media_play,
   media_pause,
   master_volume_adjust,
+  media_next,
+  // Marks the NetEase Cloud Music client's current song as liked.
+  media_like,
 };
 
 enum class ExecutionSource {

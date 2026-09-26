@@ -215,9 +215,17 @@ AppConfig ConfigStore::load() const {
   c.commands.pause_phrases = read_strings(table, "commands.phrases.pause", {"暂停音乐"});
   c.commands.volume_up_phrases = read_strings(table, "commands.phrases.volume_up", {"增加音量"});
   c.commands.volume_down_phrases = read_strings(table, "commands.phrases.volume_down", {"降低音量"});
+  c.commands.next_phrases = read_strings(table, "commands.phrases.next", {"下一首"});
+  c.commands.like_phrases = read_strings(table, "commands.phrases.like", {"喜欢这首歌"});
   c.commands.connectors = read_strings(
       table, "commands.connectors",
       {"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"});
+
+  c.netease.ncm_cli = resolve_optional(project_root_, read_path(table, "netease.ncm_cli", {}));
+  c.netease.node = read_path(table, "netease.node", {});
+  c.netease.client_data =
+      resolve_optional(project_root_, read_path(table, "netease.client_data", {}));
+  c.netease.timeout_ms = read<std::int64_t>(table, "netease.timeout_ms", 10000);
 
   c.announcements.enabled = read<bool>(table, "announcements.enabled", true);
   c.announcements.backend = read<std::string>(table, "announcements.backend", "log");
@@ -358,6 +366,8 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
         "commands.action_timeout_ms must be in [100, 10000]");
   range(c.commands.queue_capacity >= 1 && c.commands.queue_capacity <= 256,
         "commands.queue_capacity must be in [1, 256]");
+  range(c.netease.timeout_ms >= 1000 && c.netease.timeout_ms <= 30000,
+        "netease.timeout_ms must be in [1000, 30000]");
   range(c.announcements.backend == "log",
         "announcements.backend must be 'log'");
   range(c.announcements.queue_capacity >= 1 &&
@@ -374,6 +384,8 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
     grammar.pause_phrases = c.commands.pause_phrases;
     grammar.volume_up_phrases = c.commands.volume_up_phrases;
     grammar.volume_down_phrases = c.commands.volume_down_phrases;
+    grammar.next_phrases = c.commands.next_phrases;
+    grammar.like_phrases = c.commands.like_phrases;
     grammar.connectors = c.commands.connectors;
     grammar.max_actions_per_utterance = c.commands.max_actions_per_utterance;
     const CommandParser parser(static_cast<int>(c.commands.default_volume_step_percent),
@@ -456,10 +468,14 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                      {"pause_phrases", c.commands.pause_phrases},
                      {"volume_up_phrases", c.commands.volume_up_phrases},
                      {"volume_down_phrases", c.commands.volume_down_phrases},
+                     {"next_phrases", c.commands.next_phrases},
+                     {"like_phrases", c.commands.like_phrases},
                      {"phrases", {{"play", c.commands.play_phrases},
                                    {"pause", c.commands.pause_phrases},
                                    {"volume_up", c.commands.volume_up_phrases},
-                                   {"volume_down", c.commands.volume_down_phrases}}},
+                                   {"volume_down", c.commands.volume_down_phrases},
+                                   {"next", c.commands.next_phrases},
+                                   {"like", c.commands.like_phrases}}},
                      {"connectors", c.commands.connectors}}},
       {"announcements", {{"enabled", c.announcements.enabled},
                           {"backend", c.announcements.backend},
@@ -569,8 +585,14 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                     {"phrases", {{"play", c.commands.play_phrases},
                                   {"pause", c.commands.pause_phrases},
                                   {"volume_up", c.commands.volume_up_phrases},
-                                  {"volume_down", c.commands.volume_down_phrases}}},
+                                  {"volume_down", c.commands.volume_down_phrases},
+                                  {"next", c.commands.next_phrases},
+                                  {"like", c.commands.like_phrases}}},
                     {"connectors", c.commands.connectors}}},
+      {"netease", {{"ncm_cli", c.netease.ncm_cli.string()},
+                   {"node", c.netease.node.string()},
+                   {"client_data", c.netease.client_data.string()},
+                   {"timeout_ms", c.netease.timeout_ms}}},
       {"announcements", {{"enabled", c.announcements.enabled},
                           {"backend", c.announcements.backend},
                           {"queue_capacity", c.announcements.queue_capacity},
@@ -681,12 +703,16 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
       assign_if(*it, "pause_phrases", candidate.commands.pause_phrases);
       assign_if(*it, "volume_up_phrases", candidate.commands.volume_up_phrases);
       assign_if(*it, "volume_down_phrases", candidate.commands.volume_down_phrases);
+      assign_if(*it, "next_phrases", candidate.commands.next_phrases);
+      assign_if(*it, "like_phrases", candidate.commands.like_phrases);
       assign_if(*it, "connectors", candidate.commands.connectors);
       if (const auto phrases = it->find("phrases"); phrases != it->end()) {
         assign_if(*phrases, "play", candidate.commands.play_phrases);
         assign_if(*phrases, "pause", candidate.commands.pause_phrases);
         assign_if(*phrases, "volume_up", candidate.commands.volume_up_phrases);
         assign_if(*phrases, "volume_down", candidate.commands.volume_down_phrases);
+        assign_if(*phrases, "next", candidate.commands.next_phrases);
+        assign_if(*phrases, "like", candidate.commands.like_phrases);
       }
     }
     if (const auto it = patch.find("announcements"); it != patch.end()) {
@@ -785,7 +811,13 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
       << "[commands.phrases]\nplay = " << toml_array(c.commands.play_phrases)
       << "\npause = " << toml_array(c.commands.pause_phrases)
       << "\nvolume_up = " << toml_array(c.commands.volume_up_phrases)
-      << "\nvolume_down = " << toml_array(c.commands.volume_down_phrases) << "\n\n";
+      << "\nvolume_down = " << toml_array(c.commands.volume_down_phrases)
+      << "\nnext = " << toml_array(c.commands.next_phrases)
+      << "\nlike = " << toml_array(c.commands.like_phrases) << "\n\n";
+  out << "[netease]\nncm_cli = " << toml_string(c.netease.ncm_cli.generic_string())
+      << "\nnode = " << toml_string(c.netease.node.generic_string())
+      << "\nclient_data = " << toml_string(c.netease.client_data.generic_string())
+      << "\ntimeout_ms = " << c.netease.timeout_ms << "\n\n";
   out << "[announcements]\nenabled = "
       << (c.announcements.enabled ? "true" : "false")
       << "\nbackend = " << toml_string(c.announcements.backend)

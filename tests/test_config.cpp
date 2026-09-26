@@ -30,6 +30,12 @@ TEST_CASE("checked-in default configuration is valid") {
   REQUIRE(has(config.commands.play_phrases, "把音乐打开"));
   REQUIRE(has(config.commands.pause_phrases, "暂停音乐"));
   REQUIRE(has(config.commands.pause_phrases, "别放了"));
+  REQUIRE(has(config.commands.next_phrases, "切歌"));
+  REQUIRE(has(config.commands.like_phrases, "收藏一下"));
+  // Empty NetEase paths are resolved when the action runs.
+  CHECK(config.netease.ncm_cli.empty());
+  CHECK(config.netease.client_data.empty());
+  CHECK(config.netease.timeout_ms == 10000);
   REQUIRE(config.commands.action_timeout_ms == 2000);
   REQUIRE(config.activation.enabled);
   REQUIRE(config.activation.idle_timeout_ms == 6000);
@@ -83,6 +89,16 @@ TEST_CASE("checked-in default configuration is valid") {
   auto probe = config;
   probe.kws.asr_probe_source = "loopback";
   CHECK_FALSE(store.validate(probe).ok());
+
+  auto netease = config;
+  netease.netease.timeout_ms = 500;
+  CHECK_FALSE(store.validate(netease).ok());
+  netease = config;
+  netease.commands.next_phrases.clear();  // optional actions may be switched off
+  netease.commands.like_phrases.clear();
+  CHECK(store.validate(netease).ok());
+  netease.commands.like_phrases = {"暂停"};  // but never share a phrase with another action
+  CHECK_FALSE(store.validate(netease).ok());
 }
 
 TEST_CASE("AEC calibration patch is validated exposed and persisted") {
@@ -138,9 +154,20 @@ TEST_CASE("saved overrides keep a replaced final decoder and the wake probe sett
   config.asr.final_tokens = root / "config/keywords.txt";
   config.kws.asr_probe = !config.kws.asr_probe;
   config.kws.asr_probe_max_ms = 6000;
+  config.netease.ncm_cli = root / "config/default.toml";
+  config.netease.node = "node";
+  config.netease.timeout_ms = 15000;
+  config.commands.next_phrases = {"切歌"};
+  config.commands.like_phrases = {};
 
   store.save_overrides(config);
   const auto reloaded = store.load();
+  CHECK(std::filesystem::equivalent(reloaded.netease.ncm_cli, config.netease.ncm_cli));
+  CHECK(reloaded.netease.node == "node");
+  CHECK(reloaded.netease.client_data.empty());
+  CHECK(reloaded.netease.timeout_ms == 15000);
+  CHECK(reloaded.commands.next_phrases == std::vector<std::string>{"切歌"});
+  CHECK(reloaded.commands.like_phrases.empty());
   CHECK(reloaded.asr.final_decoder == config.asr.final_decoder);
   CHECK(std::filesystem::equivalent(reloaded.asr.final_model, config.asr.final_model));
   CHECK(std::filesystem::equivalent(reloaded.asr.final_tokens, config.asr.final_tokens));
