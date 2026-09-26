@@ -280,6 +280,9 @@ class VoiceFrontendRuntime {
   // Evaluation recordings disable live system actions so that, for example,
   // a spoken "暂停音乐" does not stop the music the take is being recorded over.
   std::atomic<bool> live_dry_run_{};
+  // Transcription test: while set (never persisted), the final decoder's text
+  // for every live speech segment is published as "transcript" events.
+  std::atomic<bool> live_transcribe_{};
   std::optional<std::uint64_t> first_frame_sample_;
   std::atomic<bool> benchmark_capture_enabled_{};
   mutable std::mutex benchmark_events_mutex_;

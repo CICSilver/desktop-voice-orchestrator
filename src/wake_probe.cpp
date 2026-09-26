@@ -105,6 +105,8 @@ WakeProbeResult WakeProbe::decode(const WakeProbeRequest& request) {
   WakeProbeResult result;
   result.id = request.id;
   result.speech = request.speech;
+  result.probe = request.probe;
+  result.transcribe = request.transcribe;
   if (!engine_) {
     result.error = "wake probe engine unavailable";
     return result;

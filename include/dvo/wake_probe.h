@@ -28,11 +28,17 @@ struct WakeProbeRequest {
   std::uint64_t id{};
   SampleSpan speech;  // VAD speech span, processing sample clock
   SampleSpan audio;   // span actually decoded (speech plus margins)
+  // A segment may be decoded for the wake check, for the live transcription
+  // test, or both; a match only wakes when `probe` is set.
+  bool probe{true};
+  bool transcribe{};
 };
 
 struct WakeProbeResult {
   std::uint64_t id{};
   SampleSpan speech;
+  bool probe{true};
+  bool transcribe{};
   bool matched{};
   bool exact{};
   std::string keyword;

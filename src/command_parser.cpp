@@ -398,6 +398,11 @@ void correct_wake_confirmed_asr_confusions(
   return normalized.value;
 }
 
+// A phrase shorter than this is matched exactly: dropping one character from
+// "暂停" or "别放了" leaves too little to tell a misheard command from other
+// speech.
+constexpr std::size_t kMinOmissionPhraseCodepoints = 4;
+
 [[nodiscard]] std::vector<std::string> omission_variants(std::string_view phrase) {
   std::vector<std::size_t> boundaries{0};
   for (std::size_t offset = 0; offset < phrase.size();) {
@@ -406,7 +411,7 @@ void correct_wake_confirmed_asr_confusions(
     offset += decoded->second;
     boundaries.push_back(offset);
   }
-  if (boundaries.size() <= 2) return {};
+  if (boundaries.size() - 1 < kMinOmissionPhraseCodepoints) return {};
 
   std::vector<std::string> variants;
   std::unordered_set<std::string> unique;
@@ -460,11 +465,13 @@ void append_rules(const std::vector<std::string>& phrases, std::string_view cate
   return result;
 }
 
-// Hesitations carry no command meaning, and recognizers sometimes emit stray
-// markup symbols (for example a leading '<').
+// Hesitations and sentence-final particles ("开一下音乐吧") carry no command
+// meaning, and recognizers sometimes emit stray markup symbols (for example a
+// leading '<').
 [[nodiscard]] bool is_filler(char32_t cp) {
   switch (cp) {
     case U'啊': case U'呃': case U'嗯': case U'哦': case U'唉': case U'诶': case U'呀':
+    case U'吧': case U'啦': case U'呗':
     case U'<': case U'>': case U'|': case U'*': case U'#': case U'~': case U'"':
     case U'\'': case U'(': case U')': case U'[': case U']': case U'{': case U'}':
     case U'-': case U'_': case U'=': case U'@': case U'/': case U'\\': case U'`':

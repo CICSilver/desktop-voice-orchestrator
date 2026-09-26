@@ -1045,6 +1045,7 @@ for (const id of ['waveform', 'aec-band', 'vad', 'kws']) installTimelineDrag($(i
 syncViewControls();
 setActiveMode('live');
 $('collect-link').href = `/collect.html?token=${encodeURIComponent(token)}`;
+$('transcribe-link').href = `/transcribe.html?token=${encodeURIComponent(token)}`;
 connect();
 draw();
 setInterval(updateRecordingControls, 500);

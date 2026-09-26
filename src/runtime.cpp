@@ -1349,23 +1349,27 @@ void VoiceFrontendRuntime::process_keyword_hit(
 }
 
 void VoiceFrontendRuntime::submit_wake_probe(const VadInterval& interval) {
-  // Speech inside an activation is already a follow-up turn.
-  if (segmenter_->activation().active()) return;
   const auto length = interval.span.end - interval.span.start;
   constexpr std::uint64_t kMinimumProbeSamples = kProcessingSampleRate * 2 / 5;
-  if (length < kMinimumProbeSamples ||
-      length > static_cast<std::uint64_t>(config_.kws.asr_probe_max_ms) *
-                   kProcessingSampleRate / 1000) {
-    return;
-  }
-  // Speech that produced a keyword hit belongs to the keyword path.
   constexpr std::uint64_t kKeywordGuardSamples = kProcessingSampleRate / 2;
-  if (last_runtime_keyword_sample_ != 0 &&
-      last_runtime_keyword_sample_ + kKeywordGuardSamples >= interval.span.start) {
-    return;
-  }
+  // Speech inside an activation is already a follow-up turn, and speech that
+  // produced a keyword hit belongs to the keyword path.
+  const bool probe =
+      !segmenter_->activation().active() && length >= kMinimumProbeSamples &&
+      length <= static_cast<std::uint64_t>(config_.kws.asr_probe_max_ms) *
+                    kProcessingSampleRate / 1000 &&
+      !(last_runtime_keyword_sample_ != 0 &&
+        last_runtime_keyword_sample_ + kKeywordGuardSamples >= interval.span.start);
+  // The transcription test shows what the final decoder hears in every live
+  // segment, including follow-ups and keyword turns.
+  const bool transcribe = live_transcribe_.load(std::memory_order_acquire) &&
+                          !replay_mode_.load(std::memory_order_acquire) &&
+                          length >= kMinimumProbeSamples;
+  if (!probe && !transcribe) return;
   constexpr std::uint64_t kMarginSamples = kProcessingSampleRate * 3 / 10;
   WakeProbeRequest request;
+  request.probe = probe;
+  request.transcribe = transcribe;
   request.id = next_wake_probe_id_++;
   request.speech = interval.span;
   request.audio = {interval.span.start > kMarginSamples ? interval.span.start - kMarginSamples
@@ -1381,6 +1385,18 @@ void VoiceFrontendRuntime::submit_wake_probe(const VadInterval& interval) {
 void VoiceFrontendRuntime::handle_wake_probe(WakeProbeResult result,
                                              std::uint64_t frame_end) {
   const bool replay = replay_mode_.load(std::memory_order_acquire);
+  if (result.transcribe) {
+    // Only while the user has the transcription test open.
+    auto transcript = nlohmann::json{{"speech", span_json(result.speech)},
+                                     {"duration_ms", (result.speech.end - result.speech.start) *
+                                                         1000 / kProcessingSampleRate},
+                                     {"decode_ms", result.decode_ms},
+                                     {"text", result.text},
+                                     {"wake_word_heard", result.matched}};
+    if (!result.error.empty()) transcript["error"] = result.error;
+    emit_event("transcript", std::move(transcript), frame_end, "live");
+  }
+  if (!result.probe) return;
   auto payload = nlohmann::json{{"probe_id", result.id},
                                 {"matched", result.matched},
                                 {"exact", result.exact},
@@ -2809,10 +2825,43 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     emit_event("live_dry_run_state", {{"enabled", enabled_it->get<bool>()}});
     return {{"ok", true}, {"enabled", enabled_it->get<bool>()}};
   }
+  if (action == "transcribe.set") {
+    const auto enabled_it = command.find("enabled");
+    if (enabled_it == command.end() || !enabled_it->is_boolean()) {
+      return {{"ok", false}, {"error", "enabled must be a boolean"}};
+    }
+    const bool enabled = enabled_it->get<bool>();
+    bool available{};
+    {
+      std::scoped_lock lock(pipeline_mutex_);
+      available = wake_probe_ != nullptr;
+    }
+    if (enabled && !available) {
+      return {{"ok", false},
+              {"error", "transcription needs kws.asr_probe and an offline asr.final_decoder"}};
+    }
+    live_transcribe_.store(enabled, std::memory_order_release);
+    emit_event("transcribe_state", {{"enabled", enabled}});
+    return {{"ok", true}, {"enabled", enabled}};
+  }
   if (action == "evaluation.info") {
+    bool transcribe_available{};
+    {
+      std::scoped_lock lock(pipeline_mutex_);
+      transcribe_available = wake_probe_ != nullptr;
+    }
+    std::filesystem::path final_model;
+    {
+      std::scoped_lock lock(config_mutex_);
+      final_model = config_.asr.final_model;
+    }
     return {{"ok", true},
             {"wake_words", configured_wake_words()},
             {"live_dry_run", live_dry_run_.load(std::memory_order_acquire)},
+            {"live_transcribe", live_transcribe_.load(std::memory_order_acquire)},
+            {"transcribe_available", transcribe_available},
+            // Which final decoder is loaded, e.g. a personally fine-tuned one.
+            {"final_model_dir", final_model.parent_path().filename().string()},
             {"recording_active", recorder_.active()},
             {"mode", replay_mode_.load(std::memory_order_acquire) ? "replay"
                                                                    : "live"}};

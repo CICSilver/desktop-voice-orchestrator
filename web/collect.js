@@ -63,21 +63,35 @@ const TRAINING_GROUPS = {
 const READING_GROUPS = {
   quiet: {id: 'read-quiet', title: '朗读 · 安静', condition: 'quiet', distance_m: 0.5,
     script: 'read', purpose: 'train',
-    intro: '关掉音乐和视频，照着屏幕上的句子念，用平时说话的语气就好。念错或卡住了按 R 重录；生僻的人名地名念不顺就按 S 跳过。'},
+    intro: '关掉音乐和视频，照着屏幕上的句子念，用平时说话的语气就好。有些是两句连在一起的长句，在逗号处自然停一下接着念。念错或卡住了按 R 重录；生僻的人名地名念不顺就按 S 跳过。'},
   music: {id: 'read-music', title: '朗读 · 播放音乐', condition: 'music', distance_m: 0.5,
     script: 'read', purpose: 'train',
-    intro: '用音箱播放你平时听的音乐（带人声的歌也要有），音量调到平时习惯的大小，照着句子念。念错按 R 重录，念不顺按 S 跳过。'}
+    intro: '用音箱播放你平时听的音乐（带人声的歌也要有），音量调到平时习惯的大小，照着句子念；两句连在一起的长句在逗号处自然停一下。念错按 R 重录，念不顺按 S 跳过。'}
 };
 // Share of colloquial sentences (some use command words without being commands).
 const COLLOQUIAL_SHARE = 0.15;
+// Share of prompts joining two sentences (about 25-40 characters, 6-10 s), so a
+// recognizer fine-tuned on this speaker also sees longer speech with a pause.
+const LONG_SHARE = 0.2;
+const LONG_MAX_CHARS = 40;
+// Prompts longer than this are shown in a smaller font.
+const LONG_PROMPT_CHARS = 24;
 const READ_USED_KEY = 'dvo.collect.readSentences';
 let readingPool = null;
 
-const TRAIN_PHRASES = [
-  {say: '播放音乐', action: 'play'}, {say: '打开音乐', action: 'play'},
-  {say: '暂停音乐', action: 'pause'},
-  {say: '增加音量', action: 'up', sign: 1}, {say: '降低音量', action: 'down', sign: -1}
-];
+// Every phrasing in config/default.toml's [commands.phrases]. A prompt picks
+// the action first and then one of its phrasings, so everyday wordings get as
+// much training data as the formal ones. Amounts are only spoken after the
+// phrasings that read naturally with one ("调大音量百分之十", not "大声点百分之十").
+const TRAIN_PHRASINGS = {
+  play: ['播放音乐', '打开音乐', '把音乐打开', '开一下音乐', '放音乐', '放点音乐', '放首歌', '来首歌',
+    '继续播放', '继续播放音乐', '继续放歌', '开始播放'],
+  pause: ['暂停音乐', '暂停', '暂停一下', '停一下', '停一下歌', '停一下音乐', '先停一下', '停止播放',
+    '别放了', '先别放了', '不要放了', '关掉音乐', '把音乐关掉', '把音乐关了'],
+  up: ['增加音量', '调大音量', '音量调大', '音量大一点', '声音大一点', '大声一点', '大声点'],
+  down: ['降低音量', '调小音量', '音量调小', '音量小一点', '声音小一点', '小声一点', '小声点']
+};
+const AMOUNT_PHRASINGS = new Set(['增加音量', '调大音量', '音量调大', '降低音量', '调小音量', '音量调小']);
 const TRAIN_CONNECTORS = ['，然后', '，再', '，然后再', '，接着'];
 // Common amounts weighted up; every value the parser accepts can appear.
 const TRAIN_AMOUNTS = [5, 5, 10, 10, 10, 20, 15, 3, 8, 2, 1, 12, 6, 18];
@@ -107,16 +121,17 @@ function seededRandom(seed) {
 
 function trainingPhrase(random, previousAction) {
   const pick = (list) => list[Math.floor(random() * list.length)];
-  let phrase;
-  do phrase = pick(TRAIN_PHRASES);
-  while (phrase.action === previousAction);
-  if (!phrase.sign) {
-    return {say: phrase.say, action: phrase.action, actions: [phrase.action === 'play' ? PLAY : PAUSE]};
+  let action;
+  do action = pick(Object.keys(TRAIN_PHRASINGS));
+  while (action === previousAction);
+  const say = pick(TRAIN_PHRASINGS[action]);
+  if (action === 'play' || action === 'pause') {
+    return {say, action, actions: [action === 'play' ? PLAY : PAUSE]};
   }
-  if (random() < 0.4) return {say: phrase.say, action: phrase.action, actions: [volume(5 * phrase.sign)]};
+  const sign = action === 'up' ? 1 : -1;
+  if (!AMOUNT_PHRASINGS.has(say) || random() < 0.4) return {say, action, actions: [volume(5 * sign)]};
   const amount = pick(TRAIN_AMOUNTS);
-  return {say: `${phrase.say}百分之${chineseNumber(amount)}`, action: phrase.action,
-    actions: [volume(amount * phrase.sign)]};
+  return {say: `${say}百分之${chineseNumber(amount)}`, action, actions: [volume(amount * sign)]};
 }
 
 function buildTrainingScript(group) {
@@ -183,12 +198,29 @@ function buildReadingScript(group) {
   const colloquial = fresh(readingPool.colloquial);
   const general = fresh(readingPool.aishell);
   const picked = new Set();
+  const pick = (list) => {
+    for (let attempt = 0; attempt < 50; attempt += 1) {
+      const text = list[Math.floor(random() * list.length)];
+      if (!picked.has(text)) return text;
+    }
+    return null;
+  };
   const script = [];
-  while (script.length < group.count && picked.size < colloquial.length + general.length) {
-    const list = random() < COLLOQUIAL_SHARE ? colloquial : general;
-    const text = list[Math.floor(random() * list.length)];
-    if (picked.has(text)) continue;
-    picked.add(text);
+  for (let attempt = 0; script.length < group.count && attempt < group.count * 20; attempt += 1) {
+    const roll = random();
+    let text = null;
+    if (roll < COLLOQUIAL_SHARE) {
+      text = pick(colloquial);
+    } else if (roll < COLLOQUIAL_SHARE + LONG_SHARE) {
+      const first = pick(general);
+      const second = first && pick(general.filter((other) =>
+        other !== first && first.length + other.length + 1 <= LONG_MAX_CHARS));
+      if (first && second) text = `${first}，${second}`;
+    } else {
+      text = pick(general);
+    }
+    if (!text) continue;
+    for (const part of text.split('，')) picked.add(part);
     script.push({key: 'read', kind: 'read', position: 'none', say: text, actions: []});
   }
   return script;
@@ -474,7 +506,8 @@ function startSpeaking() {
   state.takeStart = Date.now();
   $('take-countdown').textContent = take.kind === 'silence' ? '' : '请说：';
   $('take-prompt').textContent = take.prompt;
-  $('take-prompt').className = `prompt${take.kind === 'silence' ? ' silence' : ''}`;
+  $('take-prompt').className = `prompt${take.kind === 'silence' ? ' silence' : ''}` +
+    (take.prompt.length > LONG_PROMPT_CHARS ? ' long' : '');
   $('take-note').textContent = take.note || (state.attempt > 1 ? `第 ${state.attempt} 次录这一条` : '');
   for (const id of ['next-take', 'redo-take', 'skip-take']) $(id).disabled = false;
   if (take.kind === 'silence') {
@@ -562,7 +595,8 @@ async function endGroup() {
   const scored = state.labels.filter((take) => take.status === 'ok').length;
   if (saved.ok) {
     if (state.group.script === 'read') {
-      rememberSentences(state.labels.filter((take) => take.status === 'ok').map((take) => take.text));
+      rememberSentences(state.labels.filter((take) => take.status === 'ok')
+        .flatMap((take) => take.text.split('，')));
     }
     state.saved.push({title: state.group.title, session: name, detail: `${scored} 条`});
     $('done-title').textContent = `${state.group.title} 已保存`;

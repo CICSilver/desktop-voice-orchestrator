@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>识别测试</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/collect.css">
+</head>
+<body class="collect">
+  <header class="topbar">
+    <div><p class="eyebrow">DESKTOP VOICE ORCHESTRATOR</p><h1>识别测试 · 实时转写</h1></div>
+    <div class="status-cluster">
+      <span id="connection" class="pill offline">离线</span>
+      <span id="dry-run" class="pill">系统动作：未知</span>
+      <span id="state" class="record-indicator" role="status" aria-live="polite">
+        <i></i><span id="state-label">未转写</span>
+      </span>
+    </div>
+  </header>
+
+  <main class="collect-main">
+    <section class="panel stage">
+      <p class="section-label">LIVE TRANSCRIPT</p>
+      <h2>说什么都行，看看识别模型听到了什么</h2>
+      <p class="lead">
+        开始后，你说的每一段话都会交给整句识别模型（当前：<code id="model">读取中…</code>），停顿后约半秒显示结果。
+        说了唤醒词的命令，还会显示最终是否执行、为什么没执行。文字只显示在本页，不保存；关闭本页或点停止即结束。
+      </p>
+      <label class="check"><input id="use-dry-run" type="checkbox" checked>
+        测试期间停用系统动作（命令只显示，不真的执行）</label>
+      <div class="stage-actions">
+        <span id="message" class="control-message-inline"></span>
+        <button id="clear">清空</button>
+        <button id="toggle" class="primary" disabled>开始转写</button>
+      </div>
+    </section>
+
+    <section class="panel stage">
+      <p class="section-label">RESULTS</p>
+      <ol id="lines" class="transcript-list"></ol>
+      <p id="empty" class="lead">还没有内容。</p>
+    </section>
+  </main>
+  <script src="/transcribe.js"></script>
+</body>
+</html>

@@ -100,12 +100,19 @@ TEST_CASE("wake probe decodes ring audio and reports matches with a wake span") 
   CHECK(matched.wake_span->end == 1600 + 3 * 1600);
   CHECK(matched.error.empty());
 
-  REQUIRE(probe.try_submit({2, {0, 16000}, {0, 16000}}));
+  CHECK(matched.probe);
+  CHECK_FALSE(matched.transcribe);
+
+  // A transcription-only request keeps its text and flags for the runtime.
+  REQUIRE(probe.try_submit({2, {0, 16000}, {0, 16000}, false, true}));
   dvo::WakeProbeResult unmatched;
   REQUIRE(wait_for_result(probe, unmatched));
   CHECK(unmatched.id == 2);
   CHECK_FALSE(unmatched.matched);
   CHECK_FALSE(unmatched.wake_span);
+  CHECK_FALSE(unmatched.probe);
+  CHECK(unmatched.transcribe);
+  CHECK(unmatched.text == "今天天气怎么样");
 
   // Audio that already left the ring is reported, not decoded.
   REQUIRE(probe.try_submit({3, {16000 * 10, 16000 * 11}, {16000 * 10, 16000 * 11}}));

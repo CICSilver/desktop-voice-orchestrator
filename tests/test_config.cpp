@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/catch_approx.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -22,8 +23,13 @@ TEST_CASE("checked-in default configuration is valid") {
   const auto config = store.load();
   REQUIRE(config.audio.target_sample_rate == 16000);
   REQUIRE(config.ring.duration_ms == 20000);
-  REQUIRE(config.commands.play_phrases ==
-          std::vector<std::string>{"播放音乐", "打开音乐"});
+  const auto has = [](const std::vector<std::string>& phrases, const char* phrase) {
+    return std::ranges::find(phrases, phrase) != phrases.end();
+  };
+  REQUIRE(has(config.commands.play_phrases, "播放音乐"));
+  REQUIRE(has(config.commands.play_phrases, "把音乐打开"));
+  REQUIRE(has(config.commands.pause_phrases, "暂停音乐"));
+  REQUIRE(has(config.commands.pause_phrases, "别放了"));
   REQUIRE(config.commands.action_timeout_ms == 2000);
   REQUIRE(config.activation.enabled);
   REQUIRE(config.activation.idle_timeout_ms == 6000);
@@ -119,6 +125,28 @@ TEST_CASE("AEC calibration patch is validated exposed and persisted") {
                                         {"auto_delay_max_ms", 100}}}});
   REQUIRE_FALSE(result.ok());
   CHECK(invalid.aec.auto_delay_min_ms == before.aec.auto_delay_min_ms);
+  std::filesystem::remove_all(temp);
+}
+
+TEST_CASE("saved overrides keep a replaced final decoder and the wake probe settings") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  const auto temp = temporary_directory();
+  dvo::ConfigStore store(root / "config/default.toml", temp / "config/local.toml", root);
+  auto config = store.load();
+  // Stand-ins for a personally fine-tuned model: any files that differ from the defaults.
+  config.asr.final_model = root / "config/default.toml";
+  config.asr.final_tokens = root / "config/keywords.txt";
+  config.kws.asr_probe = !config.kws.asr_probe;
+  config.kws.asr_probe_max_ms = 6000;
+
+  store.save_overrides(config);
+  const auto reloaded = store.load();
+  CHECK(reloaded.asr.final_decoder == config.asr.final_decoder);
+  CHECK(std::filesystem::equivalent(reloaded.asr.final_model, config.asr.final_model));
+  CHECK(std::filesystem::equivalent(reloaded.asr.final_tokens, config.asr.final_tokens));
+  CHECK(reloaded.asr.fallback_decoder == config.asr.fallback_decoder);
+  CHECK(reloaded.kws.asr_probe == config.kws.asr_probe);
+  CHECK(reloaded.kws.asr_probe_max_ms == 6000);
   std::filesystem::remove_all(temp);
 }
 

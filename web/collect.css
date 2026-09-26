@@ -39,6 +39,7 @@ code { color: var(--cyan); font: 12px Consolas, monospace; }
 .prompt { flex: 1; display: flex; align-items: center; justify-content: center; margin: 10px 0; color: #f3f8ff; font: 600 46px/1.35 "Microsoft YaHei UI", "Segoe UI", sans-serif; text-align: center; letter-spacing: .02em; }
 .prompt.waiting { color: #3c4a5c; }
 .prompt.silence { color: var(--muted); font-size: 32px; }
+.prompt.long { font-size: 34px; }
 .take-note { min-height: 22px; color: var(--amber); text-align: center; }
 .take-meter { margin-top: 18px; }
 
@@ -55,6 +56,15 @@ code { color: var(--cyan); font: 12px Consolas, monospace; }
 .background-stats b { color: #f3f8ff; font: 700 26px Consolas, monospace; }
 .background-meters { margin-top: 18px; }
 
+.transcript-list { margin: 0; padding: 0; list-style: none; }
+.transcript-list li { display: grid; grid-template-columns: 70px minmax(0, 1fr); gap: 2px 12px; padding: 10px 2px; border-bottom: 1px solid var(--line); }
+.transcript-list .time { grid-row: span 2; color: var(--muted); font: 12px Consolas, monospace; padding-top: 4px; }
+.transcript-list .text { color: #f3f8ff; font: 500 20px/1.4 "Microsoft YaHei UI", "Segoe UI", sans-serif; overflow-wrap: anywhere; }
+.transcript-list .meta { color: var(--muted); font-size: 12px; }
+.transcript-list li.wake .text { color: var(--cyan); }
+.transcript-list li.plan .text { color: var(--green); }
+.transcript-list li.reject .text { color: var(--amber); }
+
 .saved-list { margin: 0 0 16px; padding-left: 20px; color: #b8c7d8; line-height: 1.8; }
 .saved-list code { color: var(--text); }
 .command-line { margin: 0; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: #0b1118; color: var(--cyan); font: 13px Consolas, monospace; white-space: pre-wrap; word-break: break-all; }
@@ -69,6 +79,7 @@ code { color: var(--cyan); font: 12px Consolas, monospace; }
   .stage { padding: 18px 16px; }
   .setup-grid { grid-template-columns: 1fr; }
   .prompt { font-size: 30px; }
+  .prompt.long { font-size: 24px; }
   .background-stats { grid-template-columns: 1fr; }
   .topbar { flex-wrap: wrap; gap: 10px; padding: 16px; }
 }

@@ -742,7 +742,10 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
       << "\ntokens = " << toml_string(c.kws.tokens.generic_string())
       << "\nkeywords = " << toml_string(c.kws.keywords.generic_string())
       << "\nprovider = " << toml_string(c.kws.provider) << "\nnum_threads = " << c.kws.num_threads
-      << "\nthreshold = " << c.kws.threshold << "\nboosting_score = " << c.kws.boosting_score << "\n\n";
+      << "\nthreshold = " << c.kws.threshold << "\nboosting_score = " << c.kws.boosting_score
+      << "\nasr_probe = " << (c.kws.asr_probe ? "true" : "false")
+      << "\nasr_probe_source = " << toml_string(c.kws.asr_probe_source)
+      << "\nasr_probe_max_ms = " << c.kws.asr_probe_max_ms << "\n\n";
   out << "[vad]\nmodel = " << toml_string(c.vad.model.generic_string())
       << "\nprovider = " << toml_string(c.vad.provider) << "\nnum_threads = " << c.vad.num_threads
       << "\nthreshold = " << c.vad.threshold << "\nmin_speech_ms = " << c.vad.min_speech_ms
@@ -764,7 +767,14 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
       << "\nprovider = " << toml_string(c.asr.provider)
       << "\nnum_threads = " << c.asr.num_threads
       << "\nfeed_chunk_ms = " << c.asr.feed_chunk_ms
-      << "\nemit_partials = " << (c.asr.emit_partials ? "true" : "false") << "\n\n";
+      << "\nemit_partials = " << (c.asr.emit_partials ? "true" : "false")
+      // Saving must keep a replaced (e.g. personally fine-tuned) final decoder.
+      << "\nfinal_decoder = " << toml_string(c.asr.final_decoder)
+      << "\nfinal_model = " << toml_string(c.asr.final_model.generic_string())
+      << "\nfinal_tokens = " << toml_string(c.asr.final_tokens.generic_string())
+      << "\nfallback_decoder = " << toml_string(c.asr.fallback_decoder)
+      << "\nfallback_model = " << toml_string(c.asr.fallback_model.generic_string())
+      << "\nfallback_tokens = " << toml_string(c.asr.fallback_tokens.generic_string()) << "\n\n";
   out << "[commands]\nenabled = " << (c.commands.enabled ? "true" : "false")
        << "\ndefault_volume_step_percent = " << c.commands.default_volume_step_percent
        << "\nmax_spoken_volume_step_percent = " << c.commands.max_spoken_volume_step_percent

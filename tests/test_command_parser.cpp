@@ -1,4 +1,5 @@
 #include <array>
+#include <filesystem>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -6,6 +7,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "dvo/command_parser.h"
+#include "dvo/config.h"
+#include "dvo/runtime.h"
 
 namespace {
 
@@ -287,7 +290,7 @@ TEST_CASE("Natural multi-command connectors are accepted") {
 
 TEST_CASE("Parser rejects the whole sentence when any residual text is unknown") {
   const dvo::CommandParser parser;
-  for (const auto* text : {"帮我未知命令", "播放音乐吧", "播放音乐然后未知命令",
+  for (const auto* text : {"帮我未知命令", "播放音乐好吗", "播放音乐然后未知命令",
                            "播放音乐暂停音乐谢谢", "播放，音乐", "增加音量五",
                            "播放音乐并暂停音乐"}) {
     CAPTURE(text);
@@ -296,6 +299,8 @@ TEST_CASE("Parser rejects the whole sentence when any residual text is unknown")
     CHECK_FALSE(result.plan.has_value());
     REQUIRE(result.error.has_value());
   }
+  // A sentence-final particle carries no meaning, like a hesitation.
+  CHECK(parser.parse("播放音乐吧", context("particle")).ok());
 }
 
 TEST_CASE("Parser rejects invalid ambiguous and excessive volume amounts") {
@@ -418,6 +423,52 @@ TEST_CASE("Configured command grammar and action limit replace the defaults") {
   CHECK(parsed.plan->actions[1].volume_delta_percent == 2);
   CHECK_FALSE(parser.parse("播放音乐", context("old-default")).ok());
   CHECK_FALSE(parser.parse("开始播放停止播放音量减", context("too-many")).ok());
+}
+
+TEST_CASE("The shipped grammar accepts everyday phrasings of each command") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  dvo::ConfigStore store(root / "config/default.toml",
+                         std::filesystem::temp_directory_path() / "dvo-no-overrides.toml", root);
+  const auto config = store.load();
+  const dvo::CommandParser parser(config.commands.default_volume_step_percent,
+                                  config.commands.max_spoken_volume_step_percent,
+                                  dvo::command_grammar(config.commands));
+  auto wake = context("everyday");
+  wake.origin = dvo::UtteranceOrigin::keyword;
+  wake.wake_word = "小克";
+  const auto actions_of = [&](const char* text) {
+    const auto result = parser.parse(text, wake);
+    return result.ok() ? result.plan->normalized_text : std::string("REJECTED");
+  };
+
+  for (const char* text : {"小克，把音乐打开", "开一下音乐吧，小克", "小克继续播放", "小克继续播放音乐",
+                           "小克放首歌", "来首歌小克", "小克，开始播放"}) {
+    CAPTURE(text);
+    const auto result = parser.parse(text, wake);
+    REQUIRE(result.ok());
+    CHECK(result.plan->actions.front().type == dvo::ActionType::media_play);
+  }
+  for (const char* text : {"小克暂停", "小克，暂停一下", "停一下歌，小克", "小克先别放了", "小克别放了",
+                           "不要放了小克", "小克把音乐关了", "小克停止播放"}) {
+    CAPTURE(text);
+    const auto result = parser.parse(text, wake);
+    REQUIRE(result.ok());
+    CHECK(result.plan->actions.front().type == dvo::ActionType::media_pause);
+  }
+  CHECK(actions_of("小克大声点") == "大声点5%");
+  CHECK(actions_of("小克声音小一点百分之十") == "声音小一点10%");
+  CHECK(actions_of("小克暂停一下然后调大音量") == "暂停一下;调大音量5%");
+
+  // Short phrases match exactly: a dropped character is not guessed back.
+  CHECK(actions_of("小克别了") == "REJECTED");
+  CHECK(actions_of("小克暂") == "REJECTED");
+  // Four characters or more still tolerate one dropped character.
+  const auto dropped = parser.parse("小克停播放", wake);
+  REQUIRE(dropped.ok());
+  CHECK(dropped.plan->actions.front().type == dvo::ActionType::media_pause);
+  // Ordinary sentences that merely contain command words stay rejected.
+  CHECK(actions_of("这首歌的音乐还挺好听的") == "REJECTED");
+  CHECK(actions_of("暂停一下我去倒杯水") == "REJECTED");
 }
 
 TEST_CASE("Configured grammar rejects phrase collisions") {
