@@ -9,9 +9,11 @@ and writes, without touching the sessions:
     <out>/summary.json                     counts and hours per split/kind/condition
 
 Splits:
-    test       evaluation sessions recorded with the current wake word; never train on these
-    train      training-mode sessions (labels "purpose": "train"), and evaluation
-               sessions recorded with an earlier wake word
+    test       evaluation sessions recorded with the current wake word, and the second
+               half of each daily background recording; never train on these
+    train      training-mode sessions (labels "purpose": "train"), evaluation sessions
+               recorded with an earlier wake word, and the first half of each daily
+               background recording
     dev        a fixed 10% of training-mode takes, chosen by a hash of the clip id
     unlabeled  sessions without labels, cut into fixed-length chunks
 
@@ -190,12 +192,19 @@ class Session:
         return resample(piece, rate)
 
 
-def split_for(labels: dict | None, clip_id: str, wake: str) -> str:
+def split_for(labels: dict | None, clip_id: str, wake: str,
+              position: float | None = None) -> str:
+    """position is a background chunk's place in its recording, 0..1."""
     if labels is None:
         return "unlabeled"
     if labels.get("purpose") == "train":
         digest = int(hashlib.sha1(clip_id.encode("utf-8")).hexdigest(), 16)
         return "dev" if digest % 100 < DEV_PERCENT else "train"
+    if position is not None:
+        # Daily background serves both as augmentation noise and wake negatives
+        # (first half) and as the false-execution regression set (second half);
+        # splitting by time keeps the two apart.
+        return "train" if position < 0.5 else "test"
     # Evaluation sessions with the current wake word are the held-out test set;
     # those recorded with an earlier wake word cannot score it and train instead.
     return "test" if labels.get("wake_word") == wake else "train"
@@ -262,7 +271,8 @@ def export_labeled(session: Session, labels: dict, out: Path, wake: str) -> list
                 a = start_s + piece * CHUNK_S
                 b = min(end_s, a + CHUNK_S)
                 clip = take["id"] if pieces == 1 else f"{take['id']}-{piece + 1:03d}"
-                record = {**base, "split": split_for(labels, f"{session.name}/{clip}", wake)}
+                position = piece / pieces if kind == "background" else None
+                record = {**base, "split": split_for(labels, f"{session.name}/{clip}", wake, position)}
                 exported = export_clip(session, out, clip, a, b, record, bounds=False)
                 if exported:
                     records.append(exported)

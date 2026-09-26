@@ -50,9 +50,11 @@
       </div>
       <div class="background-setup">
         <h3>个性化训练数据</h3>
-        <p>随机生成的命令句子，也有只说唤醒词、不带唤醒词的，用来拿你的声音微调唤醒和识别模型。这些会话不参与评估。
-          建议安静和放音乐各录几轮，每轮换换坐姿和说话状态。同样遵循上面“停用系统动作”的选项。</p>
+        <p>用你的声音微调唤醒和识别模型，这些会话不参与评估。“命令”是随机生成的命令句子（也有只说唤醒词、不带唤醒词的）；
+          “普通句子”是日常和新闻类句子，照着念，给模型提供你说普通话时的样子，普通句子的数量最好不少于命令。
+          安静和放音乐都要录，每轮换换坐姿和说话状态。同样遵循上面“停用系统动作”的选项。</p>
         <div class="background-row">
+          <label>内容 <select id="training-content"><option value="command">命令</option><option value="read">普通句子</option></select></label>
           <label>环境 <select id="training-condition"><option value="quiet">安静</option><option value="music">播放音乐</option></select></label>
           <label>条数 <input id="training-count" type="number" min="10" max="200" step="10" value="60"></label>
           <button id="start-training" disabled>开始录训练数据</button>
@@ -118,7 +120,8 @@
       <h2>日常背景录音</h2>
       <p class="lead">
         照常用电脑：看视频、听歌、打电话、和人聊天、自言自语都可以，只是<strong>不要说唤醒词</strong>。
-        本页可以切到后台，但不要关掉它，也别让电脑睡眠。
+        本页可以切到后台，但不要关掉它，也别让电脑睡眠。浏览器可能冻结后台标签页，这时录音照常进行，
+        但分段和到时停止要等你切回本页才生效；想按时自动停止，可以在浏览器里把本站排除在“睡眠标签页”之外。
       </p>
       <div class="background-stats">
         <div><span>已录</span><b id="bg-elapsed">0:00</b><small id="bg-target"></small></div>

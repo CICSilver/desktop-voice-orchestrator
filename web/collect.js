@@ -57,6 +57,22 @@ const TRAINING_GROUPS = {
     script: 'train', purpose: 'train',
     intro: '用音箱播放你平时听的音乐（带人声的歌也要有），音量调到平时习惯的大小，照着念。'}
 };
+// Reading ordinary sentences: the speaker's voice with exact transcripts but
+// no wake word and no command, so fine-tuning does not learn that everything
+// this speaker says is a wake-up or a command.
+const READING_GROUPS = {
+  quiet: {id: 'read-quiet', title: '朗读 · 安静', condition: 'quiet', distance_m: 0.5,
+    script: 'read', purpose: 'train',
+    intro: '关掉音乐和视频，照着屏幕上的句子念，用平时说话的语气就好。念错或卡住了按 R 重录；生僻的人名地名念不顺就按 S 跳过。'},
+  music: {id: 'read-music', title: '朗读 · 播放音乐', condition: 'music', distance_m: 0.5,
+    script: 'read', purpose: 'train',
+    intro: '用音箱播放你平时听的音乐（带人声的歌也要有），音量调到平时习惯的大小，照着句子念。念错按 R 重录，念不顺按 S 跳过。'}
+};
+// Share of colloquial sentences (some use command words without being commands).
+const COLLOQUIAL_SHARE = 0.15;
+const READ_USED_KEY = 'dvo.collect.readSentences';
+let readingPool = null;
+
 const TRAIN_PHRASES = [
   {say: '播放音乐', action: 'play'}, {say: '打开音乐', action: 'play'},
   {say: '暂停音乐', action: 'pause'},
@@ -139,7 +155,47 @@ function buildTrainingScript(group) {
   return script;
 }
 
-const KIND_LABELS = {negative: '不带唤醒词', bare_command: '不带唤醒词', wake: '只说唤醒词', silence: '静默'};
+function usedSentences() {
+  try {
+    return new Set(JSON.parse(localStorage.getItem(READ_USED_KEY) || '[]'));
+  } catch {
+    return new Set();
+  }
+}
+
+function rememberSentences(texts) {
+  try {
+    const used = usedSentences();
+    for (const text of texts) used.add(text);
+    localStorage.setItem(READ_USED_KEY, JSON.stringify([...used]));
+  } catch {
+    // Only a convenience: without storage a sentence may simply come up again.
+  }
+}
+
+function buildReadingScript(group) {
+  const random = seededRandom(`${state.collectionId}-${group.id}`);
+  const used = usedSentences();
+  const fresh = (list) => {
+    const unused = list.filter((text) => !used.has(text));
+    return unused.length ? unused : list;
+  };
+  const colloquial = fresh(readingPool.colloquial);
+  const general = fresh(readingPool.aishell);
+  const picked = new Set();
+  const script = [];
+  while (script.length < group.count && picked.size < colloquial.length + general.length) {
+    const list = random() < COLLOQUIAL_SHARE ? colloquial : general;
+    const text = list[Math.floor(random() * list.length)];
+    if (picked.has(text)) continue;
+    picked.add(text);
+    script.push({key: 'read', kind: 'read', position: 'none', say: text, actions: []});
+  }
+  return script;
+}
+
+const KIND_LABELS = {negative: '不带唤醒词', bare_command: '不带唤醒词', wake: '只说唤醒词', silence: '静默',
+  read: '朗读'};
 
 // Pause before each prompt appears. Together with reading time it keeps
 // consecutive takes in separate VAD segments (endpoint silence is 0.9 s).
@@ -308,7 +364,8 @@ function renderGroups() {
 function buildTakes(group) {
   const rotation = ((group.rotation || 0) * 5) % COMMANDS.length;
   const commands = COMMANDS.slice(rotation).concat(COMMANDS.slice(0, rotation));
-  const script = group.script === 'train' ? buildTrainingScript(group) : [
+  const script = group.script === 'train' ? buildTrainingScript(group)
+    : group.script === 'read' ? buildReadingScript(group) : [
     {key: 'silence', kind: 'silence', position: 'none', say: '', actions: [], auto_s: group.silence_s,
       note: group.condition === 'music' ? '让音乐继续播放，不要说话' : '不要说话'},
     ...NEGATIVES.map((item) => ({...item, position: 'none', actions: []})),
@@ -504,6 +561,9 @@ async function endGroup() {
   const name = sessionName(state.session);
   const scored = state.labels.filter((take) => take.status === 'ok').length;
   if (saved.ok) {
+    if (state.group.script === 'read') {
+      rememberSentences(state.labels.filter((take) => take.status === 'ok').map((take) => take.text));
+    }
     state.saved.push({title: state.group.title, session: name, detail: `${scored} 条`});
     $('done-title').textContent = `${state.group.title} 已保存`;
     $('done-text').textContent = `会话 ${name}，有效 ${scored} 条（重录/跳过的不计）。`;
@@ -609,7 +669,18 @@ async function startTraining() {
     $('setup-message').textContent = '训练数据每轮 10 到 200 条。';
     return;
   }
-  const group = TRAINING_GROUPS[$('training-condition').value];
+  const reading = $('training-content').value === 'read';
+  const group = (reading ? READING_GROUPS : TRAINING_GROUPS)[$('training-condition').value];
+  if (reading && !readingPool) {
+    try {
+      const response = await fetch('/reading-sentences.json');
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      readingPool = await response.json();
+    } catch (error) {
+      $('setup-message').textContent = `无法读取朗读句子：${error}`;
+      return;
+    }
+  }
   if (!await prepareCollection()) return;
   state.trainingOnly = true;
   state.plan = [{...group, count}];
@@ -827,6 +898,15 @@ $('restart').addEventListener('click', () => {
   show('setup');
 });
 document.addEventListener('keydown', handleKey);
+// Browsers freeze hidden tabs (Edge sleeping tabs, Chrome memory saver), which
+// stops the segment and target timers while the recording itself continues.
+// Catch up as soon as the page runs again.
+const catchUpBackground = () => {
+  if (state.phase === 'background' && document.visibilityState === 'visible') backgroundTick();
+};
+document.addEventListener('visibilitychange', catchUpBackground);
+document.addEventListener('resume', catchUpBackground);
+
 window.addEventListener('beforeunload', (event) => {
   if (state.recording) {
     event.preventDefault();
@@ -834,13 +914,18 @@ window.addEventListener('beforeunload', (event) => {
   }
 });
 window.addEventListener('pagehide', () => {
-  if (state.previousDryRun === null) return;
-  fetch(`/api/command?token=${encodeURIComponent(token)}`, {
+  const send = (payload) => fetch(`/api/command?token=${encodeURIComponent(token)}`, {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'commands.live_dry_run', enabled: state.previousDryRun}),
+    body: JSON.stringify(payload),
     keepalive: true
   });
+  // A recording outlives its page otherwise and runs until the program stops.
+  // Its labels cannot be saved from here, so the session stays unlabeled.
+  if (state.recording) send({action: 'recording.stop'});
+  if (state.previousDryRun !== null) {
+    send({action: 'commands.live_dry_run', enabled: state.previousDryRun});
+  }
 });
 
 init();
