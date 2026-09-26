@@ -54,7 +54,7 @@
           “普通句子”是日常和新闻类句子，照着念，给模型提供你说普通话时的样子，普通句子的数量最好不少于命令。
           安静和放音乐都要录，每轮换换坐姿和说话状态。同样遵循上面“停用系统动作”的选项。</p>
         <div class="background-row">
-          <label>内容 <select id="training-content"><option value="command">命令</option><option value="read">普通句子</option></select></label>
+          <label>内容 <select id="training-content"><option value="new" selected>新说法与新命令</option><option value="command">全部命令</option><option value="read">普通句子</option></select></label>
           <label>环境 <select id="training-condition"><option value="quiet">安静</option><option value="music">播放音乐</option></select></label>
           <label>条数 <input id="training-count" type="number" min="10" max="200" step="10" value="60"></label>
           <button id="start-training" disabled>开始录训练数据</button>

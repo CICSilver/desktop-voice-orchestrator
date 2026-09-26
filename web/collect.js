@@ -64,6 +64,18 @@ const TRAINING_GROUPS = {
     script: 'train', purpose: 'train',
     intro: '用音箱播放你平时听的音乐（带人声的歌也要有），音量调到平时习惯的大小，照着念。'}
 };
+// Only what the earlier rounds never recorded: the everyday phrasings and the
+// newer commands (next, like, daily recommendations, play modes). The earlier
+// recordings stay in the training set, so the formal phrases and the wake
+// word alone are not asked for again.
+const NEW_TRAINING_GROUPS = {
+  quiet: {id: 'train-new-quiet', title: '训练数据 · 新说法 · 安静', condition: 'quiet', distance_m: 0.5,
+    script: 'train', phrasings: 'new', purpose: 'train',
+    intro: '只录之前没录过的说法和新命令。关掉音乐和视频，在平时用电脑的位置说话，照着念；语气和快慢自然变化就好，有提示时按提示说。'},
+  music: {id: 'train-new-music', title: '训练数据 · 新说法 · 播放音乐', condition: 'music', distance_m: 0.5,
+    script: 'train', phrasings: 'new', purpose: 'train',
+    intro: '只录之前没录过的说法和新命令。用音箱播放你平时听的音乐（带人声的歌也要有），音量调到平时习惯的大小，照着念。'}
+};
 // Reading ordinary sentences: the speaker's voice with exact transcripts but
 // no wake word and no command, so fine-tuning does not learn that everything
 // this speaker says is a wake-up or a command.
@@ -106,6 +118,11 @@ const TRAIN_PHRASINGS = {
 const FIXED_ACTIONS = {play: PLAY, pause: PAUSE, next: NEXT, like: LIKE, daily: DAILY};
 const MODE_ACTIONS = {'顺序播放': MODE_ORDER, '列表循环': MODE_LIST_LOOP, '单曲循环': MODE_SINGLE_LOOP,
   '随机播放': MODE_SHUFFLE};
+// The only phrasings the first training rounds (2026-09) used, each recorded
+// dozens of times.
+const RECORDED_PHRASES = new Set(['播放音乐', '打开音乐', '暂停音乐', '增加音量', '降低音量']);
+const NEW_PHRASINGS = Object.fromEntries(Object.entries(TRAIN_PHRASINGS).map(
+  ([action, list]) => [action, list.filter((phrase) => !RECORDED_PHRASES.has(phrase))]));
 const AMOUNT_PHRASINGS = new Set(['增加音量', '调大音量', '音量调大', '降低音量', '调小音量', '音量调小']);
 const TRAIN_CONNECTORS = ['，然后', '，再', '，然后再', '，接着'];
 // Common amounts weighted up; every value the parser accepts can appear.
@@ -134,12 +151,12 @@ function seededRandom(seed) {
   };
 }
 
-function trainingPhrase(random, previousAction) {
+function trainingPhrase(random, previousAction, phrasings = TRAIN_PHRASINGS) {
   const pick = (list) => list[Math.floor(random() * list.length)];
   let action;
-  do action = pick(Object.keys(TRAIN_PHRASINGS));
+  do action = pick(Object.keys(phrasings));
   while (action === previousAction);
-  const say = pick(TRAIN_PHRASINGS[action]);
+  const say = pick(phrasings[action]);
   if (FIXED_ACTIONS[action]) return {say, action, actions: [FIXED_ACTIONS[action]]};
   if (action === 'mode') return {say, action, actions: [MODE_ACTIONS[say]]};
   const sign = action === 'up' ? 1 : -1;
@@ -151,8 +168,11 @@ function trainingPhrase(random, previousAction) {
 function buildTrainingScript(group) {
   const random = seededRandom(`${state.collectionId}-${group.id}`);
   const pick = (list) => list[Math.floor(random() * list.length)];
-  // Exact proportions, shuffled: 10% wake word alone, 15% without it.
-  const wakeCount = Math.round(group.count * 0.1);
+  const phrasings = group.phrasings === 'new' ? NEW_PHRASINGS : TRAIN_PHRASINGS;
+  const phrase = (previousAction) => trainingPhrase(random, previousAction, phrasings);
+  // Exact proportions, shuffled: 10% wake word alone (none for new phrasings,
+  // which the earlier rounds already covered), 15% without it.
+  const wakeCount = group.phrasings === 'new' ? 0 : Math.round(group.count * 0.1);
   const bareCount = Math.round(group.count * 0.15);
   const kinds = Array.from({length: group.count}, (_, index) =>
     index < wakeCount ? 'wake' : index < wakeCount + bareCount ? 'bare' : 'command');
@@ -166,12 +186,12 @@ function buildTrainingScript(group) {
     if (kind === 'wake') {
       item = {key: 'wake', kind: 'wake', position: 'none', say: state.wake, actions: []};
     } else if (kind === 'bare') {
-      const phrase = trainingPhrase(random);
-      item = {key: 'bare', kind: 'bare_command', position: 'none', say: phrase.say,
-        actions: phrase.actions, note: '这条不说唤醒词'};
+      const bare = phrase();
+      item = {key: 'bare', kind: 'bare_command', position: 'none', say: bare.say,
+        actions: bare.actions, note: '这条不说唤醒词'};
     } else {
-      const parts = [trainingPhrase(random)];
-      if (random() < 0.3) parts.push(trainingPhrase(random, parts[0].action));
+      const parts = [phrase()];
+      if (random() < 0.3) parts.push(phrase(parts[0].action));
       const body = parts.map((part, i) => (i ? pick(TRAIN_CONNECTORS) : '') + part.say).join('');
       const prefix = random() < 0.5;
       item = {key: prefix ? 'prefix' : 'suffix', kind: 'command', position: prefix ? 'prefix' : 'suffix',
@@ -717,8 +737,10 @@ async function startTraining() {
     $('setup-message').textContent = '训练数据每轮 10 到 200 条。';
     return;
   }
-  const reading = $('training-content').value === 'read';
-  const group = (reading ? READING_GROUPS : TRAINING_GROUPS)[$('training-condition').value];
+  const content = $('training-content').value;
+  const reading = content === 'read';
+  const groups = reading ? READING_GROUPS : content === 'new' ? NEW_TRAINING_GROUPS : TRAINING_GROUPS;
+  const group = groups[$('training-condition').value];
   if (reading && !readingPool) {
     try {
       const response = await fetch('/reading-sentences.json');
