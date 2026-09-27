@@ -551,6 +551,51 @@ TEST_CASE("The shipped grammar plays daily recommendations and sets play modes")
   CHECK_FALSE(parser.parse("小克随机", wake).ok());
 }
 
+TEST_CASE("A trailing command prefix completes only after a connector and never from the wake word") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  dvo::ConfigStore store(root / "config/default.toml",
+                         std::filesystem::temp_directory_path() / "dvo-no-overrides.toml", root);
+  const auto config = store.load();
+  const dvo::CommandParser parser(config.commands.default_volume_step_percent,
+                                  config.commands.max_spoken_volume_step_percent,
+                                  dvo::command_grammar(config.commands));
+  auto wake = context("trailing-prefix");
+  wake.wake_word = "小克";
+  const auto actions_of = [&](const char* text, const dvo::CommandParseContext& parse_context) {
+    const auto result = parser.parse(text, parse_context);
+    return result.ok() ? result.plan->normalized_text : std::string("REJECTED");
+  };
+
+  // The "小" of a clipped suffix 小克 used to complete to "小声一点" and lower
+  // the volume a second time. The residue is dropped, never executed.
+  const auto clipped = parser.parse("降低音量百分之十小", wake);
+  REQUIRE(clipped.ok());
+  REQUIRE(clipped.plan->actions.size() == 1);
+  CHECK(clipped.plan->actions[0].type == dvo::ActionType::master_volume_adjust);
+  CHECK(clipped.plan->actions[0].volume_delta_percent == -10);
+  // Only the residue goes, not the digit before it.
+  CHECK(actions_of("降低音量百分之十二小", wake) == "降低音量12%");
+  CHECK(actions_of("增加音量，小", wake) == "增加音量5%");
+  // Without a wake word to explain it, the residue rejects the sentence.
+  CHECK(actions_of("降低音量百分之十小", context("no-wake")) == "REJECTED");
+
+  // Without a connector a trailing prefix is unknown text, not a command.
+  CHECK(actions_of("播放音乐大", wake) == "REJECTED");
+  CHECK(actions_of("播放音乐大", context("no-wake")) == "REJECTED");
+
+  // After a connector a truncated last command still completes, unless the
+  // remainder could be the start of the wake word.
+  CHECK(actions_of("播放音乐然后大", wake) == "播放音乐;大声一点5%");
+  CHECK(actions_of("播放音乐然后小", wake) == "REJECTED");
+  const dvo::CommandParser default_parser;
+  const auto truncated = default_parser.parse("播放音乐然后再暂", wake);
+  REQUIRE(truncated.ok());
+  REQUIRE(truncated.plan->actions.size() == 2);
+  CHECK(truncated.plan->actions[0].type == dvo::ActionType::media_play);
+  CHECK(truncated.plan->actions[1].type == dvo::ActionType::media_pause);
+  CHECK(truncated.plan->normalized_text == "播放音乐;暂停音乐");
+}
+
 TEST_CASE("Empty next and like phrase lists disable those actions") {
   dvo::CommandGrammar grammar;
   CHECK(dvo::CommandParser(5, 20, grammar).parse("下一首", context()).ok());

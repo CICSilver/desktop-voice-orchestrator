@@ -290,7 +290,8 @@ void correct_wake_confirmed_asr_confusions(
 [[nodiscard]] ParsedAction parse_action(std::string_view text, std::size_t offset,
                                         int default_delta, int maximum_delta,
                                         const std::vector<PhraseRule>& rules,
-                                        bool allow_trailing_prefix) {
+                                        bool allow_trailing_prefix,
+                                        std::string_view wake_word) {
   const auto parsed_rule = [&](const PhraseRule& rule, std::size_t end) {
     if (rule.type == ActionType::master_volume_adjust) {
       return parse_volume(text, end, rule.phrase, rule.volume_increase,
@@ -342,8 +343,11 @@ void correct_wake_confirmed_asr_confusions(
   // connector, accept an end-of-utterance prefix only when every matching
   // configured phrase has the same semantic action. For example,
   // "播放音乐然后再暂" deterministically completes to "暂停音乐", while
-  // arbitrary residual text remains rejected.
-  if (allow_trailing_prefix && offset < text.size()) {
+  // arbitrary residual text remains rejected. A remainder that could be the
+  // start of the wake word is never completed: a clipped suffix wake word
+  // ("降低音量百分之十小" for 小克) must not become an extra "小声点".
+  if (allow_trailing_prefix && offset < text.size() &&
+      !wake_word.starts_with(text.substr(offset))) {
     const auto remainder = text.substr(offset);
     const PhraseRule* prefix_rule{};
     bool prefix_ambiguous{};
@@ -577,6 +581,21 @@ void append_rules(const std::vector<std::string>& phrases, std::string_view cate
   return best;
 }
 
+// A suffix wake word clipped by the recognizer leaves only its beginning at
+// the end of the utterance ("降低音量百分之十小" for 小克). Returns the text
+// before that residue, or nothing when the text does not end that way.
+[[nodiscard]] std::optional<std::string> without_clipped_wake(
+    std::span<const char32_t> text, std::span<const char32_t> wake) {
+  if (wake.size() < 2 || text.size() < 2) return std::nullopt;
+  for (auto length = std::min(wake.size(), text.size()) - 1; length > 0; --length) {
+    if (!std::ranges::equal(text.last(length), wake.first(length))) continue;
+    const auto kept = trim_separators(text.first(text.size() - length));
+    if (kept.empty()) return std::nullopt;
+    return to_utf8(kept);
+  }
+  return std::nullopt;
+}
+
 [[nodiscard]] std::size_t word_length(std::span<const char32_t> text) {
   return static_cast<std::size_t>(
       std::ranges::count_if(text, [](char32_t cp) { return cp != U';'; }));
@@ -728,7 +747,7 @@ CommandParseResult CommandParser::parse(std::string_view text,
   strip_polite_prefix(strict);
   correct_wake_confirmed_asr_confusions(strict, impl_->rules, wake_confirmed_in_text);
 
-  const auto parse_drafts = [this](std::string_view value) -> DraftParse {
+  const auto parse_drafts = [this, &wake_value](std::string_view value) -> DraftParse {
     const auto fail = [](std::string code, std::string message, std::size_t offset) {
       return DraftParse{{}, CommandParseError{std::move(code), std::move(message), offset}};
     };
@@ -753,12 +772,15 @@ CommandParseResult CommandParser::parse(std::string_view text,
     }
 
     std::vector<ActionDraft> drafts;
+    // Only an action announced by a connector after a complete action may be
+    // completed from an end-of-utterance prefix; see parse_action().
+    bool had_connector = false;
 
     while (position < value.size()) {
       const auto parsed = parse_action(value, position,
                                        default_volume_delta_percent_,
                                        maximum_volume_delta_percent_, impl_->rules,
-                                       !drafts.empty());
+                                       had_connector, wake_value);
       if (parsed.error) return DraftParse{{}, parsed.error};
       drafts.push_back({parsed.type, parsed.delta, parsed.canonical});
       if (drafts.size() > max_actions_per_utterance_) {
@@ -778,7 +800,7 @@ CommandParseResult CommandParser::parse(std::string_view text,
         if (position == value.size()) break;  // one terminal punctuation is harmless
       }
 
-      bool had_connector = false;
+      had_connector = false;
       while (const auto connector_end = consume_connector(value, position,
                                                             impl_->connectors)) {
         had_connector = true;
@@ -796,10 +818,9 @@ CommandParseResult CommandParser::parse(std::string_view text,
         }
       }
 
-      // With neither punctuation nor a connector, adjacency is intentional and
-      // parse_action() below must consume the next command in full.
+      // Without a connector, the next parse_action() must consume the
+      // following command in full, whether adjacent or after punctuation.
       (void)had_punctuation;
-      (void)had_connector;
     }
     return DraftParse{std::move(drafts), {}};
   };
@@ -819,8 +840,13 @@ CommandParseResult CommandParser::parse(std::string_view text,
   add_reading(strict, wake_confirmed_in_text);
   add_reading(collapse_repeats(remove_fillers(strict)), wake_confirmed_in_text);
   if (!wake_value.empty()) {
-    const auto cleaned = codepoints(remove_fillers(normalized.value));
     const auto wake = codepoints(wake_value);
+    // Tried before the near-miss readings below, which would take the clipped
+    // residue together with the character before it ("十二小" -> "十").
+    if (auto kept = without_clipped_wake(codepoints(remove_fillers(strict)), wake)) {
+      add_reading(std::move(*kept), wake_confirmed_in_text);
+    }
+    const auto cleaned = codepoints(remove_fillers(normalized.value));
     if (const auto span = locate_wake(cleaned, wake, true)) {
       const auto all = std::span<const char32_t>(cleaned);
       const auto before = trim_separators(all.first(span->first));
