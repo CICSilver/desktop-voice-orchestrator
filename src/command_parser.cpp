@@ -665,6 +665,10 @@ CommandParser::CommandParser(int default_volume_delta_percent,
                ActionType::media_mode_single_loop, false, implementation->rules, owners, true);
   append_rules(grammar.mode_shuffle_phrases, "commands.phrases.mode_shuffle",
                ActionType::media_mode_shuffle, false, implementation->rules, owners, true);
+  append_rules(grammar.lyrics_show_phrases, "commands.phrases.lyrics_show",
+               ActionType::media_lyrics_show, false, implementation->rules, owners, true);
+  append_rules(grammar.lyrics_hide_phrases, "commands.phrases.lyrics_hide",
+               ActionType::media_lyrics_hide, false, implementation->rules, owners, true);
   std::ranges::sort(implementation->rules, {}, [](const PhraseRule& rule) {
     return rule.phrase.size();
   });

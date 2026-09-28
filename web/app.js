@@ -67,6 +67,8 @@ function parseActionLabel(action) {
   if (action.type === 'media.mode.list_loop') return '列表循环';
   if (action.type === 'media.mode.single_loop') return '单曲循环';
   if (action.type === 'media.mode.shuffle') return '随机播放';
+  if (action.type === 'media.lyrics.show') return '打开歌词';
+  if (action.type === 'media.lyrics.hide') return '关闭歌词';
   if (action.type === 'audio.volume.adjust') {
     const delta = Number(action.volume_delta_percent || 0);
     return `音量${delta >= 0 ? '+' : ''}${delta}%`;

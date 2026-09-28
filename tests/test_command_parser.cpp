@@ -596,6 +596,29 @@ TEST_CASE("A trailing command prefix completes only after a connector and never 
   CHECK(truncated.plan->normalized_text == "播放音乐;暂停音乐");
 }
 
+TEST_CASE("Desktop lyrics commands stay off until phrases are configured") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  dvo::ConfigStore store(root / "config/default.toml",
+                         std::filesystem::temp_directory_path() / "dvo-no-overrides.toml", root);
+  auto config = store.load();
+  CHECK(config.commands.lyrics_show_phrases.empty());
+  CHECK(config.commands.lyrics_hide_phrases.empty());
+  auto wake = context("lyrics");
+  wake.wake_word = "小克";
+  const dvo::CommandParser shipped(5, 20, dvo::command_grammar(config.commands));
+  CHECK_FALSE(shipped.parse("小克打开歌词", wake).ok());
+
+  config.commands.lyrics_show_phrases = {"打开歌词"};
+  config.commands.lyrics_hide_phrases = {"关闭歌词"};
+  const dvo::CommandParser parser(5, 20, dvo::command_grammar(config.commands));
+  const auto shown = parser.parse("小克打开歌词", wake);
+  REQUIRE(shown.ok());
+  CHECK(shown.plan->actions.front().type == dvo::ActionType::media_lyrics_show);
+  const auto hidden = parser.parse("关闭歌词，小克", wake);
+  REQUIRE(hidden.ok());
+  CHECK(hidden.plan->actions.front().type == dvo::ActionType::media_lyrics_hide);
+}
+
 TEST_CASE("Empty next and like phrase lists disable those actions") {
   dvo::CommandGrammar grammar;
   CHECK(dvo::CommandParser(5, 20, grammar).parse("下一首", context()).ok());

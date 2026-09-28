@@ -149,6 +149,8 @@ template <typename AsyncOperation>
     case ActionType::media_mode_list_loop:
     case ActionType::media_mode_single_loop:
     case ActionType::media_mode_shuffle: return "netease.cdp";
+    case ActionType::media_lyrics_show:
+    case ActionType::media_lyrics_hide: return "netease.hotkey";
     default: return "windows.gsmtc";
   }
 }
@@ -317,26 +319,26 @@ void read_pipe(HANDLE pipe, std::string& output) {
   return output;
 }
 
-// NetEase's global "like" hotkey (设置 → 快捷键 → 喜欢歌曲, default Ctrl+Alt+L;
-// global hotkeys must be enabled in the client).
-constexpr UINT kLikeHotkeyModifiers = MOD_CONTROL | MOD_ALT;
+// NetEase's global hotkeys (设置 → 快捷键, Ctrl+Alt+<key> by default; global
+// hotkeys must be enabled in the client): 喜欢歌曲 and 打开/关闭歌词.
 constexpr WORD kLikeHotkeyKey = 'L';
+constexpr WORD kLyricsHotkeyKey = 'D';
 
-// True when some program holds the like hotkey: probing it with RegisterHotKey
+// True when some program holds Ctrl+Alt+<key>: probing it with RegisterHotKey
 // fails with ERROR_HOTKEY_ALREADY_REGISTERED. A successful probe is undone at
 // once, and the keystroke is then not sent, because it would reach whatever
 // window has the focus.
-[[nodiscard]] bool like_hotkey_taken() {
+[[nodiscard]] bool netease_hotkey_taken(WORD key) {
   constexpr int kProbeId = 0x0D0A;
-  if (RegisterHotKey(nullptr, kProbeId, kLikeHotkeyModifiers | MOD_NOREPEAT, kLikeHotkeyKey)) {
+  if (RegisterHotKey(nullptr, kProbeId, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, key)) {
     UnregisterHotKey(nullptr, kProbeId);
     return false;
   }
   return GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED;
 }
 
-[[nodiscard]] bool press_like_hotkey() {
-  const std::array<WORD, 3> keys{VK_CONTROL, VK_MENU, kLikeHotkeyKey};
+[[nodiscard]] bool press_netease_hotkey(WORD key) {
+  const std::array<WORD, 3> keys{VK_CONTROL, VK_MENU, key};
   std::array<INPUT, 6> inputs{};
   for (std::size_t i = 0; i < keys.size(); ++i) {
     inputs[i].type = INPUT_KEYBOARD;
@@ -413,6 +415,19 @@ void sleep_for_action(std::chrono::milliseconds duration,
     }
   }
   return result;
+}
+
+// The client's desktop-lyrics window (class DesktopLyrics, title 桌面歌词). It
+// exists while the client runs and is visible exactly while the lyrics are on.
+[[nodiscard]] HWND netease_lyrics_window() {
+  const auto processes = netease_processes();
+  HWND window{};
+  while ((window = FindWindowExW(nullptr, window, L"DesktopLyrics", nullptr)) != nullptr) {
+    DWORD pid{};
+    GetWindowThreadProcessId(window, &pid);
+    if (std::ranges::find(processes, pid) != processes.end()) return window;
+  }
+  return nullptr;
 }
 
 // cloudmusic.exe as configured, else the program registered for orpheus:// links.
@@ -527,6 +542,8 @@ class WindowsActionBackend final : public IActionBackend {
         case ActionType::media_mode_list_loop:
         case ActionType::media_mode_single_loop:
         case ActionType::media_mode_shuffle: return control_netease(action.type, stop);
+        case ActionType::media_lyrics_show: return set_desktop_lyrics(true, stop);
+        case ActionType::media_lyrics_hide: return set_desktop_lyrics(false, stop);
       }
     } catch (const ActionTimeoutError& error) {
       return failure(action.type, adapter_for(action.type), "action_timeout", error.what());
@@ -726,7 +743,7 @@ class WindowsActionBackend final : public IActionBackend {
     // local idea of the state, so it is pressed at most once, only for a song
     // the server reports as not liked, and the result is checked; if the
     // client's state was stale, ncm-cli likes the song.
-    if (like_hotkey_taken() && press_like_hotkey()) {
+    if (netease_hotkey_taken(kLikeHotkeyKey) && press_netease_hotkey(kLikeHotkeyKey)) {
       for (int check = 0; check < 2; ++check) {
         sleep_for_action(std::chrono::milliseconds(500), deadline, stop);
         const auto after = search(keyword);
@@ -749,6 +766,50 @@ class WindowsActionBackend final : public IActionBackend {
     result.status = ActionStatus::succeeded;
     result.message = "liked through ncm-cli (the client shows it after a refresh): " + title +
                      " - " + artist;
+    return result;
+  }
+
+  // Desktop lyrics on or off. The client only offers a toggle (its global
+  // hotkey), so the lyrics window's visibility decides whether to press it,
+  // and the window is checked again afterwards. Works whether or not the
+  // client has its DevTools channel.
+  [[nodiscard]] ActionResult set_desktop_lyrics(bool show, std::stop_token stop) const {
+    const auto type = show ? ActionType::media_lyrics_show : ActionType::media_lyrics_hide;
+    constexpr auto adapter = "netease.hotkey";
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(config_.action_timeout_ms);
+    const auto window = netease_lyrics_window();
+    if (!window) {
+      return failure(type, adapter, "netease_not_running",
+                     "the NetEase client's desktop-lyrics window was not found");
+    }
+    ActionResult result;
+    result.type = type;
+    result.adapter = adapter;
+    result.target_id = "desktop_lyrics";
+    if ((IsWindowVisible(window) != FALSE) == show) {
+      result.status = ActionStatus::noop;
+      result.verified = true;
+      result.message = show ? "desktop lyrics are already shown" : "desktop lyrics are already hidden";
+      return result;
+    }
+    if (!netease_hotkey_taken(kLyricsHotkeyKey)) {
+      return failure(type, adapter, "hotkey_unavailable",
+                     "Ctrl+Alt+D is not held by the NetEase client; enable its global hotkeys");
+    }
+    if (!press_netease_hotkey(kLyricsHotkeyKey)) {
+      return failure(type, adapter, "input_rejected", "SendInput did not accept the hotkey");
+    }
+    while ((IsWindowVisible(window) != FALSE) != show) {
+      if (std::chrono::steady_clock::now() >= deadline) {
+        return failure(type, adapter, "lyrics_unchanged",
+                       "the desktop-lyrics window did not change after the hotkey");
+      }
+      sleep_for_action(std::chrono::milliseconds(20), deadline, stop);
+    }
+    result.status = ActionStatus::succeeded;
+    result.verified = true;
+    result.message = show ? "desktop lyrics shown" : "desktop lyrics hidden";
     return result;
   }
 

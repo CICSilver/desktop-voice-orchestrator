@@ -75,6 +75,10 @@ namespace {
       return "单曲循环";
     case ActionType::media_mode_shuffle:
       return "随机播放";
+    case ActionType::media_lyrics_show:
+      return "打开桌面歌词";
+    case ActionType::media_lyrics_hide:
+      return "关闭桌面歌词";
   }
   return "未知操作";
 }

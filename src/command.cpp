@@ -14,6 +14,8 @@ const char* to_string(ActionType type) {
     case ActionType::media_mode_list_loop: return "media.mode.list_loop";
     case ActionType::media_mode_single_loop: return "media.mode.single_loop";
     case ActionType::media_mode_shuffle: return "media.mode.shuffle";
+    case ActionType::media_lyrics_show: return "media.lyrics.show";
+    case ActionType::media_lyrics_hide: return "media.lyrics.hide";
   }
   return "unknown";
 }

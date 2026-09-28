@@ -27,6 +27,9 @@ enum class ActionType {
   media_mode_list_loop,
   media_mode_single_loop,
   media_mode_shuffle,
+  // Shows or hides the NetEase client's desktop lyrics.
+  media_lyrics_show,
+  media_lyrics_hide,
 };
 
 enum class ExecutionSource {

@@ -187,6 +187,10 @@ mode_order = ["顺序播放"]
 mode_list_loop = ["列表循环"]
 mode_single_loop = ["单曲循环"]
 mode_shuffle = ["随机播放"]
+# 打开/关闭网易云桌面歌词：看“桌面歌词”窗口是否显示，只在状态不同时按一次客户端的全局快捷键 Ctrl+Alt+D，
+# 再核对窗口状态，所以是“设为开/关”而不是切换；不需要控制通道。说法待补充，留空即不启用。
+lyrics_show = []
+lyrics_hide = []
 
 [netease]
 # 冷：“收藏正在播放的歌”通过网易云官方 ncm-cli（npm 包 @music163/ncm-cli）完成，开放平台凭证和登录在 ncm-cli 中配置。

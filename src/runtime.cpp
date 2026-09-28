@@ -364,6 +364,8 @@ CommandGrammar command_grammar(const CommandsConfig& config) {
   grammar.mode_list_loop_phrases = config.mode_list_loop_phrases;
   grammar.mode_single_loop_phrases = config.mode_single_loop_phrases;
   grammar.mode_shuffle_phrases = config.mode_shuffle_phrases;
+  grammar.lyrics_show_phrases = config.lyrics_show_phrases;
+  grammar.lyrics_hide_phrases = config.lyrics_hide_phrases;
   grammar.connectors = config.connectors;
   grammar.max_actions_per_utterance = config.max_actions_per_utterance;
   return grammar;
@@ -3043,6 +3045,8 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         active.commands.mode_list_loop_phrases != current.commands.mode_list_loop_phrases ||
         active.commands.mode_single_loop_phrases != current.commands.mode_single_loop_phrases ||
         active.commands.mode_shuffle_phrases != current.commands.mode_shuffle_phrases ||
+        active.commands.lyrics_show_phrases != current.commands.lyrics_show_phrases ||
+        active.commands.lyrics_hide_phrases != current.commands.lyrics_hide_phrases ||
         active.commands.connectors != current.commands.connectors;
     const bool pipeline_changed = aec_changed || kws_changed || vad_changed ||
                                   segmentation_changed || activation_changed;

@@ -44,7 +44,7 @@ void print_usage() {
                "  evaluate <labeled session | directory of sessions> [--out=<report.json>]\n"
                "           [--since=<YYYYMMDD-HHMMSS>]   (only sessions recorded from then on)\n"
                "  parse [--wake=<wake word>]   (one recognized text per stdin line)\n"
-               "  act <next|like|daily|order|list-loop|single-loop|shuffle>\n"
+               "  act <next|like|daily|order|list-loop|single-loop|shuffle|lyrics-on|lyrics-off>\n"
                "      (runs one action for real, bypassing speech)\n"
                "  netease-start [--restart]   (starts NetEase Cloud Music with its control channel;\n"
                "      --restart closes a client running without it first)\n";
@@ -130,7 +130,7 @@ int run_action(const dvo::AppConfig& config, std::string_view name) {
   dvo::PlannedAction action;
   action.action_id = "act-cli";
   action.sequence = 1;
-  const std::array<std::pair<std::string_view, dvo::ActionType>, 7> actions{{
+  const std::array<std::pair<std::string_view, dvo::ActionType>, 9> actions{{
       {"next", dvo::ActionType::media_next},
       {"like", dvo::ActionType::media_like},
       {"daily", dvo::ActionType::media_play_daily},
@@ -138,6 +138,8 @@ int run_action(const dvo::AppConfig& config, std::string_view name) {
       {"list-loop", dvo::ActionType::media_mode_list_loop},
       {"single-loop", dvo::ActionType::media_mode_single_loop},
       {"shuffle", dvo::ActionType::media_mode_shuffle},
+      {"lyrics-on", dvo::ActionType::media_lyrics_show},
+      {"lyrics-off", dvo::ActionType::media_lyrics_hide},
   }};
   const auto found = std::ranges::find(actions, name, &decltype(actions)::value_type::first);
   if (found == actions.end()) throw std::invalid_argument("unknown action for act");

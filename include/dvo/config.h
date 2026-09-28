@@ -147,6 +147,8 @@ struct CommandsConfig {
   std::vector<std::string> mode_list_loop_phrases{"列表循环"};
   std::vector<std::string> mode_single_loop_phrases{"单曲循环"};
   std::vector<std::string> mode_shuffle_phrases{"随机播放"};
+  std::vector<std::string> lyrics_show_phrases;
+  std::vector<std::string> lyrics_hide_phrases;
   std::vector<std::string> connectors{"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"};
 };
 

@@ -94,7 +94,7 @@ struct OptionalPhrases {
   const char* key;
   std::vector<std::string> CommandsConfig::*member;
 };
-constexpr std::array<OptionalPhrases, 7> kOptionalPhrases{{
+constexpr std::array<OptionalPhrases, 9> kOptionalPhrases{{
     {"next", &CommandsConfig::next_phrases},
     {"like", &CommandsConfig::like_phrases},
     {"daily", &CommandsConfig::daily_phrases},
@@ -102,6 +102,8 @@ constexpr std::array<OptionalPhrases, 7> kOptionalPhrases{{
     {"mode_list_loop", &CommandsConfig::mode_list_loop_phrases},
     {"mode_single_loop", &CommandsConfig::mode_single_loop_phrases},
     {"mode_shuffle", &CommandsConfig::mode_shuffle_phrases},
+    {"lyrics_show", &CommandsConfig::lyrics_show_phrases},
+    {"lyrics_hide", &CommandsConfig::lyrics_hide_phrases},
 }};
 
 }  // namespace
@@ -416,6 +418,8 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
     grammar.mode_list_loop_phrases = c.commands.mode_list_loop_phrases;
     grammar.mode_single_loop_phrases = c.commands.mode_single_loop_phrases;
     grammar.mode_shuffle_phrases = c.commands.mode_shuffle_phrases;
+    grammar.lyrics_show_phrases = c.commands.lyrics_show_phrases;
+    grammar.lyrics_hide_phrases = c.commands.lyrics_hide_phrases;
     grammar.connectors = c.commands.connectors;
     grammar.max_actions_per_utterance = c.commands.max_actions_per_utterance;
     const CommandParser parser(static_cast<int>(c.commands.default_volume_step_percent),
