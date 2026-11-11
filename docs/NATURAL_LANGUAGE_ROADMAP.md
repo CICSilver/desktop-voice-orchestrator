@@ -118,8 +118,8 @@ flowchart LR
 
 - **目标**：消除本地微调 SenseVoice 对未训练新词（切歌/收藏/日推/播放模式）、常见歌手/歌名及自由口语表达的识别盲区，同时保持音乐外放场景下的高抗噪能力。
 - **核心任务**：
-  1. 使用 `tools/export_dataset.py` 将 `20260926-225120-4205d4`（51 条新命令录音）合入训练集，并利用 OpenAI TTS 批量合成 3,000~5,000 条覆盖高频歌手/歌名与自然语言控制句式的增广音频。
-  2. 将 `training/asr/finetune.py` 与 `training/asr/export.py` 封装为可直接在 Google Colab（A100/L4，挂载 Google Drive 数据目录）一键运行的 Notebook/脚本，开启 `--unfreeze-encoder-layers 3` 与 0~15 dB 动态背景音乐混音训练。
+  1. 使用 `tools/prepare_voice_prompts.py` 从已有真实录音中筛出无截幅黄金干声参考池，用 `tools/build_nl_tts_prompts.py` 结合本机网易云歌库与中英混说桌面应用指令生成提示语料；通过 `training/asr/synthesize_personal_tts.py`（`CosyVoice2-0.5B` 零样本个人声音克隆 + `SenseVoice` 回环 CER/拼音防失真门控）合成覆盖高频歌手/歌名与自然语言控制句式的增广音频，并用 `tools/mine_game_sessions.py` 挖掘耳机游戏开黑期间由桌面麦克风录制的自然口语与抗误唤醒负样本。
+  2. 将 `training/asr/finetune.py`、`training/asr/export.py` 与 `training/asr/evaluate.py` 全量参数化（支持 `--extra-manifests` 与 `--tts-max-per-epoch` 比例上限防合成音过拟合），封装为可在 Google Colab（A100/L4，挂载 Google Drive 数据目录）一键运行的 `training/colab_m3_pipeline.ipynb`，开启 `--unfreeze-encoder-layers 3` 与 0~15 dB 动态背景音乐混音训练。
   3. 导出 `models/asr-personal-v2/model.int8.onnx` 并在本机完成回归评测。
 - **里程碑验收标准**：
   - 原 `test_quiet`（26 条）与 `test_music`（26 条）命令正确率保持 **100%（26/26）**；
@@ -141,3 +141,101 @@ flowchart LR
 - **里程碑验收标准**：
   - 端侧 0.5B/1.5B 路由模型在 M2 自然语言评测集上准确率与 `gpt-4o-mini` 差距 **<= 2%**，反例误执行率 **= 0%**，本机推理延迟 **<= 150 ms**；
   - 命中本地缓存的 TTS 播报启动延迟 **< 30 ms**，连续播报 100 次 **0 次自唤醒**，断网时自动使用本地缓存或平滑降级为 `log`。
+
+---
+
+## 5. 当前进展与跨机器交接手册（2026-11-11，`develop` 分支）
+
+> **分支管理约定**：所有 M1~M4 的开发统一收敛在远端单分支 **`origin/develop`** 上推进，不再拆分零散特性分支；等 M4 验收通过后再一次性合并回 `main`。
+
+### 5.1 各模块完成状态总览
+
+| 模块 / 任务 | 当前状态 | 核心代码与产物位置 |
+| --- | --- | --- |
+| **M1 解析边界清理 + `media.search_play`** | **已完成并合入 `develop`**（`4847667`） | `src/command_parser.cpp`（移除 `"再听音乐"->"暂停音乐"` 反转规则）、`config/default.toml`（`fallback_decoder = "none"`）、`include/dvo/command.h`（`ActionType::media_search_play`）、`src/netease.cpp`、`src/netease_cdp.cpp` |
+| **M2 WinHTTP OpenAI 兼容路由器 + 60 条评测集** | **代码与离线测试已完成**（`9cff550`），待配置真实 API / 本地推理端跑线上指标 | `include/dvo/openai_router.h`、`src/openai_router.cpp`（Strict JSON Schema + `2500 ms` 硬超时取消 + 环境变量读 Key）、`tests/test_openai_router.cpp`、`tools/nl_router_eval_60.jsonl`、`tools/eval_nl_router.py` |
+| **第一层桌面控制：`app.open` + `AppCatalog`** | **已完成并合入 `develop`**（`9cff550`） | `include/dvo/app_catalog.h`、`src/app_catalog.cpp`（`configured` > `quickstart_dirs` > 开始菜单/注册表二级扫描，内置 `powershell`/`steam`/`clash`/`discord`/`qq` 预设）、`src/platform/windows/windows_action_backend.cpp`（`Activate-or-Launch` 窗口激活或启动）、`voice_frontend list-apps` / `act open-app` |
+| **`sync-desktop-apps` 工作区 Skill** | **已完成并合入 `develop`**（`9cff550`） | `.agents/skills/sync-desktop-apps/SKILL.md`、`.agents/skills/sync-desktop-apps/scripts/sync_apps.py`（自动探测 `QuickStart`、解析 `.lnk` 含 Discord Squirrel 参数、无损更新 `config/local.toml`） |
+| **M3 个人声音克隆 + 游戏录音清洗 + Colab 训练管线** | **脚本与云盘初始语料已就绪**（`4847667` / `9cff550`），待采集今晚游戏会话并上 Colab 训练 | `tools/prepare_voice_prompts.py`、`tools/build_nl_tts_prompts.py`、`tools/mine_game_sessions.py`、`training/asr/synthesize_personal_tts.py`、`training/colab_m3_pipeline.ipynb`；云盘 `desktop-voice-orchestrator-data/m3_tts_prep/` 下已生成 20 条干声参考池及 `pilot_prompts_25.jsonl` / `full_prompts_3600.jsonl` |
+| **M4 端侧路由小模型蒸馏 + 带缓存 TTS 播报** | **待启动**（排在 M2 线上实测与 M3 `asr-personal-v2` 导出之后） | 计划修改 `src/announcement.cpp`（修正 `playback_started` 门控时序）并新增本地缓存 TTS 后端与端侧路由蒸馏脚本 |
+
+---
+
+### 5.2 换回另一台机器（如家里主力机）的接手步骤
+
+1. **拉取 `origin/develop`（注意保护本地未提交实验文件）**：
+   如果家里的机器此前在旧分支上有未推送的实验代码（例如早期实验性的 `src/agy_router.cpp` 或本地 `config/local.toml` 修改），先做好暂存再切换分支：
+   ```powershell
+   git fetch origin
+   git status -sb
+   # 若工作区有未提交的旧实验改动，先 stash 留档（config/local.toml 本身被 gitignore 忽略，不会丢失）：
+   git stash push -u -m "backup-home-experimental-before-develop"
+   git checkout -B develop origin/develop
+   ```
+
+2. **编译最新 `Release` 二进制**：
+   ```powershell
+   cmake --preset windows-x64
+   cmake --build --preset release --parallel
+   ctest --preset all --output-on-failure
+   ```
+
+3. **同步本机的 `QuickStart` 快捷方式目录与应用路径**：
+   可直接让 Agent 触发 `sync-desktop-apps` Skill（例如说“帮我同步本机的 QuickStart 应用到 `local.toml`”），或直接运行：
+   ```powershell
+   python .agents/skills/sync-desktop-apps/scripts/sync_apps.py --discover-quickstart
+   # 确认路径后（例如 D:\QuickStart 或 C:\QuickStart）一键无损写入 config/local.toml：
+   python .agents/skills/sync-desktop-apps/scripts/sync_apps.py --scan --quickstart-dir "<你的QuickStart路径>" --write-local-toml
+   # 验证 C++ 目录合并结果：
+   .\build\windows-x64\Release\voice_frontend.exe list-apps
+   ```
+
+4. **实测 M2 自然语言路由（可选，随时可跑）**：
+   在终端设置 `OPENAI_API_KEY` 后，既可以直接压测 HTTP 路由准确率/延迟，也可以跑 C++ `voice_frontend.exe` 混合快慢通道端到端验证：
+   ```powershell
+   $env:OPENAI_API_KEY = "sk-..."
+   python tools/eval_nl_router.py --backend openai --model gpt-4o-mini
+   # 若在 config/local.toml 中配置了 [commands] parser_mode = "hybrid" 与 router_backend = "openai_compatible"：
+   python tools/eval_nl_router.py --backend cpp --parser-mode hybrid
+   ```
+
+---
+
+### 5.3 游戏开黑双路语音采集指南（耳麦开黑 + 桌面 ReSpeaker Lite 独立录音）
+
+玩游戏戴耳机时，可以让 **Discord / 游戏语音走耳麦麦克风**（保证队友听得清晰），同时让 **`voice_frontend` 单独绑死桌面上的 ReSpeaker Lite 录音**。这样既无扬声器外放串音，又能采到与日常远场唤醒完全同分布的 ReSpeaker 真实房间声学数据：
+
+1. **查询 ReSpeaker Lite 的设备 ID**：
+   ```powershell
+   .\build\windows-x64\Release\voice_frontend.exe list-devices
+   ```
+   复制名称含 `ReSpeaker` 的 `microphone` 设备 `id`（形如 `{0.0.1.00000000}.{xxxx-...}`）。
+
+2. **修改 `config/local.toml` 锁死录音设备并临时关闭动作执行**：
+   Windows 系统默认输入设备和语音软件保持选**耳机麦克风**，在 `config/local.toml` 中设置：
+   ```toml
+   [audio]
+   microphone_device = "{0.0.1.00000000}.{刚才复制的ReSpeaker设备ID}"
+   follow_default_device = false   # 锁死 ReSpeaker，避免插拔或切换默认耳麦时跟跑
+
+   [commands]
+   enabled = false                 # 采集期间关闭实时动作，防止开黑说话误触发切歌或调音量
+   ```
+
+3. **启动录制与 45~60 分钟分段保存提醒**：
+   - 运行 `.\build\windows-x64\Release\voice_frontend.exe live`，在调试台（`http://127.0.0.1:8765`）将波形切到 **“原始麦克风”**，对着桌面说两句话确认波形跳动正常后点击 **“开始录制”**。
+   - **避坑提醒（RIFF WAV 4 GB 上限）**：`FloatWavWriter` 写标准 32-bit float RIFF WAV，单文件上限 4 GB。虽然双声道 `mic.wav` 可连录约 2.5 小时，但如果游戏耳机开启了 **Windows 7.1 虚拟环绕声（8 声道 48 kHz）**，同步写盘的 `loopback.wav` 约 **45 分钟**就会达到 4 GB。建议每打完一两局（约 **45~60 分钟**）切回调试台点一次 **“停止录制” → “开始录制”** 分成 2~3 个 session。
+   - 采集结束后，记得将 `config/local.toml` 中的 `commands.enabled` 改回 `true`。
+
+---
+
+### 5.4 Google Drive 数据补齐与 Colab M3 训练流程
+
+在家里机器上跑 Colab 之前，只需把云端硬盘（`desktop-voice-orchestrator-data/`）里缺的两样东西拷进去：
+
+1. **补齐主训练清单**：将家里机器本地的 `dataset/manifest.jsonl` 复制到云端硬盘 `desktop-voice-orchestrator-data/dataset/manifest.jsonl`（云盘上已有 `dataset/clips/` 的 32 个目录与 `dataset/reference/`，唯独缺根目录的 `manifest.jsonl`）。
+2. **上传游戏录音会话（可选但推荐）**：将今晚录好的 `data/sessions/<session_id>` 文件夹复制到 `desktop-voice-orchestrator-data/game_sessions/<session_id>`（如果体积大，甚至可以只拷每个会话里的 `mic.wav` 和 `manifest.json`，`mine_game_sessions.py` 只需要 `mic.wav`）。
+3. **打开 Colab 一键运行 `training/colab_m3_pipeline.ipynb`**：
+   - **Step 1~3**：挂载 Google Drive，先合成并直接在网页里试听 `pilot_prompts_25.jsonl` 的 25 条个人克隆样本（含周杰伦/陈奕迅点歌与 `Steam`/`Clash`/`Discord` 中英混说），确认音色自然、无电音失真；
+   - **Step 4**：若上传了游戏会话，自动运行 `mine_game_sessions.py --transcribe`（`SenseVoice` + `faster-whisper large-v3` 双模型逐字一致才放行正样本，不一致自动归入防误唤醒负样本集）；
+   - **Step 5~7**：批量合成通过防失真门控的训练音频，运行 `finetune.py`（默认 `--tts-max-per-epoch 1200` 锚定真实人声分布 + 3 层 Encoder 解冻 + 音乐混音增广），导出 `models/asr-personal-v2/model.int8.onnx` 并自动跑完回归评测。

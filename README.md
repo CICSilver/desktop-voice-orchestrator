@@ -97,7 +97,11 @@ ctest --preset all
 
 ```powershell
 ./build/windows-x64/Release/voice_frontend.exe list-devices
+./build/windows-x64/Release/voice_frontend.exe list-apps
 ./build/windows-x64/Release/voice_frontend.exe live
+./build/windows-x64/Release/voice_frontend.exe parse --mode=hybrid --wake=小克
+./build/windows-x64/Release/voice_frontend.exe act open-app steam
+./build/windows-x64/Release/voice_frontend.exe act search-play 晴天 --artist=周杰伦
 ./build/windows-x64/Release/voice_frontend.exe replay data/sessions/<session>
 ./build/windows-x64/Release/voice_frontend.exe benchmark data/sessions/<session> [--events=<file.ndjson>]
 ./build/windows-x64/Release/voice_frontend.exe evaluate data/sessions [--out=<report.json>]
@@ -189,6 +193,7 @@ AEC、流式识别、命令语法和执行边界见
 
 ## 文档
 
+- [自然语言演进路线图与当前跨机交接进度（`develop`）](docs/NATURAL_LANGUAGE_ROADMAP.md)
 - [项目计划](docs/PROJECT_PLAN.md)
 - [系统架构](docs/ARCHITECTURE.md)
 - [识别评估：采集、指标与标注格式](docs/EVALUATION.md)
