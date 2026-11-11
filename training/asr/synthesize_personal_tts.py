@@ -55,6 +55,18 @@ import numpy as np
 TARGET_SR = 16000
 
 
+# Optional Mandarin phonetic transliterations emitted by Chinese-biased ASR judges for English app names.
+# Strict English matching is enforced by default; homophone fallback is only active if `--allow-en-app-homophones` is set.
+EN_APP_HOMOPHONE_MAP: dict[str, tuple[str, ...]] = {
+    "steam": ("斯蒂姆", "死盯", "丝蒂姆"),
+    "clash": ("可拉什", "克拉什", "克拉斯"),
+    "discord": ("迪斯科", "迪斯扣", "迪斯考德"),
+    "powershell": ("泡我秀", "帕瓦谢尔"),
+    "qq": ("扣扣",),
+    "vscode": ("维埃斯扣德",),
+}
+
+
 def edit_distance_seq(ref: list[str] | str, hyp: list[str] | str) -> int:
     prev = list(range(len(hyp) + 1))
     for i, r in enumerate(ref, 1):
@@ -65,17 +77,38 @@ def edit_distance_seq(ref: list[str] | str, hyp: list[str] | str) -> int:
     return prev[-1]
 
 
-def normalize_cjk(text: str) -> str:
+def normalize_asr_text(text: str) -> str:
+    """Strips SenseVoice tags (`<|zh|>`, etc.), lowercases ASCII, and retains `[a-z0-9\\u4e00-\\u9fff]`."""
     cleaned = re.sub(r"<\|[^|]*\|>", "", text)
-    return "".join(re.findall(r"[\u4e00-\u9fff]", cleaned))
+    return "".join(re.findall(r"[a-z0-9\u4e00-\u9fff]", cleaned.lower()))
+
+
+# Backward-compatible alias
+normalize_cjk = normalize_asr_text
+
+
+def count_speech_units(norm_text: str) -> int:
+    """Counts spoken syllable-equivalent units so multi-letter English words (e.g. `powershell`)
+    do not artificially inflate characters-per-second speaking-rate checks."""
+    hz = len(re.findall(r"[\u4e00-\u9fff]", norm_text))
+    en_runs = re.findall(r"[a-z0-9]+", norm_text.lower())
+    en_units = sum(max(2, min(4, round(len(tok) * 0.4))) for tok in en_runs)
+    return hz + en_units
 
 
 def to_toneless_pinyin(text: str) -> list[str]:
-    try:
-        from pypinyin import Style, lazy_pinyin
-        return lazy_pinyin(text, style=Style.NORMAL, errors="ignore")
-    except ImportError:
-        return list(text)
+    """Tokenizes CJK into toneless pinyin syllables while keeping lowercase ASCII runs intact as tokens."""
+    tokens: list[str] = []
+    for chunk in re.findall(r"[a-z0-9]+|[\u4e00-\u9fff]+", text.lower()):
+        if re.fullmatch(r"[a-z0-9]+", chunk):
+            tokens.append(chunk)
+        else:
+            try:
+                from pypinyin import Style, lazy_pinyin
+                tokens.extend(lazy_pinyin(chunk, style=Style.NORMAL, errors="ignore"))
+            except ImportError:
+                tokens.extend(list(chunk))
+    return tokens
 
 
 def resample_to_16k_poly(signal: np.ndarray, orig_sr: int) -> np.ndarray:
@@ -119,7 +152,7 @@ def check_acoustic_and_speed_gate(
     max_duration_s: float = 12.0,
 ) -> tuple[bool, np.ndarray, dict]:
     """Stage A quality gate: trims excess dead air, checks truncation/clipping/speaking rate."""
-    n_chars = len(target_norm_text)
+    n_chars = count_speech_units(normalize_asr_text(target_norm_text))
     if len(audio_16k) < int(0.35 * TARGET_SR) or n_chars == 0:
         return False, audio_16k, {"reason": "empty_or_too_short_raw"}
 
@@ -203,21 +236,28 @@ def check_judge_asr_gate(
     strict_exact: bool,
     max_cmd_cer: float = 0.0,
     max_entity_cer: float = 0.20,
+    allow_en_app_homophones: bool = False,
 ) -> tuple[bool, dict]:
-    """Stage B quality gate: compares independent SenseVoice transcription against target."""
-    hyp_norm = normalize_cjk(hyp_raw)
-    if not hyp_norm:
+    """Stage B quality gate: compares independent SenseVoice transcription against target.
+
+    Normalizes both `target_norm` and `hyp_raw` to lowercase `[a-z0-9\\u4e00-\\u9fff]` so mixed
+    Chinese-English app names (e.g. `"小克，打开 Steam"` vs `"<|zh|>小克打开STEAM"`) match with 0 CER.
+    Strict English matching is preferred by default (`allow_en_app_homophones=False`).
+    """
+    ref_norm = normalize_asr_text(target_norm)
+    hyp_norm = normalize_asr_text(hyp_raw)
+    if not hyp_norm or not ref_norm:
         return False, {"reason": "judge_empty_transcript", "judge_text": "", "char_cer": 1.0, "pinyin_cer": 1.0}
 
-    char_err = edit_distance_seq(target_norm, hyp_norm)
-    char_cer = char_err / max(1, len(target_norm))
+    char_err = edit_distance_seq(ref_norm, hyp_norm)
+    char_cer = char_err / max(1, len(ref_norm))
 
-    ref_py = to_toneless_pinyin(target_norm)
+    ref_py = to_toneless_pinyin(ref_norm)
     hyp_py = to_toneless_pinyin(hyp_norm)
     py_err = edit_distance_seq(ref_py, hyp_py)
     pinyin_cer = py_err / max(1, len(ref_py))
 
-    info = {
+    info: dict = {
         "judge_text": hyp_norm,
         "char_cer": round(char_cer, 4),
         "pinyin_cer": round(pinyin_cer, 4),
@@ -226,6 +266,16 @@ def check_judge_asr_gate(
     if strict_exact:
         if char_cer <= max_cmd_cer:
             return True, info
+        if allow_en_app_homophones and re.search(r"[a-z]", ref_norm):
+            hyp_mapped = hyp_norm
+            for en_key, zh_forms in EN_APP_HOMOPHONE_MAP.items():
+                if en_key in ref_norm:
+                    for zf in zh_forms:
+                        hyp_mapped = hyp_mapped.replace(zf, en_key)
+            if hyp_mapped != hyp_norm:
+                mapped_cer = edit_distance_seq(ref_norm, hyp_mapped) / max(1, len(ref_norm))
+                if mapped_cer <= max_cmd_cer:
+                    return True, {**info, "matched_en_homophone": True, "mapped_judge_text": hyp_mapped}
         return False, {**info, "reason": "command_cer_exceeded"}
 
     # Proper-noun song/artist request: pass if exact match OR toneless pinyin matches 100% within CER cap
@@ -416,7 +466,33 @@ def run_self_test() -> int:
     ok_ent_bad, _ = check_judge_asr_gate("小克我想听周杰伦的晴天", "小克，我想听周杰伦的夜曲。", strict_exact=False)
     assert not ok_ent_bad
 
-    print("SELF-TEST PASSED! Resampling, acoustic/rate gate, and SenseVoice judge gate verified.")
+    # 5. Mixed Chinese-English desktop app normalization & strict judge checks
+    ok_steam, info_steam = check_judge_asr_gate("小克，打开 Steam", "小克打开steam", strict_exact=True)
+    assert ok_steam and info_steam["char_cer"] == 0.0, f"Expected 0 CER on Steam, got {info_steam}"
+    ok_steam_upper, info_steam_upper = check_judge_asr_gate(
+        "小克打开steam", "<|zh|>小克，打开 STEAM。", strict_exact=True
+    )
+    assert ok_steam_upper and info_steam_upper["char_cer"] == 0.0
+    ok_ps, info_ps = check_judge_asr_gate(
+        "小克，打开 PowerShell", "<|zh|>小克打开 Power Shell", strict_exact=True
+    )
+    assert ok_ps and info_ps["char_cer"] == 0.0
+    # Strict mode rejects Chinese phonetic substitute by default, optional homophone mode accepts it
+    ok_hom_strict, _ = check_judge_asr_gate("小克，打开 Steam", "小克打开斯蒂姆", strict_exact=True)
+    assert not ok_hom_strict
+    ok_hom_opt, info_hom_opt = check_judge_asr_gate(
+        "小克，打开 Steam", "小克打开斯蒂姆", strict_exact=True, allow_en_app_homophones=True
+    )
+    assert ok_hom_opt and info_hom_opt.get("matched_en_homophone") is True
+    # Wrong English app name must always fail
+    ok_wrong_app, _ = check_judge_asr_gate(
+        "小克，打开 Steam", "小克打开clash", strict_exact=True, allow_en_app_homophones=True
+    )
+    assert not ok_wrong_app
+
+    print(
+        "SELF-TEST PASSED! Resampling, acoustic/rate gate, and mixed ZH-EN SenseVoice judge gate verified."
+    )
     return 0
 
 
@@ -443,6 +519,8 @@ def main() -> int:
     parser.add_argument("--max-cps", type=float, default=7.5)
     parser.add_argument("--max-cmd-cer", type=float, default=0.0)
     parser.add_argument("--max-entity-cer", type=float, default=0.20)
+    parser.add_argument("--allow-en-app-homophones", action="store_true",
+                        help="accept curated Chinese phonetic transliterations for English app names if judge outputs CJK")
     parser.add_argument("--limit", type=int, default=0, help="optional cap on number of prompts to process")
     parser.add_argument("--resume", action="store_true",
                         help="skip prompts already present in existing manifest.jsonl or rejected.jsonl")
@@ -570,6 +648,7 @@ def main() -> int:
                     strict_exact=strict_exact,
                     max_cmd_cer=args.max_cmd_cer,
                     max_entity_cer=args.max_entity_cer,
+                    allow_en_app_homophones=args.allow_en_app_homophones,
                 )
                 if not ok_b:
                     stats[f"retry_{meta_b['reason']}"] += 1

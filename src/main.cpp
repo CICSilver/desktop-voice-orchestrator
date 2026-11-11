@@ -16,6 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "dvo/app_catalog.h"
 #include "dvo/config.h"
 #include "dvo/evaluation.h"
 #include "dvo/runtime.h"
@@ -38,13 +39,17 @@ std::filesystem::path project_root() {
 }
 
 void print_usage() {
-  std::cout << "voice_frontend <list-devices|live|replay|benchmark|evaluate> [session] "
+  std::cout << "voice_frontend <list-devices|list-apps|live|replay|benchmark|evaluate> [session] "
                "[--no-browser] [--web-port=<port>]\n"
+               "  list-apps   (prints the merged local application catalog as JSON)\n"
                "  benchmark <session> [--events=<file.ndjson>]\n"
                "  evaluate <labeled session | directory of sessions> [--out=<report.json>]\n"
                "           [--since=<YYYYMMDD-HHMMSS>]   (only sessions recorded from then on)\n"
-               "  parse [--wake=<wake word>]   (one recognized text per stdin line)\n"
+               "  parse [--wake=<wake word>] [--mode=rules|hybrid|router]\n"
+               "        [--router-url=<url>] [--router-model=<model>]\n"
+               "        (one recognized text per stdin line)\n"
                "  act <next|like|daily|order|list-loop|single-loop|shuffle|lyrics-on|lyrics-off>\n"
+               "  act open-app <id_or_alias>\n"
                "  act search-play <query> [--playlist] [--artist=<artist>]\n"
                "      (runs one action for real, bypassing speech)\n"
                "  netease-start [--restart]   (starts NetEase Cloud Music with its control channel;\n"
@@ -139,10 +144,38 @@ std::optional<std::string> utf8_option_value(std::string_view name) {
 // Executes one action through the live Windows backend, for checking an
 // adapter (for example the NetEase like) without speaking.
 int run_action(const dvo::AppConfig& config, std::string_view name) {
+  std::shared_ptr<const dvo::AppCatalog> catalog;
   dvo::PlannedAction action;
   action.action_id = "act-cli";
   action.sequence = 1;
-  if (name == "search-play") {
+  if (name == "open-app") {
+    catalog = std::make_shared<const dvo::AppCatalog>(
+        dvo::AppCatalog::from_config(config.apps));
+    const auto args = utf8_command_line_args();
+    std::string query;
+    for (std::size_t index = 3; index < args.size(); ++index) {
+      const std::string_view arg = args[index];
+      if (arg.starts_with("--")) {
+        throw std::invalid_argument("unknown option for act open-app: " +
+                                    std::string(arg));
+      }
+      if (!query.empty()) query.push_back(' ');
+      query.append(arg);
+    }
+    if (query.empty()) {
+      throw std::invalid_argument("act open-app requires <id_or_alias>");
+    }
+    action.type = dvo::ActionType::app_open;
+    if (const auto* by_id = catalog->find_by_id(query)) {
+      action.app_id = by_id->id;
+      action.app_display_name = by_id->display_name;
+    } else if (const auto* by_alias = catalog->match_alias(query)) {
+      action.app_id = by_alias->id;
+      action.app_display_name = by_alias->display_name;
+    } else {
+      action.app_id = query;
+    }
+  } else if (name == "search-play") {
     const auto args = utf8_command_line_args();
     dvo::MediaSearchType search_type = dvo::MediaSearchType::song;
     std::optional<std::string> artist;
@@ -193,7 +226,7 @@ int run_action(const dvo::AppConfig& config, std::string_view name) {
   }
   const auto backend = dvo::create_windows_action_backend(
       {config.audio.loopback_device, config.commands.action_timeout_ms,
-       netease_action_config(config)});
+       netease_action_config(config), catalog});
   const auto started = std::chrono::steady_clock::now();
   const auto result = backend->execute(action, std::stop_source{}.get_token());
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -205,6 +238,12 @@ int run_action(const dvo::AppConfig& config, std::string_view name) {
                      {"error_code", result.error_code},
                      {"message", result.message},
                      {"elapsed_ms", elapsed.count()}};
+  if (result.type == dvo::ActionType::app_open) {
+    out["app_id"] = result.requested_app_id
+                        ? nlohmann::json(*result.requested_app_id)
+                        : (action.app_id ? nlohmann::json(*action.app_id)
+                                         : nlohmann::json(nullptr));
+  }
   if (result.type == dvo::ActionType::media_search_play) {
     out["search_query"] = result.requested_search_query
                               ? nlohmann::json(*result.requested_search_query)
@@ -231,13 +270,50 @@ int run_action(const dvo::AppConfig& config, std::string_view name) {
 // Runs recognized texts through the configured command parser, dry-run, so
 // alternative recognizers or parser changes can be scored offline.
 int run_parse(const dvo::AppConfig& config) {
+  dvo::AppConfig effective = config;
   const auto wake = utf8_option_value("--wake").value_or("");
-  const dvo::CommandParser parser(
-      static_cast<int>(config.commands.default_volume_step_percent),
-      static_cast<int>(config.commands.max_spoken_volume_step_percent),
-      dvo::command_grammar(config.commands),
-      dvo::parse_command_parser_mode(config.commands.parser_mode)
-          .value_or(dvo::CommandParserMode::rules));
+  const auto router_backend_opt = utf8_option_value("--router-backend");
+  if (router_backend_opt.has_value()) {
+    if (*router_backend_opt != "none" &&
+        *router_backend_opt != "openai_compatible") {
+      throw std::invalid_argument(
+          "parse --router-backend must be none or openai_compatible");
+    }
+    effective.commands.router_backend = *router_backend_opt;
+  }
+  if (const auto mode_opt = utf8_option_value("--mode")) {
+    const auto parsed_mode = dvo::parse_command_parser_mode(*mode_opt);
+    if (!parsed_mode.has_value()) {
+      throw std::invalid_argument(
+          "parse --mode must be rules, hybrid, or router");
+    }
+    effective.commands.parser_mode = *mode_opt;
+    if (*parsed_mode != dvo::CommandParserMode::rules &&
+        !router_backend_opt.has_value() &&
+        effective.commands.router_backend == "none") {
+      effective.commands.router_backend = "openai_compatible";
+    }
+  }
+  if (const auto router_url = utf8_option_value("--router-url")) {
+    effective.commands.router_base_url = *router_url;
+  }
+  if (const auto router_model = utf8_option_value("--router-model")) {
+    effective.commands.router_model = *router_model;
+  }
+  if (const auto router_key_env = utf8_option_value("--router-api-key-env")) {
+    effective.commands.router_api_key_env = *router_key_env;
+  }
+  if (const auto router_timeout = utf8_option_value("--router-timeout-ms")) {
+    const auto timeout = std::stoi(*router_timeout);
+    if (timeout < 200 || timeout > 15000) {
+      throw std::invalid_argument(
+          "parse --router-timeout-ms must be in [200, 15000]");
+    }
+    effective.commands.router_timeout_ms = static_cast<std::uint32_t>(timeout);
+  }
+  const auto catalog = std::make_shared<const dvo::AppCatalog>(
+      dvo::AppCatalog::from_config(effective.apps));
+  const auto parser = dvo::create_command_parser(effective, catalog);
   std::string line;
   std::uint64_t index{};
   while (std::getline(std::cin, line)) {
@@ -249,7 +325,7 @@ int run_parse(const dvo::AppConfig& config) {
     context.wake_word = wake;
     context.source = dvo::ExecutionSource::replay;
     context.execution_mode = dvo::ExecutionMode::dry_run;
-    const auto parsed = parser.parse(line, context);
+    const auto parsed = parser->parse(line, context);
     nlohmann::json result{{"text", line}, {"ok", parsed.ok()}};
     if (parsed.ok()) {
       auto actions = nlohmann::json::array();
@@ -270,6 +346,14 @@ int run_parse(const dvo::AppConfig& config) {
                            {"search_artist",
                             action.search_artist
                                 ? nlohmann::json(*action.search_artist)
+                                : nlohmann::json(nullptr)},
+                           {"app_id",
+                            action.app_id
+                                ? nlohmann::json(*action.app_id)
+                                : nlohmann::json(nullptr)},
+                           {"app_display_name",
+                            action.app_display_name
+                                ? nlohmann::json(*action.app_display_name)
                                 : nlohmann::json(nullptr)}});
       }
       result["parser_version"] = parsed.plan->parser_version;
@@ -351,6 +435,13 @@ int main(int argc, char** argv) {
     const auto root = project_root();
     dvo::ConfigStore store(root / "config/default.toml", root / "config/local.toml", root);
     auto config = store.load();
+    if (mode == "list-apps") {
+      const auto catalog = dvo::AppCatalog::from_config(config.apps);
+      std::cout << catalog.to_json().dump(
+                       2, ' ', false, nlohmann::json::error_handler_t::replace)
+                << '\n';
+      return 0;
+    }
     for (int index = 2; index < argc; ++index) {
       const std::string_view argument = argv[index];
       constexpr std::string_view prefix = "--web-port=";

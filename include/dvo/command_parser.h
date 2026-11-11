@@ -42,6 +42,12 @@ struct CommandParseResult {
   [[nodiscard]] bool ok() const { return plan.has_value(); }
 };
 
+struct AppOpenRule {
+  std::string alias;
+  std::string app_id;
+  std::string display_name;
+};
+
 struct CommandGrammar {
   std::vector<std::string> play_phrases{"播放音乐", "打开音乐"};
   std::vector<std::string> pause_phrases{"暂停音乐"};
@@ -57,6 +63,7 @@ struct CommandGrammar {
   std::vector<std::string> mode_shuffle_phrases{"随机播放"};
   std::vector<std::string> lyrics_show_phrases;
   std::vector<std::string> lyrics_hide_phrases;
+  std::vector<AppOpenRule> app_open_rules;
   std::vector<std::string> connectors{"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"};
   std::size_t max_actions_per_utterance{kMaxCommandActions};
 };
@@ -88,6 +95,8 @@ struct ProposedAction {
   std::optional<std::string> search_query;
   std::optional<MediaSearchType> search_type;
   std::optional<std::string> search_artist;
+  std::optional<std::string> app_id;
+  std::optional<std::string> app_display_name;
 };
 
 struct LlmRouteResult {

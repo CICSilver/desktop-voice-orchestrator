@@ -860,3 +860,83 @@ TEST_CASE("Hybrid parser keeps fast-path rules local, routes natural phrasings, 
   REQUIRE(too_many.error.has_value());
   CHECK(too_many.error->code == "too_many_actions");
 }
+
+TEST_CASE("Fast-path app.open rules match registered apps locally without shadowing media.play") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  dvo::ConfigStore store(
+      root / "config/default.toml",
+      root / "config/nonexistent-app-fastpath-local.toml",
+      root);
+  auto cfg = store.load();
+  cfg.apps.scan_system_apps = false;
+  cfg.apps.quickstart_dirs.clear();
+  // Ensure even a hypothetical app alias named "音乐" cannot steal "打开音乐"!
+  cfg.apps.entries.push_back(dvo::AppEntryConfig{
+      .id = "fake_music_app",
+      .display_name = "音乐",
+      .aliases = {"音乐", "每日推荐"},
+  });
+
+  const auto catalog = std::make_shared<const dvo::AppCatalog>(
+      dvo::AppCatalog::from_config(cfg.apps));
+
+  std::size_t router_calls = 0;
+  struct CountingRouter final : dvo::ILlmCommandRouter {
+    std::size_t* calls{};
+    dvo::LlmRouteResult route(const dvo::LlmRouteRequest&) const override {
+      ++(*calls);
+      return {.actions = {}, .router_name = "llm.counting"};
+    }
+  };
+  auto counting_router = std::make_shared<CountingRouter>();
+  counting_router->calls = &router_calls;
+
+  const dvo::CommandParser parser(
+      static_cast<int>(cfg.commands.default_volume_step_percent),
+      static_cast<int>(cfg.commands.max_spoken_volume_step_percent),
+      dvo::command_grammar(cfg.commands, catalog.get()),
+      dvo::CommandParserMode::hybrid,
+      counting_router);
+
+  auto wake = context("app-fastpath-wake");
+  wake.origin = dvo::UtteranceOrigin::keyword;
+  wake.wake_word = "小克";
+
+  const auto open_steam = parser.parse("小克，打开 Steam", wake);
+  REQUIRE(open_steam.ok());
+  REQUIRE(open_steam.plan->actions.size() == 1);
+  CHECK(open_steam.plan->actions[0].type == dvo::ActionType::app_open);
+  CHECK(open_steam.plan->actions[0].app_id == "steam");
+  CHECK(open_steam.plan->actions[0].app_display_name == "Steam");
+  CHECK(router_calls == 0);
+
+  const auto open_ps = parser.parse("打开 PowerShell", context("app-fastpath-ps"));
+  REQUIRE(open_ps.ok());
+  REQUIRE(open_ps.plan->actions.size() == 1);
+  CHECK(open_ps.plan->actions[0].type == dvo::ActionType::app_open);
+  CHECK(open_ps.plan->actions[0].app_id == "powershell");
+  CHECK(router_calls == 0);
+
+  const auto open_homophone = parser.parse("小克，启动死盯然后切换到迪斯科", wake);
+  REQUIRE(open_homophone.ok());
+  REQUIRE(open_homophone.plan->actions.size() == 2);
+  CHECK(open_homophone.plan->actions[0].type == dvo::ActionType::app_open);
+  CHECK(open_homophone.plan->actions[0].app_id == "steam");
+  CHECK(open_homophone.plan->actions[1].type == dvo::ActionType::app_open);
+  CHECK(open_homophone.plan->actions[1].app_id == "discord");
+  CHECK(router_calls == 0);
+
+  // Critical regression guard: "打开音乐" and "打开每日推荐" MUST keep hitting media rules!
+  const auto open_music = parser.parse("小克，打开音乐", wake);
+  REQUIRE(open_music.ok());
+  REQUIRE(open_music.plan->actions.size() == 1);
+  CHECK(open_music.plan->actions[0].type == dvo::ActionType::media_play);
+  CHECK_FALSE(open_music.plan->actions[0].app_id.has_value());
+  CHECK(router_calls == 0);
+
+  const auto open_daily = parser.parse("小克，打开每日推荐", wake);
+  REQUIRE(open_daily.ok());
+  REQUIRE(open_daily.plan->actions.size() == 1);
+  CHECK(open_daily.plan->actions[0].type == dvo::ActionType::media_play_daily);
+  CHECK(router_calls == 0);
+}

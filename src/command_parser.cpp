@@ -28,6 +28,8 @@ struct ParsedNumber {
 struct ParsedAction {
   ActionType type{ActionType::media_play};
   std::optional<int> delta;
+  std::optional<std::string> app_id;
+  std::optional<std::string> app_display_name;
   std::string canonical;
   std::size_t end{};
   std::optional<CommandParseError> error;
@@ -38,6 +40,12 @@ struct PhraseRule {
   std::vector<std::string> omission_variants;
   ActionType type{ActionType::media_play};
   bool volume_increase{};
+};
+
+struct CompiledAppRule {
+  std::string pattern_lower;
+  std::string app_id;
+  std::string display_name;
 };
 
 [[nodiscard]] bool is_space(char32_t cp) {
@@ -151,6 +159,31 @@ void append_utf8(std::string& output, char32_t cp) {
 [[nodiscard]] bool starts_with_at(std::string_view value, std::size_t offset,
                                   std::string_view prefix) {
   return offset <= value.size() && value.substr(offset).starts_with(prefix);
+}
+
+[[nodiscard]] std::string to_ascii_lower(std::string_view value) {
+  std::string out;
+  out.reserve(value.size());
+  for (const unsigned char ch : value) {
+    if (ch >= 'A' && ch <= 'Z') {
+      out.push_back(static_cast<char>(ch - 'A' + 'a'));
+    } else {
+      out.push_back(static_cast<char>(ch));
+    }
+  }
+  return out;
+}
+
+[[nodiscard]] bool starts_with_ascii_icase_at(std::string_view value,
+                                              std::size_t offset,
+                                              std::string_view lower_prefix) {
+  if (offset + lower_prefix.size() > value.size()) return false;
+  for (std::size_t i = 0; i < lower_prefix.size(); ++i) {
+    auto ch = static_cast<unsigned char>(value[offset + i]);
+    if (ch >= 'A' && ch <= 'Z') ch = static_cast<unsigned char>(ch - 'A' + 'a');
+    if (ch != static_cast<unsigned char>(lower_prefix[i])) return false;
+  }
+  return true;
 }
 
 void strip_polite_prefix(std::string& value) {
@@ -291,6 +324,7 @@ void correct_wake_confirmed_asr_confusions(
 [[nodiscard]] ParsedAction parse_action(std::string_view text, std::size_t offset,
                                         int default_delta, int maximum_delta,
                                         const std::vector<PhraseRule>& rules,
+                                        const std::vector<CompiledAppRule>& app_rules,
                                         bool allow_trailing_prefix,
                                         std::string_view wake_word) {
   const auto parsed_rule = [&](const PhraseRule& rule, std::size_t end) {
@@ -298,12 +332,41 @@ void correct_wake_confirmed_asr_confusions(
       return parse_volume(text, end, rule.phrase, rule.volume_increase,
                           default_delta, maximum_delta);
     }
-    return ParsedAction{rule.type, {}, rule.phrase, end, {}};
+    return ParsedAction{rule.type, {}, {}, {}, rule.phrase, end, {}};
   };
 
+  const PhraseRule* matched_media = nullptr;
   for (const auto& rule : rules) {
     if (!starts_with_at(text, offset, rule.phrase)) continue;
-    return parsed_rule(rule, offset + rule.phrase.size());
+    matched_media = &rule;
+    break;
+  }
+
+  const CompiledAppRule* matched_app = nullptr;
+  for (const auto& app_rule : app_rules) {
+    if (!starts_with_ascii_icase_at(text, offset, app_rule.pattern_lower)) continue;
+    matched_app = &app_rule;
+    break;
+  }
+
+  // Existing media/volume rules win ties so "打开音乐" / "打开每日推荐" can never
+  // be shadowed by a scanned desktop shortcut.
+  if (matched_media &&
+      (!matched_app ||
+       matched_media->phrase.size() >= matched_app->pattern_lower.size())) {
+    return parsed_rule(*matched_media, offset + matched_media->phrase.size());
+  }
+  if (matched_app) {
+    return ParsedAction{
+        ActionType::app_open,
+        {},
+        matched_app->app_id,
+        matched_app->display_name.empty()
+            ? std::optional<std::string>{}
+            : std::optional<std::string>{matched_app->display_name},
+        "app.open:" + matched_app->app_id,
+        offset + matched_app->pattern_lower.size(),
+        {}};
   }
 
   // ASR commonly drops one Chinese character at an utterance boundary. Admit
@@ -332,7 +395,7 @@ void correct_wake_confirmed_asr_confusions(
     }
   }
   if (ambiguous) {
-    return {ActionType::media_play, {}, {}, offset,
+    return {ActionType::media_play, {}, {}, {}, {}, offset,
             CommandParseError{"ambiguous_text",
                               "one-character ASR correction matches multiple commands",
                               offset}};
@@ -364,14 +427,14 @@ void correct_wake_confirmed_asr_confusions(
       }
     }
     if (prefix_ambiguous) {
-      return {ActionType::media_play, {}, {}, offset,
+      return {ActionType::media_play, {}, {}, {}, {}, offset,
               CommandParseError{"ambiguous_text",
                                 "trailing command prefix matches multiple actions",
                                 offset}};
     }
     if (prefix_rule) return parsed_rule(*prefix_rule, text.size());
   }
-  return {ActionType::media_play, {}, {}, offset,
+  return {ActionType::media_play, {}, {}, {}, {}, offset,
           CommandParseError{"unknown_text", "text contains an unknown or incomplete command", offset}};
 }
 
@@ -610,6 +673,8 @@ constexpr std::size_t kMaxDroppedResidue = 3;
 struct ActionDraft {
   ActionType type;
   std::optional<int> delta;
+  std::optional<std::string> app_id;
+  std::optional<std::string> app_display_name;
   std::string canonical;
 };
 
@@ -830,7 +895,8 @@ struct DraftParse {
 [[nodiscard]] CommandParseResult build_validated_router_plan(
     const LlmRouteResult& route_result, const CommandParseContext& context,
     std::string_view raw_text, int maximum_volume_delta_percent,
-    std::size_t max_actions_per_utterance) {
+    std::size_t max_actions_per_utterance,
+    const std::unordered_map<std::string, std::string>& app_display_names) {
   if (route_result.error) return {{}, route_result.error};
   if (route_result.actions.empty()) {
     return failure("no_command_intent",
@@ -867,9 +933,10 @@ struct DraftParse {
 
     std::string canonical;
     if (proposed.type == ActionType::master_volume_adjust) {
-      if (proposed.search_query || proposed.search_type || proposed.search_artist) {
+      if (proposed.search_query || proposed.search_type ||
+          proposed.search_artist || proposed.app_id) {
         return failure("invalid_action_parameters",
-                       "master_volume_adjust must not carry search parameters", i);
+                       "master_volume_adjust must not carry search or app parameters", i);
       }
       if (!proposed.volume_delta_percent || *proposed.volume_delta_percent == 0) {
         return failure("invalid_volume_amount",
@@ -886,9 +953,9 @@ struct DraftParse {
       canonical = (delta > 0 ? "增加音量" : "降低音量") +
                   std::to_string(std::abs(delta)) + "%";
     } else if (proposed.type == ActionType::media_search_play) {
-      if (proposed.volume_delta_percent) {
+      if (proposed.volume_delta_percent || proposed.app_id) {
         return failure("invalid_action_parameters",
-                       "media.search_play must not carry volume_delta_percent", i);
+                       "media.search_play must not carry volume or app parameters", i);
       }
       if (!proposed.search_query) {
         return failure("invalid_search_query",
@@ -934,9 +1001,36 @@ struct DraftParse {
       canonical = std::string("media.search_play:") + to_string(search_type) + ":";
       if (action.search_artist) canonical += *action.search_artist + "/";
       canonical += *action.search_query;
-    } else {
+    } else if (proposed.type == ActionType::app_open) {
       if (proposed.volume_delta_percent || proposed.search_query ||
           proposed.search_type || proposed.search_artist) {
+        return failure("invalid_action_parameters",
+                       "app.open must not carry volume or search parameters", i);
+      }
+      if (!proposed.app_id) {
+        return failure("invalid_app_id", "app.open requires app_id", i);
+      }
+      const auto cleaned_id = clean_router_text_field(*proposed.app_id, kMaxAppIdBytes);
+      if (!cleaned_id || !is_valid_app_id(*cleaned_id)) {
+        return failure("invalid_app_id",
+                       "app.open app_id must match [a-z0-9_.-] without path separators", i);
+      }
+      action.app_id = *cleaned_id;
+      if (proposed.app_display_name) {
+        if (const auto cleaned_display = clean_router_text_field(*proposed.app_display_name, 128)) {
+          action.app_display_name = *cleaned_display;
+        }
+      }
+      if (!action.app_display_name) {
+        if (const auto found = app_display_names.find(*cleaned_id);
+            found != app_display_names.end() && !found->second.empty()) {
+          action.app_display_name = found->second;
+        }
+      }
+      canonical = "app.open:" + *cleaned_id;
+    } else {
+      if (proposed.volume_delta_percent || proposed.search_query ||
+          proposed.search_type || proposed.search_artist || proposed.app_id) {
         return failure("invalid_action_parameters",
                        "action must not carry unexpected parameters", i);
       }
@@ -971,6 +1065,8 @@ std::optional<CommandParserMode> parse_command_parser_mode(std::string_view valu
 
 struct CommandParser::Impl {
   std::vector<PhraseRule> rules;
+  std::vector<CompiledAppRule> app_rules;
+  std::unordered_map<std::string, std::string> app_display_names;
   std::vector<std::string> connectors;
 };
 
@@ -1044,6 +1140,47 @@ CommandParser::CommandParser(int default_volume_delta_percent,
   }
   std::ranges::sort(implementation->connectors, {}, &std::string::size);
   std::ranges::reverse(implementation->connectors);
+
+  static constexpr std::array<std::string_view, 4> kAppOpenVerbs{
+      "打开", "启动", "切换到", "切到"};
+  std::unordered_set<std::string> seen_app_patterns;
+  for (const auto& app_rule : grammar.app_open_rules) {
+    if (!is_valid_app_id(app_rule.app_id)) {
+      throw std::invalid_argument("app_open_rules contains invalid app_id '" +
+                                  app_rule.app_id + "'");
+    }
+    if (!app_rule.display_name.empty()) {
+      implementation->app_display_names.try_emplace(app_rule.app_id,
+                                                    app_rule.display_name);
+    }
+    const auto norm_alias = normalize(app_rule.alias);
+    if (norm_alias.error || norm_alias.value.empty() ||
+        norm_alias.value.find(';') != std::string::npos) {
+      continue;
+    }
+    std::vector<std::string> alias_variants;
+    alias_variants.push_back(to_ascii_lower(norm_alias.value));
+    if (auto compact = to_ascii_lower(remove_fillers(norm_alias.value));
+        !compact.empty() && compact != alias_variants.front()) {
+      alias_variants.push_back(std::move(compact));
+    }
+    for (const auto& variant : alias_variants) {
+      for (const auto verb : kAppOpenVerbs) {
+        std::string pattern = std::string(verb) + variant;
+        const bool starts_with_connector = std::ranges::any_of(
+            implementation->connectors, [&](const std::string& conn) {
+              return pattern.starts_with(conn);
+            });
+        if (starts_with_connector) continue;
+        if (!seen_app_patterns.insert(pattern).second) continue;
+        implementation->app_rules.push_back(CompiledAppRule{
+            std::move(pattern), app_rule.app_id, app_rule.display_name});
+      }
+    }
+  }
+  std::ranges::stable_sort(implementation->app_rules, std::greater{},
+                           [](const CompiledAppRule& r) { return r.pattern_lower.size(); });
+
   impl_ = std::move(implementation);
 }
 
@@ -1138,9 +1275,10 @@ CommandParseResult CommandParser::parse(std::string_view text,
       const auto parsed = parse_action(value, position,
                                        default_volume_delta_percent_,
                                        maximum_volume_delta_percent_, impl_->rules,
-                                       had_connector, wake_value);
+                                       impl_->app_rules, had_connector, wake_value);
       if (parsed.error) return DraftParse{{}, parsed.error};
-      drafts.push_back({parsed.type, parsed.delta, parsed.canonical});
+      drafts.push_back({parsed.type, parsed.delta, parsed.app_id,
+                        parsed.app_display_name, parsed.canonical});
       if (drafts.size() > max_actions_per_utterance_) {
         return fail("too_many_actions", "command plan exceeds the configured action limit", position);
       }
@@ -1243,7 +1381,7 @@ CommandParseResult CommandParser::parse(std::string_view text,
     const auto route_result = router_->route(request);
     return build_validated_router_plan(
         route_result, context, text, maximum_volume_delta_percent_,
-        max_actions_per_utterance_);
+        max_actions_per_utterance_, impl_->app_display_names);
   };
 
   if (mode_ == CommandParserMode::router) {
@@ -1284,6 +1422,8 @@ CommandParseResult CommandParser::parse(std::string_view text,
     action.action_id = plan.command_id + ":" + std::to_string(action.sequence);
     action.type = drafts[i].type;
     action.volume_delta_percent = drafts[i].delta;
+    action.app_id = drafts[i].app_id;
+    action.app_display_name = drafts[i].app_display_name;
     plan.actions.push_back(std::move(action));
   }
   return {std::move(plan), {}};

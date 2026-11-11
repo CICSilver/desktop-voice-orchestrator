@@ -132,6 +132,11 @@ struct CommandsConfig {
   bool enabled{true};
   std::string parser_mode{"rules"};
   std::string router_backend{"none"};
+  std::string router_base_url{"https://api.openai.com/v1"};
+  std::string router_model{"gpt-4o-mini"};
+  std::string router_api_key_env{"OPENAI_API_KEY"};
+  std::uint32_t router_timeout_ms{2500};
+  bool router_structured_outputs{true};
   std::uint32_t default_volume_step_percent{5};
   std::uint32_t max_spoken_volume_step_percent{20};
   std::uint32_t max_actions_per_utterance{8};
@@ -195,6 +200,23 @@ struct RecordingConfig {
   std::uint32_t queue_capacity_ms{5000};
 };
 
+struct AppEntryConfig {
+  std::string id;
+  std::string display_name;
+  std::filesystem::path target;
+  std::vector<std::string> arguments;
+  std::vector<std::string> aliases;
+  std::vector<std::string> process_names;
+};
+
+struct AppsConfig {
+  std::vector<std::string> quickstart_dirs{
+      "%USERPROFILE%/QuickStart",
+      "%APPDATA%/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar"};
+  bool scan_system_apps{true};
+  std::vector<AppEntryConfig> entries;
+};
+
 struct AppConfig {
   AudioConfig audio;
   PreprocessConfig preprocess;
@@ -206,6 +228,7 @@ struct AppConfig {
   ActivationConfig activation;
   AsrConfig asr;
   CommandsConfig commands;
+  AppsConfig apps;
   NeteaseConfig netease;
   AnnouncementsConfig announcements;
   WebConfig web;

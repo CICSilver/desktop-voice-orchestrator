@@ -15,6 +15,7 @@
 
 #include "dvo/json_utils.h"
 #include "dvo/hash.h"
+#include "dvo/openai_router.h"
 #include "dvo/wav_file.h"
 #include "dvo/windows_action_backend.h"
 
@@ -118,6 +119,12 @@ nlohmann::json command_plan_json(const CommandPlan& plan) {
     action_value["search_artist"] =
         action.search_artist ? nlohmann::json(*action.search_artist)
                              : nlohmann::json(nullptr);
+    action_value["app_id"] =
+        action.app_id ? nlohmann::json(*action.app_id)
+                      : nlohmann::json(nullptr);
+    action_value["app_display_name"] =
+        action.app_display_name ? nlohmann::json(*action.app_display_name)
+                                : nlohmann::json(nullptr);
     actions.push_back(std::move(action_value));
   }
   auto value = nlohmann::json{{"schema_version", plan.schema_version},
@@ -215,6 +222,7 @@ nlohmann::json action_result_json(const ActionResult& result) {
           : nlohmann::json(nullptr);
   value["requested_search_artist"] =
       optional_json(result.requested_search_artist);
+  value["requested_app_id"] = optional_json(result.requested_app_id);
   value["volume_before"] = optional_json(result.volume_before);
   value["volume_requested"] = optional_json(result.volume_requested);
   value["volume_after"] = optional_json(result.volume_after);
@@ -369,7 +377,8 @@ std::vector<std::string> read_wake_words(const std::filesystem::path& keywords) 
 
 }  // namespace
 
-CommandGrammar command_grammar(const CommandsConfig& config) {
+CommandGrammar command_grammar(const CommandsConfig& config,
+                               const AppCatalog* app_catalog) {
   CommandGrammar grammar;
   grammar.play_phrases = config.play_phrases;
   grammar.pause_phrases = config.pause_phrases;
@@ -384,9 +393,61 @@ CommandGrammar command_grammar(const CommandsConfig& config) {
   grammar.mode_shuffle_phrases = config.mode_shuffle_phrases;
   grammar.lyrics_show_phrases = config.lyrics_show_phrases;
   grammar.lyrics_hide_phrases = config.lyrics_hide_phrases;
+  if (app_catalog != nullptr) {
+    for (const auto& entry : app_catalog->entries()) {
+      if (!is_valid_app_id(entry.id)) continue;
+      grammar.app_open_rules.push_back(
+          AppOpenRule{entry.id, entry.id, entry.display_name});
+      if (!entry.display_name.empty() && entry.display_name != entry.id) {
+        grammar.app_open_rules.push_back(
+            AppOpenRule{entry.display_name, entry.id, entry.display_name});
+      }
+      for (const auto& alias : entry.aliases) {
+        if (!alias.empty()) {
+          grammar.app_open_rules.push_back(
+              AppOpenRule{alias, entry.id, entry.display_name});
+        }
+      }
+    }
+  }
   grammar.connectors = config.connectors;
   grammar.max_actions_per_utterance = config.max_actions_per_utterance;
   return grammar;
+}
+
+std::shared_ptr<const CommandParser> create_command_parser(
+    const AppConfig& config,
+    std::shared_ptr<const AppCatalog> app_catalog) {
+  const auto mode = parse_command_parser_mode(config.commands.parser_mode)
+                        .value_or(CommandParserMode::rules);
+  std::shared_ptr<const ILlmCommandRouter> router;
+  if (config.commands.router_backend == "openai_compatible") {
+    OpenAiRouterConfig router_config;
+    router_config.base_url = config.commands.router_base_url;
+    router_config.model = config.commands.router_model;
+    router_config.api_key_env = config.commands.router_api_key_env;
+    router_config.timeout_ms = config.commands.router_timeout_ms;
+    router_config.structured_outputs =
+        config.commands.router_structured_outputs;
+    router = std::make_shared<const OpenAiCompatibleCommandRouter>(
+        std::move(router_config), app_catalog);
+  }
+  return std::make_shared<const CommandParser>(
+      static_cast<int>(config.commands.default_volume_step_percent),
+      static_cast<int>(config.commands.max_spoken_volume_step_percent),
+      command_grammar(config.commands, app_catalog.get()),
+      mode,
+      std::move(router));
+}
+
+std::shared_ptr<const CommandParser> create_command_parser(
+    const AppConfig& config,
+    const AppCatalog* app_catalog) {
+  std::shared_ptr<const AppCatalog> shared_catalog;
+  if (app_catalog != nullptr) {
+    shared_catalog = std::make_shared<const AppCatalog>(*app_catalog);
+  }
+  return create_command_parser(config, std::move(shared_catalog));
 }
 
 VoiceFrontendRuntime::VoiceFrontendRuntime(AppConfig config, ConfigStore store)
@@ -468,14 +529,11 @@ void VoiceFrontendRuntime::initialize_pipeline() {
           probe_ring, std::move(wake_words));
     }
   }
+  app_catalog_ = std::make_shared<const AppCatalog>(
+      AppCatalog::from_config(config_.apps));
   {
     std::scoped_lock command_lock(command_mutex_);
-    command_parser_ = std::make_shared<const CommandParser>(
-        static_cast<int>(config_.commands.default_volume_step_percent),
-        static_cast<int>(config_.commands.max_spoken_volume_step_percent),
-        command_grammar(config_.commands),
-        parse_command_parser_mode(config_.commands.parser_mode)
-            .value_or(CommandParserMode::rules));
+    command_parser_ = create_command_parser(config_, app_catalog_);
     command_config_revision_ = config_.revision;
     commands_enabled_ = config_.commands.enabled;
     command_snapshots_.clear();
@@ -493,7 +551,8 @@ void VoiceFrontendRuntime::initialize_pipeline() {
           {config_.audio.loopback_device, config_.commands.action_timeout_ms,
            {config_.netease.ncm_cli, config_.netease.node, config_.netease.client_data,
             config_.netease.timeout_ms, config_.netease.cdp_port,
-            config_.netease.executable}}),
+            config_.netease.executable},
+           app_catalog_}),
       ActionExecutorConfig{config_.commands.queue_capacity, 4096, ExecutionMode::live},
       [this](const ActionResult& result) { handle_action_result(result); },
       [this](const CommandPlan& plan) { handle_plan_started(plan); });
@@ -2948,12 +3007,33 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     changed(candidate.asr.tokens != current.asr.tokens, "asr.tokens");
     changed(candidate.asr.provider != current.asr.provider, "asr.provider");
     changed(candidate.asr.num_threads != current.asr.num_threads, "asr.num_threads");
+    const auto app_entries_equal = [](const std::vector<AppEntryConfig>& lhs,
+                                      const std::vector<AppEntryConfig>& rhs) {
+      if (lhs.size() != rhs.size()) return false;
+      for (std::size_t idx = 0; idx < lhs.size(); ++idx) {
+        if (lhs[idx].id != rhs[idx].id ||
+            lhs[idx].display_name != rhs[idx].display_name ||
+            lhs[idx].target != rhs[idx].target ||
+            lhs[idx].arguments != rhs[idx].arguments ||
+            lhs[idx].aliases != rhs[idx].aliases ||
+            lhs[idx].process_names != rhs[idx].process_names) {
+          return false;
+        }
+      }
+      return true;
+    };
     changed(candidate.commands.router_backend != current.commands.router_backend,
             "commands.router_backend");
     changed(candidate.commands.action_timeout_ms != current.commands.action_timeout_ms,
             "commands.action_timeout_ms");
     changed(candidate.commands.queue_capacity != current.commands.queue_capacity,
             "commands.queue_capacity");
+    changed(candidate.apps.quickstart_dirs != current.apps.quickstart_dirs,
+            "apps.quickstart_dirs");
+    changed(candidate.apps.scan_system_apps != current.apps.scan_system_apps,
+            "apps.scan_system_apps");
+    changed(!app_entries_equal(candidate.apps.entries, current.apps.entries),
+            "apps.entries");
     changed(candidate.segmentation.assembly_queue_capacity !=
                 current.segmentation.assembly_queue_capacity,
             "segmentation.assembly_queue_capacity");
@@ -3002,6 +3082,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     active.commands.router_backend = current.commands.router_backend;
     active.commands.action_timeout_ms = current.commands.action_timeout_ms;
     active.commands.queue_capacity = current.commands.queue_capacity;
+    active.apps = current.apps;
     active.netease = current.netease;
     active.web = current.web;
     active.web.telemetry_hz = candidate.web.telemetry_hz;
@@ -3052,6 +3133,12 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         (!active.announcements.enabled || active.announcements.barge_in);
     const bool parser_changed =
         active.commands.parser_mode != current.commands.parser_mode ||
+        active.commands.router_base_url != current.commands.router_base_url ||
+        active.commands.router_model != current.commands.router_model ||
+        active.commands.router_api_key_env != current.commands.router_api_key_env ||
+        active.commands.router_timeout_ms != current.commands.router_timeout_ms ||
+        active.commands.router_structured_outputs !=
+            current.commands.router_structured_outputs ||
         active.commands.default_volume_step_percent !=
             current.commands.default_volume_step_percent ||
         active.commands.max_spoken_volume_step_percent !=
@@ -3094,12 +3181,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         kws_changed ? create_keyword_spotter(active.kws) : nullptr;
     std::shared_ptr<const CommandParser> new_parser;
     if (parser_changed) {
-      new_parser = std::make_shared<const CommandParser>(
-          static_cast<int>(active.commands.default_volume_step_percent),
-          static_cast<int>(active.commands.max_spoken_volume_step_percent),
-          command_grammar(active.commands),
-          parse_command_parser_mode(active.commands.parser_mode)
-              .value_or(CommandParserMode::rules));
+      new_parser = create_command_parser(active, app_catalog_);
     }
     if (save) config_store_.save_overrides(candidate);
     std::size_t cancelled_candidates{};

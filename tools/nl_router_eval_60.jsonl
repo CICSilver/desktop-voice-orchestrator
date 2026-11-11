@@ -1,0 +1,60 @@
+{"id": "pos_01", "split": "positive", "category": "media_basic", "wake_word": "小克", "text": "小克，放首歌来听听吧", "expected_actions": [{"type": "media.play"}]}
+{"id": "pos_02", "split": "positive", "category": "media_basic", "wake_word": "小克", "text": "小克，太吵了先把音乐关掉", "expected_actions": [{"type": "media.pause"}]}
+{"id": "pos_03", "split": "positive", "category": "media_basic", "wake_word": "小克", "text": "这首歌听腻了帮我换下一首，小克", "expected_actions": [{"type": "media.next"}]}
+{"id": "pos_04", "split": "positive", "category": "media_basic", "wake_word": "小克", "text": "小克，这首歌真好听帮我点个红心收藏一下", "expected_actions": [{"type": "media.like"}]}
+{"id": "pos_05", "split": "positive", "category": "media_basic", "wake_word": "小克", "text": "小克，来点今天的每日推荐", "expected_actions": [{"type": "media.play_daily"}]}
+{"id": "pos_06", "split": "positive", "category": "play_mode", "wake_word": "小克", "text": "小克，把播放模式改成顺序播放", "expected_actions": [{"type": "media.mode.order"}]}
+{"id": "pos_07", "split": "positive", "category": "play_mode", "wake_word": "小克", "text": "切换成列表循环模式吧，小克", "expected_actions": [{"type": "media.mode.list_loop"}]}
+{"id": "pos_08", "split": "positive", "category": "play_mode", "wake_word": "小克", "text": "小克，把当前这首歌设为单曲循环", "expected_actions": [{"type": "media.mode.single_loop"}]}
+{"id": "pos_09", "split": "positive", "category": "play_mode", "wake_word": "小克", "text": "小克，打乱顺序随机播放吧", "expected_actions": [{"type": "media.mode.shuffle"}]}
+{"id": "pos_10", "split": "positive", "category": "lyrics", "wake_word": "小克", "text": "小克，把桌面上的歌词显示出来", "expected_actions": [{"type": "media.lyrics.show"}]}
+{"id": "pos_11", "split": "positive", "category": "lyrics", "wake_word": "小克", "text": "挡住屏幕了把桌面歌词关掉吧，小克", "expected_actions": [{"type": "media.lyrics.hide"}]}
+{"id": "pos_12", "split": "positive", "category": "volume", "wake_word": "小克", "text": "小克，把音量调大百分之十五", "expected_actions": [{"type": "audio.volume.adjust", "volume_delta_percent": 15}]}
+{"id": "pos_13", "split": "positive", "category": "volume", "wake_word": "小克", "text": "把声音调小百分之十，小克", "expected_actions": [{"type": "audio.volume.adjust", "volume_delta_percent": -10}]}
+{"id": "pos_14", "split": "positive", "category": "volume", "wake_word": "小克", "text": "小克，声音有点轻帮我开大一点", "expected_actions": [{"type": "audio.volume.adjust", "volume_delta_percent": 5}], "allowed_volume_deltas": [5, 8, 10]}
+{"id": "pos_15", "split": "positive", "category": "music_search", "wake_word": "小克", "text": "小克，我想听周杰伦的晴天", "expected_actions": [{"type": "media.search_play", "search_query": "晴天", "search_type": "song", "search_artist": "周杰伦"}]}
+{"id": "pos_16", "split": "positive", "category": "music_search", "wake_word": "小克", "text": "帮我放一首陈奕迅唱的孤勇者，小克", "expected_actions": [{"type": "media.search_play", "search_query": "孤勇者", "search_type": "song", "search_artist": "陈奕迅"}]}
+{"id": "pos_17", "split": "positive", "category": "music_search", "wake_word": "小克", "text": "小克，来一首邓紫棋的泡沫", "expected_actions": [{"type": "media.search_play", "search_query": "泡沫", "search_type": "song", "search_artist": "邓紫棋"}]}
+{"id": "pos_18", "split": "positive", "category": "music_search", "wake_word": "小克", "text": "播放莫文蔚的忽然之间，小克", "expected_actions": [{"type": "media.search_play", "search_query": "忽然之间", "search_type": "song", "search_artist": "莫文蔚"}]}
+{"id": "pos_19", "split": "positive", "category": "music_search", "wake_word": "小克", "text": "小克，随便放几首林俊杰的歌", "expected_actions": [{"type": "media.search_play", "search_query": "林俊杰", "search_type": "song", "search_artist": "林俊杰"}]}
+{"id": "pos_20", "split": "positive", "category": "music_search", "wake_word": "小克", "text": "小克，放点适合写代码的纯音乐歌单", "expected_actions": [{"type": "media.search_play", "search_query": "纯音乐", "search_type": "playlist", "search_artist": null, "acceptable_queries": ["纯音乐", "写代码纯音乐", "适合写代码的纯音乐", "写代码"]}]}
+{"id": "pos_21", "split": "positive", "category": "music_search", "wake_word": "小克", "text": "帮我找个华语经典老歌的歌单放一下，小克", "expected_actions": [{"type": "media.search_play", "search_query": "华语经典老歌", "search_type": "playlist", "search_artist": null, "acceptable_queries": ["华语经典老歌", "华语经典", "经典老歌"]}]}
+{"id": "pos_22", "split": "positive", "category": "music_search", "wake_word": "小克", "text": "小克，播放我喜欢的音乐歌单", "expected_actions": [{"type": "media.search_play", "search_query": "我喜欢的音乐", "search_type": "playlist", "search_artist": null}]}
+{"id": "pos_23", "split": "positive", "category": "app_open", "wake_word": "小克", "text": "小克，帮我打开 Steam", "expected_actions": [{"type": "app.open", "app_id": "steam"}]}
+{"id": "pos_24", "split": "positive", "category": "app_open_homophone", "wake_word": "", "text": "打开死盯", "expected_actions": [{"type": "app.open", "app_id": "steam"}]}
+{"id": "pos_25", "split": "positive", "category": "app_open_homophone", "wake_word": "小克", "text": "小克，帮我启动斯蒂姆游戏平台", "expected_actions": [{"type": "app.open", "app_id": "steam"}]}
+{"id": "pos_26", "split": "positive", "category": "app_open", "wake_word": "小克", "text": "帮我启动 Clash，小克", "expected_actions": [{"type": "app.open", "app_id": "clash"}]}
+{"id": "pos_27", "split": "positive", "category": "app_open_homophone", "wake_word": "小克", "text": "小克，帮我打开可拉什", "expected_actions": [{"type": "app.open", "app_id": "clash"}]}
+{"id": "pos_28", "split": "positive", "category": "app_open", "wake_word": "小克", "text": "小克，切到 Discord", "expected_actions": [{"type": "app.open", "app_id": "discord"}]}
+{"id": "pos_29", "split": "positive", "category": "app_open_homophone", "wake_word": "小克", "text": "小克，打开迪斯科语音", "expected_actions": [{"type": "app.open", "app_id": "discord"}]}
+{"id": "pos_30", "split": "positive", "category": "app_open", "wake_word": "小克", "text": "打开 QQ，小克", "expected_actions": [{"type": "app.open", "app_id": "qq"}]}
+{"id": "pos_31", "split": "positive", "category": "app_open_homophone", "wake_word": "小克", "text": "小克，帮我把扣扣打开", "expected_actions": [{"type": "app.open", "app_id": "qq"}]}
+{"id": "pos_32", "split": "positive", "category": "app_open_homophone", "wake_word": "小克", "text": "小克，打开泡我秀终端", "expected_actions": [{"type": "app.open", "app_id": "powershell"}]}
+{"id": "pos_33", "split": "positive", "category": "compound_2step", "wake_word": "小克", "text": "小克，打开 PowerShell，再放点每日推荐", "expected_actions": [{"type": "app.open", "app_id": "powershell"}, {"type": "media.play_daily"}]}
+{"id": "pos_34", "split": "positive", "category": "compound_2step", "wake_word": "小克", "text": "小克，打开 Steam，再放点背景音乐", "expected_actions": [{"type": "app.open", "app_id": "steam"}, {"type": "media.play"}]}
+{"id": "pos_35", "split": "positive", "category": "compound_2step", "wake_word": "小克", "text": "先打开 Clash，然后把声音关小百分之十，小克", "expected_actions": [{"type": "app.open", "app_id": "clash"}, {"type": "audio.volume.adjust", "volume_delta_percent": -10}]}
+{"id": "pos_36", "split": "positive", "category": "compound_2step", "wake_word": "小克", "text": "小克，先把音乐暂停，再打开 Discord", "expected_actions": [{"type": "media.pause"}, {"type": "app.open", "app_id": "discord"}]}
+{"id": "pos_37", "split": "positive", "category": "compound_2step", "wake_word": "小克", "text": "小克，先把声音调小百分之五，再放首周杰伦的夜曲", "expected_actions": [{"type": "audio.volume.adjust", "volume_delta_percent": -5}, {"type": "media.search_play", "search_query": "夜曲", "search_type": "song", "search_artist": "周杰伦"}]}
+{"id": "pos_38", "split": "positive", "category": "compound_2step", "wake_word": "小克", "text": "收藏这首歌，然后改成随机播放，小克", "expected_actions": [{"type": "media.like"}, {"type": "media.mode.shuffle"}]}
+{"id": "pos_39", "split": "positive", "category": "compound_3step", "wake_word": "小克", "text": "小克，先打开死盯，再把声音关小百分之十，然后放每日推荐", "expected_actions": [{"type": "app.open", "app_id": "steam"}, {"type": "audio.volume.adjust", "volume_delta_percent": -10}, {"type": "media.play_daily"}]}
+{"id": "pos_40", "split": "positive", "category": "compound_3step", "wake_word": "小克", "text": "小克，打开桌面歌词，把音量调大百分之五，再切到下一首歌", "expected_actions": [{"type": "media.lyrics.show"}, {"type": "audio.volume.adjust", "volume_delta_percent": 5}, {"type": "media.next"}]}
+{"id": "neg_01", "split": "negative", "category": "chat_music", "wake_word": "", "text": "这首歌的旋律真好听", "expected_actions": []}
+{"id": "neg_02", "split": "negative", "category": "chat_music", "wake_word": "", "text": "周杰伦的晴天真是百听不厌", "expected_actions": []}
+{"id": "neg_03", "split": "negative", "category": "chat_music", "wake_word": "", "text": "网易云今天的每日推荐还挺合我胃口的", "expected_actions": []}
+{"id": "neg_04", "split": "negative", "category": "chat_music", "wake_word": "", "text": "我昨天把这首歌单曲循环了一整个下午", "expected_actions": []}
+{"id": "neg_05", "split": "negative", "category": "chat_daily", "wake_word": "", "text": "外面下大雨了先把窗户关小一点", "expected_actions": []}
+{"id": "neg_06", "split": "negative", "category": "chat_daily", "wake_word": "", "text": "刚才那段视频的背景声音是不是有点太大了", "expected_actions": []}
+{"id": "neg_07", "split": "negative", "category": "game_comms", "wake_word": "", "text": "小心后面有人快撤", "expected_actions": []}
+{"id": "neg_08", "split": "negative", "category": "game_comms", "wake_word": "", "text": "等一下我换把枪", "expected_actions": []}
+{"id": "neg_09", "split": "negative", "category": "game_comms", "wake_word": "", "text": "快切刀跑毒圈要缩了", "expected_actions": []}
+{"id": "neg_10", "split": "negative", "category": "game_comms", "wake_word": "", "text": "我把游戏设置里的脚步声音调大一点了", "expected_actions": []}
+{"id": "neg_11", "split": "negative", "category": "game_comms", "wake_word": "", "text": "今天 Steam 夏季特卖有好几款大作打折", "expected_actions": []}
+{"id": "neg_12", "split": "negative", "category": "game_comms", "wake_word": "", "text": "你们在迪斯科频道里听得到我说话吗", "expected_actions": []}
+{"id": "neg_13", "split": "negative", "category": "game_comms", "wake_word": "", "text": "这局打完我们休息十分钟吧", "expected_actions": []}
+{"id": "neg_14", "split": "negative", "category": "self_cancel", "wake_word": "小克", "text": "小克，算了还是别切歌了", "expected_actions": []}
+{"id": "neg_15", "split": "negative", "category": "self_cancel", "wake_word": "", "text": "不用打开微信了", "expected_actions": []}
+{"id": "neg_16", "split": "negative", "category": "self_cancel", "wake_word": "小克", "text": "小克，先不要暂停音乐，这首还没听完呢", "expected_actions": []}
+{"id": "neg_17", "split": "negative", "category": "self_cancel", "wake_word": "小克", "text": "算了小克，不用帮我打开 Steam 了", "expected_actions": []}
+{"id": "neg_18", "split": "negative", "category": "self_cancel", "wake_word": "小克", "text": "小克，别调大音量了现在的声音刚刚好", "expected_actions": []}
+{"id": "neg_19", "split": "negative", "category": "self_cancel", "wake_word": "小克", "text": "小克，没事了叫错你了什么都不用做", "expected_actions": []}
+{"id": "neg_20", "split": "negative", "category": "self_cancel", "wake_word": "小克", "text": "先不用打开可拉什了，小克", "expected_actions": []}

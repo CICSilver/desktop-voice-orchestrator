@@ -351,3 +351,33 @@ TEST_CASE("evaluation expected_actions strictly match media.search_play paramete
       dvo::evaluate_labeled_session(labels, wrong_artist_summary, reference);
   CHECK(mismatch_report["takes"][0]["verdict"] != "correct");
 }
+
+TEST_CASE("evaluation expected_actions strictly match app.open app_id") {
+  auto doc = labels_document();
+  doc["takes"] = nlohmann::json::array({take(
+      "a1", "command", "小助手，打开 Steam", "prefix",
+      nlohmann::json::array({{{"type", "app.open"}, {"app_id", "steam"}}}),
+      1.0, 4.5)});
+  const auto labels = dvo::parse_evaluation_labels(doc);
+  dvo::SessionReference reference;
+  reference.takes.resize(1);
+  reference.takes[0].available = true;
+
+  const nlohmann::json matched_summary{
+      {"keyword_hits", nlohmann::json::array({hit(1.5)})},
+      {"utterances",
+       nlohmann::json::array({utterance(
+           "u-app-1", 1.1, 3.8, "小助手打开Steam", "plan",
+           nlohmann::json::array({{{"type", "app.open"}, {"app_id", "steam"}}}))})}};
+  CHECK(dvo::evaluate_labeled_session(labels, matched_summary, reference)["takes"][0]["verdict"] ==
+        "correct");
+
+  const nlohmann::json wrong_app_summary{
+      {"keyword_hits", nlohmann::json::array({hit(1.5)})},
+      {"utterances",
+       nlohmann::json::array({utterance(
+           "u-app-2", 1.1, 3.8, "小助手打开Discord", "plan",
+           nlohmann::json::array({{{"type", "app.open"}, {"app_id", "discord"}}}))})}};
+  CHECK(dvo::evaluate_labeled_session(labels, wrong_app_summary, reference)["takes"][0]["verdict"] !=
+        "correct");
+}

@@ -20,6 +20,7 @@
 
 #include "dvo/action_executor.h"
 #include "dvo/announcement.h"
+#include "dvo/app_catalog.h"
 #include "dvo/command_parser.h"
 #include "dvo/config.h"
 #include "dvo/debug_server.h"
@@ -40,7 +41,16 @@ namespace dvo {
 
 // The command grammar the runtime builds from configuration; shared with the
 // offline `parse` CLI so both accept exactly the same sentences.
-[[nodiscard]] CommandGrammar command_grammar(const CommandsConfig& config);
+[[nodiscard]] CommandGrammar command_grammar(
+    const CommandsConfig& config,
+    const AppCatalog* app_catalog = nullptr);
+
+[[nodiscard]] std::shared_ptr<const CommandParser> create_command_parser(
+    const AppConfig& config,
+    std::shared_ptr<const AppCatalog> app_catalog = nullptr);
+[[nodiscard]] std::shared_ptr<const CommandParser> create_command_parser(
+    const AppConfig& config,
+    const AppCatalog* app_catalog);
 
 class VoiceFrontendRuntime {
  public:
@@ -182,6 +192,7 @@ class VoiceFrontendRuntime {
   std::unique_ptr<IStreamingRecognizer> asr_;
   // Parser instances are immutable. In-flight utterances retain shared snapshots
   // across command-grammar hot updates.
+  std::shared_ptr<const AppCatalog> app_catalog_;
   std::shared_ptr<const CommandParser> command_parser_;
   std::unique_ptr<AnnouncementDispatcher> announcement_dispatcher_;
   std::unique_ptr<OrderedActionExecutor> action_executor_;

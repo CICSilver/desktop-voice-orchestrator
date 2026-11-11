@@ -91,6 +91,9 @@ namespace {
       if (action.search_query || action.search_type || action.search_artist) {
         return "only media.search_play actions may carry search parameters";
       }
+      if (action.app_id) {
+        return "only app.open actions may carry app_id";
+      }
       if (!action.volume_delta_percent || *action.volume_delta_percent == 0 ||
           *action.volume_delta_percent < -20 || *action.volume_delta_percent > 20) {
         return "volume actions require a non-zero delta in [-20, 20]";
@@ -98,6 +101,9 @@ namespace {
     } else if (action.type == ActionType::media_search_play) {
       if (action.volume_delta_percent) {
         return "only volume actions may carry a volume delta";
+      }
+      if (action.app_id) {
+        return "only app.open actions may carry app_id";
       }
       if (!action.search_query) {
         return "media.search_play requires a non-empty search_query";
@@ -121,12 +127,25 @@ namespace {
         }
         action.search_artist = *normalized_artist;
       }
+    } else if (action.type == ActionType::app_open) {
+      if (action.volume_delta_percent) {
+        return "only volume actions may carry a volume delta";
+      }
+      if (action.search_query || action.search_type || action.search_artist) {
+        return "only media.search_play actions may carry search parameters";
+      }
+      if (!action.app_id || !is_valid_app_id(*action.app_id)) {
+        return "app.open requires a valid app_id matching [a-z0-9_.-] within 64 bytes";
+      }
     } else {
       if (action.volume_delta_percent) {
         return "only volume actions may carry a volume delta";
       }
       if (action.search_query || action.search_type || action.search_artist) {
         return "only media.search_play actions may carry search parameters";
+      }
+      if (action.app_id) {
+        return "only app.open actions may carry app_id";
       }
     }
   }
@@ -230,6 +249,7 @@ struct OrderedActionExecutor::Impl {
       result.requested_search_query = action.search_query;
       result.requested_search_type = action.search_type;
       result.requested_search_artist = action.search_artist;
+      result.requested_app_id = action.app_id;
 
       if (ledger.contains(action.action_id)) {
         result.status = ActionStatus::deduplicated;
@@ -280,6 +300,9 @@ struct OrderedActionExecutor::Impl {
               }
               if (!result.requested_search_artist) {
                 result.requested_search_artist = action.search_artist;
+              }
+              if (!result.requested_app_id) {
+                result.requested_app_id = action.app_id;
               }
             } catch (const std::exception& error) {
               result.status = ActionStatus::failed;

@@ -346,3 +346,56 @@ TEST_CASE("Executor validates and audits media.search_play parameters") {
   }
   search_executor.stop();
 }
+
+TEST_CASE("Executor strictly validates app.open app_id against path traversal and malformed IDs") {
+  auto backend = std::make_shared<FakeBackend>();
+  dvo::OrderedActionExecutor invalid_executor(backend);
+
+  for (const std::string bad_id : {
+           std::string{},
+           std::string{"../calc"},
+           std::string{"..\\Windows\\System32\\cmd.exe"},
+           std::string{"C:\\Windows\\notepad.exe"},
+           std::string{"steam/sub"},
+           std::string{"SteamUpper"},
+           std::string{".."},
+           std::string(65, 'a'),
+       }) {
+    CAPTURE(bad_id);
+    auto bad_plan = plan("invalid-app-" + std::to_string(bad_id.size()));
+    bad_plan.actions[0].type = dvo::ActionType::app_open;
+    bad_plan.actions[0].app_id = bad_id;
+    CHECK(invalid_executor.try_submit(std::move(bad_plan)).status ==
+          dvo::SubmitStatus::invalid_plan);
+  }
+
+  auto polluted_play = plan("invalid-play-with-app-id");
+  polluted_play.actions[0].type = dvo::ActionType::media_play;
+  polluted_play.actions[0].app_id = "steam";
+  CHECK(invalid_executor.try_submit(std::move(polluted_play)).status ==
+        dvo::SubmitStatus::invalid_plan);
+  CHECK(backend->call_count() == 0);
+  invalid_executor.stop();
+
+  std::mutex audit_mutex;
+  std::vector<dvo::ActionResult> audit_results;
+  dvo::OrderedActionExecutor app_executor(
+      backend, {}, [&](const dvo::ActionResult& r) {
+        std::scoped_lock lock(audit_mutex);
+        audit_results.push_back(r);
+      });
+  auto valid_app = plan("valid-app-open");
+  valid_app.actions[0].type = dvo::ActionType::app_open;
+  valid_app.actions[0].app_id = "steam";
+  valid_app.actions[0].app_display_name = "Steam";
+  REQUIRE(app_executor.try_submit(valid_app).accepted());
+  REQUIRE(app_executor.wait_until_idle(std::chrono::seconds(2)));
+  {
+    std::scoped_lock lock(audit_mutex);
+    REQUIRE(audit_results.size() == 2);
+    CHECK(audit_results[0].requested_app_id == "steam");
+    CHECK(audit_results[1].status == dvo::ActionStatus::succeeded);
+    CHECK(audit_results[1].requested_app_id == "steam");
+  }
+  app_executor.stop();
+}

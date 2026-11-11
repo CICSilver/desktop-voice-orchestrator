@@ -105,6 +105,14 @@ EvaluationTake parse_take(const nlohmann::json& value, std::size_t index) {
           artist != action.end() && artist->is_string()) {
         expected.search_artist = artist->get<std::string>();
       }
+      if (const auto app = action.find("app_id");
+          app != action.end() && app->is_string()) {
+        const auto app_str = app->get<std::string>();
+        if (!is_valid_app_id(app_str)) {
+          throw std::invalid_argument(where + " has an invalid app_id");
+        }
+        expected.app_id = app_str;
+      }
       take.expected_actions.push_back(std::move(expected));
     }
   }
@@ -380,6 +388,13 @@ bool actions_match(const nlohmann::json& actual,
       const auto artist = action.find("search_artist");
       if (artist == action.end() || !artist->is_string() ||
           artist->get<std::string>() != *expected[index].search_artist) {
+        return false;
+      }
+    }
+    if (expected[index].app_id) {
+      const auto app = action.find("app_id");
+      if (app == action.end() || !app->is_string() ||
+          app->get<std::string>() != *expected[index].app_id) {
         return false;
       }
     }
@@ -712,6 +727,10 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
                           {"search_artist",
                            action.search_artist
                                ? nlohmann::json(*action.search_artist)
+                               : nlohmann::json(nullptr)},
+                          {"app_id",
+                           action.app_id
+                               ? nlohmann::json(*action.app_id)
                                : nlohmann::json(nullptr)}});
     }
     nlohmann::json result = {{"id", take.id}, {"kind", take.kind}, {"status", take.status},

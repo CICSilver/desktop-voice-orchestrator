@@ -23,6 +23,7 @@ struct EvaluationExpectedAction {
   std::optional<std::string> search_query;
   std::optional<std::string> search_type;
   std::optional<std::string> search_artist;
+  std::optional<std::string> app_id;
 };
 
 struct EvaluationTake {

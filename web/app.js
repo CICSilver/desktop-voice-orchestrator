@@ -84,6 +84,9 @@ function parseActionLabel(action) {
     const delta = Number(action.volume_delta_percent || 0);
     return `音量${delta >= 0 ? '+' : ''}${delta}%`;
   }
+  if (action.type === 'app.open') {
+    return `打开应用：${action.app_display_name || action.app_id || ''}`;
+  }
   return action.type || '未知动作';
 }
 

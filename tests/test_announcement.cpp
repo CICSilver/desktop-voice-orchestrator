@@ -272,3 +272,21 @@ TEST_CASE("Slow announcement playback cannot block or reorder action execution")
   announcement_backend->release();
   REQUIRE(announcements.wait_until_idle(std::chrono::seconds(2)));
 }
+
+TEST_CASE("Action summaries format app.open actions with display name or app_id") {
+  dvo::PlannedAction named;
+  named.action_id = "a1";
+  named.sequence = 1;
+  named.type = dvo::ActionType::app_open;
+  named.app_id = "clash";
+  named.app_display_name = "Clash";
+
+  dvo::PlannedAction id_only;
+  id_only.action_id = "a2";
+  id_only.sequence = 2;
+  id_only.type = dvo::ActionType::app_open;
+  id_only.app_id = "steam";
+
+  CHECK(dvo::format_action_summary({named, id_only}) ==
+        "正在执行：打开应用 Clash，然后打开应用 steam");
+}

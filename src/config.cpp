@@ -1,12 +1,16 @@
 #include "dvo/config.h"
 
+#include <algorithm>
 #include <array>
+#include <cctype>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_set>
 
 #include <toml++/toml.hpp>
 
+#include "dvo/command.h"
 #include "dvo/command_parser.h"
 
 namespace dvo {
@@ -66,14 +70,98 @@ void assign_if(const nlohmann::json& object, const char* key, T& value) {
   if (const auto it = object.find(key); it != object.end()) value = it->get<T>();
 }
 
+std::string path_to_utf8(const std::filesystem::path& value) {
+  const auto u8 = value.generic_u8string();
+  return std::string(reinterpret_cast<const char*>(u8.data()), u8.size());
+}
+
 std::string toml_string(std::string_view value) {
   std::string result{"\""};
   for (const auto ch : value) {
-    if (ch == '\\' || ch == '\"') result.push_back('\\');
-    result.push_back(ch);
+    if (ch == '\\' || ch == '\"') {
+      result.push_back('\\');
+      result.push_back(ch);
+    } else if (ch == '\n') {
+      result += "\\n";
+    } else if (ch == '\r') {
+      result += "\\r";
+    } else if (ch == '\t') {
+      result += "\\t";
+    } else {
+      result.push_back(ch);
+    }
   }
   result.push_back('\"');
   return result;
+}
+
+std::string toml_key(std::string_view key) {
+  if (key.empty()) return "\"\"";
+  const bool bare = std::all_of(key.begin(), key.end(), [](unsigned char ch) {
+    return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+           (ch >= '0' && ch <= '9') || ch == '_' || ch == '-';
+  });
+  return bare ? std::string(key) : toml_string(key);
+}
+
+bool is_valid_env_var_name(std::string_view name) {
+  if (name.empty() || name.size() > 128) return false;
+  const auto first = static_cast<unsigned char>(name.front());
+  const bool first_ok =
+      (first >= 'A' && first <= 'Z') || (first >= 'a' && first <= 'z') || first == '_';
+  if (!first_ok) return false;
+  for (std::size_t i = 1; i < name.size(); ++i) {
+    const auto ch = static_cast<unsigned char>(name[i]);
+    const bool ok = (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+                    (ch >= '0' && ch <= '9') || ch == '_';
+    if (!ok) return false;
+  }
+  return true;
+}
+
+bool is_valid_http_base_url(std::string_view url) {
+  if (url.empty() || url.size() > 512) return false;
+  for (const unsigned char ch : url) {
+    if (ch <= 0x20 || ch == 0x7F) return false;
+  }
+  std::string_view rest;
+  if (url.starts_with("https://")) {
+    rest = url.substr(8);
+  } else if (url.starts_with("http://")) {
+    rest = url.substr(7);
+  } else {
+    return false;
+  }
+  return !rest.empty() && rest.front() != '/';
+}
+
+bool is_non_blank_token(std::string_view value, std::size_t max_len) {
+  if (value.empty() || value.size() > max_len) return false;
+  bool has_visible = false;
+  for (const unsigned char ch : value) {
+    if (ch < 0x20 || ch == 0x7F) return false;
+    if (!std::isspace(ch)) has_visible = true;
+  }
+  return has_visible;
+}
+
+nlohmann::json apps_to_json(const AppsConfig& apps) {
+  nlohmann::json entries = nlohmann::json::array();
+  for (const auto& entry : apps.entries) {
+    entries.push_back({
+        {"id", entry.id},
+        {"display_name", entry.display_name},
+        {"target", path_to_utf8(entry.target)},
+        {"arguments", entry.arguments},
+        {"aliases", entry.aliases},
+        {"process_names", entry.process_names},
+    });
+  }
+  return {
+      {"quickstart_dirs", apps.quickstart_dirs},
+      {"scan_system_apps", apps.scan_system_apps},
+      {"entries", std::move(entries)},
+  };
 }
 
 std::string toml_array(const std::vector<std::string>& values) {
@@ -224,6 +312,16 @@ AppConfig ConfigStore::load() const {
   c.commands.enabled = read<bool>(table, "commands.enabled", true);
   c.commands.parser_mode = read<std::string>(table, "commands.parser_mode", "rules");
   c.commands.router_backend = read<std::string>(table, "commands.router_backend", "none");
+  c.commands.router_base_url =
+      read<std::string>(table, "commands.router_base_url", "https://api.openai.com/v1");
+  c.commands.router_model =
+      read<std::string>(table, "commands.router_model", "gpt-4o-mini");
+  c.commands.router_api_key_env =
+      read<std::string>(table, "commands.router_api_key_env", "OPENAI_API_KEY");
+  c.commands.router_timeout_ms = static_cast<std::uint32_t>(
+      read<std::int64_t>(table, "commands.router_timeout_ms", 2500));
+  c.commands.router_structured_outputs =
+      read<bool>(table, "commands.router_structured_outputs", true);
   c.commands.default_volume_step_percent =
       read<std::int64_t>(table, "commands.default_volume_step_percent", 5);
   c.commands.max_spoken_volume_step_percent =
@@ -245,6 +343,37 @@ AppConfig ConfigStore::load() const {
   c.commands.connectors = read_strings(
       table, "commands.connectors",
       {"然后再", "然后", "再", "后", "接着", "并且", "以及", "和", "还有"});
+
+  c.apps.quickstart_dirs =
+      read_strings(table, "apps.quickstart_dirs", c.apps.quickstart_dirs);
+  c.apps.scan_system_apps = read<bool>(table, "apps.scan_system_apps", true);
+  if (const auto* entries_table = table.at_path("apps.entries").as_table()) {
+    for (const auto& [key, node] : *entries_table) {
+      const auto* sub = node.as_table();
+      if (!sub) continue;
+      AppEntryConfig entry;
+      entry.id = read<std::string>(*sub, "id", std::string(key.str()));
+      entry.display_name = read<std::string>(*sub, "display_name", entry.id);
+      entry.target = read_path(*sub, "target", {});
+      entry.arguments = read_strings(*sub, "arguments", {});
+      entry.aliases = read_strings(*sub, "aliases", {});
+      entry.process_names = read_strings(*sub, "process_names", {});
+      c.apps.entries.push_back(std::move(entry));
+    }
+  } else if (const auto* entries_array = table.at_path("apps.entries").as_array()) {
+    for (const auto& item : *entries_array) {
+      const auto* sub = item.as_table();
+      if (!sub) continue;
+      AppEntryConfig entry;
+      entry.id = read<std::string>(*sub, "id", "");
+      entry.display_name = read<std::string>(*sub, "display_name", entry.id);
+      entry.target = read_path(*sub, "target", {});
+      entry.arguments = read_strings(*sub, "arguments", {});
+      entry.aliases = read_strings(*sub, "aliases", {});
+      entry.process_names = read_strings(*sub, "process_names", {});
+      c.apps.entries.push_back(std::move(entry));
+    }
+  }
 
   c.netease.ncm_cli = resolve_optional(project_root_, read_path(table, "netease.ncm_cli", {}));
   c.netease.node = read_path(table, "netease.node", {});
@@ -384,8 +513,30 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
         "asr.fallback_model and asr.fallback_tokens are required for a fallback decoder");
   range(parse_command_parser_mode(c.commands.parser_mode).has_value(),
         "commands.parser_mode must be 'rules', 'hybrid' or 'router'");
-  range(c.commands.router_backend == "none",
-        "commands.router_backend must be 'none'");
+  range(c.commands.router_backend == "none" ||
+            c.commands.router_backend == "openai_compatible",
+        "commands.router_backend must be 'none' or 'openai_compatible'");
+  range(is_valid_http_base_url(c.commands.router_base_url),
+        "commands.router_base_url must be a valid http:// or https:// URL");
+  range(is_non_blank_token(c.commands.router_model, 128),
+        "commands.router_model must be a non-empty model identifier");
+  range(is_valid_env_var_name(c.commands.router_api_key_env),
+        "commands.router_api_key_env must be a valid environment variable name [A-Za-z_][A-Za-z0-9_]*");
+  range(c.commands.router_timeout_ms >= 200 && c.commands.router_timeout_ms <= 15000,
+        "commands.router_timeout_ms must be in [200, 15000]");
+  {
+    std::unordered_set<std::string> seen_app_ids;
+    for (const auto& entry : c.apps.entries) {
+      range(is_valid_app_id(entry.id),
+            "apps.entries id '" + entry.id + "' must match [a-z0-9_.-] without path separators");
+      if (!entry.id.empty()) {
+        range(seen_app_ids.insert(entry.id).second,
+              "apps.entries contains duplicate id '" + entry.id + "'");
+      }
+      range(is_non_blank_token(entry.display_name, 128),
+            "apps.entries '" + entry.id + "' display_name must not be empty");
+    }
+  }
   range(c.commands.default_volume_step_percent >= 1 &&
             c.commands.default_volume_step_percent <= c.commands.max_spoken_volume_step_percent,
         "commands.default_volume_step_percent must be within the spoken volume range");
@@ -503,6 +654,11 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
       {"commands", {{"enabled", c.commands.enabled},
                     {"parser_mode", c.commands.parser_mode},
                     {"router_backend", c.commands.router_backend},
+                    {"router_base_url", c.commands.router_base_url},
+                    {"router_model", c.commands.router_model},
+                    {"router_api_key_env", c.commands.router_api_key_env},
+                    {"router_timeout_ms", c.commands.router_timeout_ms},
+                    {"router_structured_outputs", c.commands.router_structured_outputs},
                     {"default_volume_step_percent", c.commands.default_volume_step_percent},
                     {"max_spoken_volume_step_percent", c.commands.max_spoken_volume_step_percent},
                     {"max_actions_per_utterance", c.commands.max_actions_per_utterance},
@@ -515,6 +671,7 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                                    {"volume_up", c.commands.volume_up_phrases},
                                    {"volume_down", c.commands.volume_down_phrases}}},
                      {"connectors", c.commands.connectors}}},
+      {"apps", apps_to_json(c.apps)},
       {"announcements", {{"enabled", c.announcements.enabled},
                           {"backend", c.announcements.backend},
                           {"queue_capacity", c.announcements.queue_capacity},
@@ -622,6 +779,11 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
       {"commands", {{"enabled", c.commands.enabled},
                     {"parser_mode", c.commands.parser_mode},
                     {"router_backend", c.commands.router_backend},
+                    {"router_base_url", c.commands.router_base_url},
+                    {"router_model", c.commands.router_model},
+                    {"router_api_key_env", c.commands.router_api_key_env},
+                    {"router_timeout_ms", c.commands.router_timeout_ms},
+                    {"router_structured_outputs", c.commands.router_structured_outputs},
                     {"default_volume_step_percent", c.commands.default_volume_step_percent},
                     {"max_spoken_volume_step_percent", c.commands.max_spoken_volume_step_percent},
                     {"max_actions_per_utterance", c.commands.max_actions_per_utterance},
@@ -632,6 +794,7 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                                   {"volume_up", c.commands.volume_up_phrases},
                                   {"volume_down", c.commands.volume_down_phrases}}},
                     {"connectors", c.commands.connectors}}},
+      {"apps", apps_to_json(c.apps)},
       {"netease", {{"ncm_cli", c.netease.ncm_cli.string()},
                    {"node", c.netease.node.string()},
                    {"client_data", c.netease.client_data.string()},
@@ -745,6 +908,11 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
       assign_if(*it, "enabled", candidate.commands.enabled);
       assign_if(*it, "parser_mode", candidate.commands.parser_mode);
       assign_if(*it, "router_backend", candidate.commands.router_backend);
+      assign_if(*it, "router_base_url", candidate.commands.router_base_url);
+      assign_if(*it, "router_model", candidate.commands.router_model);
+      assign_if(*it, "router_api_key_env", candidate.commands.router_api_key_env);
+      assign_if(*it, "router_timeout_ms", candidate.commands.router_timeout_ms);
+      assign_if(*it, "router_structured_outputs", candidate.commands.router_structured_outputs);
       assign_if(*it, "default_volume_step_percent", candidate.commands.default_volume_step_percent);
       assign_if(*it, "max_spoken_volume_step_percent", candidate.commands.max_spoken_volume_step_percent);
       assign_if(*it, "max_actions_per_utterance", candidate.commands.max_actions_per_utterance);
@@ -766,6 +934,30 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
         for (const auto& [key, member] : kOptionalPhrases) {
           assign_if(*phrases, key, candidate.commands.*member);
         }
+      }
+    }
+    if (const auto it = patch.find("apps"); it != patch.end()) {
+      assign_if(*it, "quickstart_dirs", candidate.apps.quickstart_dirs);
+      assign_if(*it, "scan_system_apps", candidate.apps.scan_system_apps);
+      if (const auto entries = it->find("entries"); entries != it->end()) {
+        std::vector<AppEntryConfig> parsed_entries;
+        for (const auto& item : *entries) {
+          AppEntryConfig entry;
+          assign_if(item, "id", entry.id);
+          entry.display_name = entry.id;
+          assign_if(item, "display_name", entry.display_name);
+          if (const auto target_it = item.find("target"); target_it != item.end()) {
+            const auto target_utf8 = target_it->get<std::string>();
+            entry.target = std::filesystem::path(std::u8string_view(
+                reinterpret_cast<const char8_t*>(target_utf8.data()),
+                target_utf8.size()));
+          }
+          assign_if(item, "arguments", entry.arguments);
+          assign_if(item, "aliases", entry.aliases);
+          assign_if(item, "process_names", entry.process_names);
+          parsed_entries.push_back(std::move(entry));
+        }
+        candidate.apps.entries = std::move(parsed_entries);
       }
     }
     if (const auto it = patch.find("announcements"); it != patch.end()) {
@@ -857,6 +1049,12 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
   out << "[commands]\nenabled = " << (c.commands.enabled ? "true" : "false")
        << "\nparser_mode = " << toml_string(c.commands.parser_mode)
        << "\nrouter_backend = " << toml_string(c.commands.router_backend)
+       << "\nrouter_base_url = " << toml_string(c.commands.router_base_url)
+       << "\nrouter_model = " << toml_string(c.commands.router_model)
+       << "\nrouter_api_key_env = " << toml_string(c.commands.router_api_key_env)
+       << "\nrouter_timeout_ms = " << c.commands.router_timeout_ms
+       << "\nrouter_structured_outputs = "
+       << (c.commands.router_structured_outputs ? "true" : "false")
        << "\ndefault_volume_step_percent = " << c.commands.default_volume_step_percent
        << "\nmax_spoken_volume_step_percent = " << c.commands.max_spoken_volume_step_percent
        << "\nmax_actions_per_utterance = " << c.commands.max_actions_per_utterance
@@ -871,6 +1069,16 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
     out << "\n" << key << " = " << toml_array(c.commands.*member);
   }
   out << "\n\n";
+  out << "[apps]\nquickstart_dirs = " << toml_array(c.apps.quickstart_dirs)
+      << "\nscan_system_apps = " << (c.apps.scan_system_apps ? "true" : "false") << "\n\n";
+  for (const auto& entry : c.apps.entries) {
+    out << "[apps.entries." << toml_key(entry.id) << "]\n"
+        << "display_name = " << toml_string(entry.display_name) << "\n"
+        << "target = " << toml_string(path_to_utf8(entry.target)) << "\n"
+        << "arguments = " << toml_array(entry.arguments) << "\n"
+        << "aliases = " << toml_array(entry.aliases) << "\n"
+        << "process_names = " << toml_array(entry.process_names) << "\n\n";
+  }
   out << "[netease]\nncm_cli = " << toml_string(c.netease.ncm_cli.generic_string())
       << "\nnode = " << toml_string(c.netease.node.generic_string())
       << "\nclient_data = " << toml_string(c.netease.client_data.generic_string())

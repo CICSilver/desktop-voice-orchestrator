@@ -158,8 +158,18 @@ fallback_tokens = "models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.tx
 enabled = true
 # 热：解析模式："rules"（仅本地规则）、"hybrid"（规则快通道优先，未覆盖表达转纯规划路由器）、"router"（仅纯规划路由器）。
 parser_mode = "rules"
-# 冷：纯规划路由器后端；默认 "none" 保持零外部网络请求安全。
+# 冷：纯规划路由器后端："none"（零外部网络请求）或 "openai_compatible"（原生 WinHTTP OpenAI 兼容接口）。
 router_backend = "none"
+# 热：OpenAI 兼容接口根地址（支持云端 https://... 或本机 http://127.0.0.1:<port>/v1，自动拼接 /chat/completions）。
+router_base_url = "https://api.openai.com/v1"
+# 热：路由模型名称（例如 gpt-4o-mini、qwen2.5-1.5b-instruct 等）。
+router_model = "gpt-4o-mini"
+# 冷：存放 API Key 的系统环境变量名（严禁在此处直接填写密钥值！本机回环无密钥时自动降级占位）。
+router_api_key_env = "OPENAI_API_KEY"
+# 热：路由器单次请求严格总截止时间（毫秒），合法范围 200..15000。
+router_timeout_ms = 2500
+# 热：是否启用 OpenAI Strict Structured Outputs（json_schema）；旧本地推理端不支持时可设为 false 退回 json_object。
+router_structured_outputs = true
 # 热：未口述数值时调整的Windows音量滑块百分点。
 default_volume_step_percent = 5
 # 热：口述相对幅度上限；合法范围1..20，超范围整句拒绝。
@@ -195,6 +205,50 @@ mode_shuffle = ["随机播放"]
 # 再核对窗口状态，所以是“设为开/关”而不是切换；不需要控制通道。说法待补充，留空即不启用。
 lyrics_show = []
 lyrics_hide = []
+
+[apps]
+# 冷：第一优先级快捷目录扫描（支持 %USERPROFILE%、%APPDATA%、%LOCALAPPDATA% 等环境变量展开，扫描 .lnk/.exe/.bat/.cmd）。
+quickstart_dirs = [
+  "%USERPROFILE%/QuickStart",
+  "%APPDATA%/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar"
+]
+# 冷：二级兜底扫描开始菜单 Programs（一层/二层 .lnk）与注册表 App Paths，自动过滤 Uninstall/卸载/Readme/Help/Updater。
+scan_system_apps = true
+
+[apps.entries.powershell]
+display_name = "PowerShell"
+target = "powershell.exe"
+arguments = []
+aliases = ["powershell", "终端", "命令行"]
+process_names = ["pwsh.exe", "powershell.exe", "WindowsTerminal.exe"]
+
+[apps.entries.steam]
+display_name = "Steam"
+target = ""
+arguments = []
+aliases = ["steam", "蒸汽平台", "死盯", "斯蒂姆"]
+process_names = ["steam.exe"]
+
+[apps.entries.clash]
+display_name = "Clash"
+target = ""
+arguments = []
+aliases = ["clash", "clash verge", "代理", "克拉什", "可拉什"]
+process_names = ["clash-verge.exe", "Clash for Windows.exe", "clashtray.exe", "mihomo-party.exe"]
+
+[apps.entries.discord]
+display_name = "Discord"
+target = ""
+arguments = []
+aliases = ["discord", "迪斯科", "迪斯扣", "迪斯科德"]
+process_names = ["Discord.exe"]
+
+[apps.entries.qq]
+display_name = "QQ"
+target = ""
+arguments = []
+aliases = ["qq", "腾讯qq", "扣扣"]
+process_names = ["QQ.exe"]
 
 [netease]
 # 冷：“收藏正在播放的歌”通过网易云官方 ncm-cli（npm 包 @music163/ncm-cli）完成，开放平台凭证和登录在 ncm-cli 中配置。

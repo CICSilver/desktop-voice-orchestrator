@@ -14,6 +14,7 @@ namespace dvo {
 inline constexpr std::size_t kMaxCommandActions = 8;
 inline constexpr const char* kCommandParserVersion = "rules.zh.v1";
 inline constexpr std::size_t kMaxMediaSearchTextBytes = 120;
+inline constexpr std::size_t kMaxAppIdBytes = 64;
 
 enum class ActionType {
   media_play,
@@ -34,6 +35,8 @@ enum class ActionType {
   media_lyrics_hide,
   // Searches NetEase Cloud Music for a song or playlist and starts playback.
   media_search_play,
+  // Activates a running window or launches a registered desktop application.
+  app_open,
 };
 
 enum class MediaSearchType {
@@ -74,6 +77,9 @@ struct PlannedAction {
   std::optional<std::string> search_query;
   std::optional<MediaSearchType> search_type;
   std::optional<std::string> search_artist;
+  // Only app_open uses these fields.
+  std::optional<std::string> app_id;
+  std::optional<std::string> app_display_name;
 };
 
 struct CommandPlan {
@@ -122,6 +128,7 @@ struct ActionResult {
   std::optional<std::string> requested_search_query;
   std::optional<MediaSearchType> requested_search_type;
   std::optional<std::string> requested_search_artist;
+  std::optional<std::string> requested_app_id;
   std::optional<double> volume_before;
   std::optional<double> volume_requested;
   std::optional<double> volume_after;
@@ -133,6 +140,8 @@ struct ActionResult {
 };
 
 [[nodiscard]] const char* to_string(ActionType type);
+[[nodiscard]] std::optional<ActionType> parse_action_type(std::string_view value);
+[[nodiscard]] bool is_valid_app_id(std::string_view app_id);
 [[nodiscard]] const char* to_string(MediaSearchType type);
 [[nodiscard]] std::optional<MediaSearchType> parse_media_search_type(std::string_view value);
 [[nodiscard]] const char* to_string(ExecutionSource source);

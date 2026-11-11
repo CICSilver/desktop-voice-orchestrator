@@ -295,3 +295,66 @@ TEST_CASE("hot config patch validates and saves an overlay") {
   REQUIRE_FALSE(result.ok());
   std::filesystem::remove_all(temp);
 }
+
+TEST_CASE("default app presets and OpenAI router configuration validate and persist without leaking keys") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  const auto temp = temporary_directory();
+  const auto local = temp / "config/local.toml";
+  dvo::ConfigStore store(root / "config/default.toml", local, root);
+  auto config = store.load();
+
+  CHECK(config.commands.router_backend == "none");
+  CHECK(config.commands.router_base_url == "https://api.openai.com/v1");
+  CHECK(config.commands.router_model == "gpt-4o-mini");
+  CHECK(config.commands.router_api_key_env == "OPENAI_API_KEY");
+  CHECK(config.commands.router_timeout_ms == 2500);
+  CHECK(config.commands.router_structured_outputs);
+  CHECK(config.apps.scan_system_apps);
+
+  const auto find_app = [&](std::string_view id) -> const dvo::AppEntryConfig* {
+    const auto it = std::ranges::find(config.apps.entries, id, &dvo::AppEntryConfig::id);
+    return it == config.apps.entries.end() ? nullptr : &(*it);
+  };
+  REQUIRE(find_app("powershell") != nullptr);
+  REQUIRE(find_app("steam") != nullptr);
+  REQUIRE(find_app("clash") != nullptr);
+  REQUIRE(find_app("discord") != nullptr);
+  REQUIRE(find_app("qq") != nullptr);
+  CHECK(find_app("powershell")->target.filename() == "powershell.exe");
+
+  REQUIRE(_putenv_s("DVO_TEST_ROUTER_ENV_SECRET", "sk-never-serialize-this-value") == 0);
+  auto patched = config;
+  REQUIRE(store.apply_patch(
+              patched,
+              {{"commands",
+                {{"parser_mode", "hybrid"},
+                 {"router_backend", "openai_compatible"},
+                 {"router_base_url", "http://127.0.0.1:11434/v1"},
+                 {"router_model", "qwen2.5:3b"},
+                 {"router_api_key_env", "DVO_TEST_ROUTER_ENV_SECRET"},
+                 {"router_timeout_ms", 1800},
+                 {"router_structured_outputs", false}}}})
+              .ok());
+
+  const auto pub_dump = store.to_public_json(patched).dump();
+  const auto manifest_dump = store.to_manifest_json(patched).dump();
+  CHECK(pub_dump.find("sk-never-serialize-this-value") == std::string::npos);
+  CHECK(manifest_dump.find("sk-never-serialize-this-value") == std::string::npos);
+
+  store.save_overrides(patched);
+  const auto reloaded = store.load();
+  CHECK(reloaded.commands.router_backend == "openai_compatible");
+  CHECK(reloaded.commands.router_base_url == "http://127.0.0.1:11434/v1");
+  CHECK(reloaded.commands.router_model == "qwen2.5:3b");
+  CHECK(reloaded.commands.router_api_key_env == "DVO_TEST_ROUTER_ENV_SECRET");
+  CHECK(reloaded.commands.router_timeout_ms == 1800);
+  CHECK_FALSE(reloaded.commands.router_structured_outputs);
+
+  auto bad = config;
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"router_timeout_ms", 50}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"router_timeout_ms", 20000}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"router_api_key_env", "sk-12345"}}}}).ok());
+
+  (void)_putenv_s("DVO_TEST_ROUTER_ENV_SECRET", "");
+  std::filesystem::remove_all(temp);
+}

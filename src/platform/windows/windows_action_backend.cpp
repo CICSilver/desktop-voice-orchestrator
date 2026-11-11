@@ -154,6 +154,7 @@ template <typename AsyncOperation>
     case ActionType::media_lyrics_show:
     case ActionType::media_lyrics_hide: return "netease.hotkey";
     case ActionType::media_search_play: return "netease.search_play";
+    case ActionType::app_open: return "windows.app";
     default: return "windows.gsmtc";
   }
 }
@@ -654,6 +655,168 @@ void open_orpheus_uri(std::string_view uri) {
   }
 }
 
+struct MatchedAppWindow {
+  HWND hwnd{};
+  std::string title;
+  bool iconic{};
+};
+
+struct WindowSearchContext {
+  const std::vector<std::wstring>* target_exe_names_lower{};
+  std::optional<MatchedAppWindow> best;
+};
+
+[[nodiscard]] std::wstring lower_wide_ascii(std::wstring_view input) {
+  std::wstring out;
+  out.reserve(input.size());
+  for (const wchar_t ch : input) {
+    if (ch >= L'A' && ch <= L'Z') {
+      out.push_back(static_cast<wchar_t>(ch - L'A' + L'a'));
+    } else {
+      out.push_back(ch);
+    }
+  }
+  return out;
+}
+
+BOOL CALLBACK enum_app_windows_proc(HWND hwnd, LPARAM lparam) {
+  auto* ctx = reinterpret_cast<WindowSearchContext*>(lparam);
+  if (!ctx || !ctx->target_exe_names_lower) return FALSE;
+
+  const BOOL visible = IsWindowVisible(hwnd);
+  const BOOL iconic = IsIconic(hwnd);
+  if (!visible && !iconic) return TRUE;
+  if (GetWindow(hwnd, GW_OWNER) != nullptr) return TRUE;
+  const LONG_PTR ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+  if ((ex_style & WS_EX_TOOLWINDOW) != 0) return TRUE;
+
+  const int title_len = GetWindowTextLengthW(hwnd);
+  if (title_len <= 0) return TRUE;
+
+  DWORD pid = 0;
+  GetWindowThreadProcessId(hwnd, &pid);
+  if (pid == 0) return TRUE;
+
+  HANDLE proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+  if (!proc) return TRUE;
+
+  std::array<wchar_t, MAX_PATH * 4> image_buf{};
+  DWORD image_size = static_cast<DWORD>(image_buf.size());
+  const BOOL queried = QueryFullProcessImageNameW(proc, 0, image_buf.data(), &image_size);
+  CloseHandle(proc);
+  if (!queried || image_size == 0) return TRUE;
+
+  const std::filesystem::path image_path(std::wstring_view(image_buf.data(), image_size));
+  const std::wstring exe_lower = lower_wide_ascii(image_path.filename().wstring());
+  const bool matched = std::ranges::any_of(
+      *ctx->target_exe_names_lower,
+      [&](const std::wstring& candidate) { return candidate == exe_lower; });
+  if (!matched) return TRUE;
+
+  std::wstring title_wide(static_cast<std::size_t>(title_len) + 1, L'\0');
+  const int copied = GetWindowTextW(hwnd, title_wide.data(), title_len + 1);
+  title_wide.resize(copied > 0 ? static_cast<std::size_t>(copied) : 0);
+  const std::string title_utf8 = winrt::to_string(winrt::hstring{title_wide});
+
+  MatchedAppWindow found{hwnd, title_utf8, iconic != FALSE};
+  if (!ctx->best.has_value() || (ctx->best->iconic && !found.iconic)) {
+    ctx->best = std::move(found);
+    if (!ctx->best->iconic) return FALSE;
+  }
+  return TRUE;
+}
+
+void activate_app_window(HWND hwnd) {
+  if (IsIconic(hwnd)) {
+    ShowWindow(hwnd, SW_RESTORE);
+  } else {
+    ShowWindow(hwnd, SW_SHOW);
+  }
+
+  const HWND foreground = GetForegroundWindow();
+  if (foreground == hwnd) return;
+
+  const DWORD current_tid = GetCurrentThreadId();
+  const DWORD foreground_tid =
+      foreground ? GetWindowThreadProcessId(foreground, nullptr) : 0;
+  bool attached = false;
+  if (foreground_tid != 0 && foreground_tid != current_tid) {
+    attached = AttachThreadInput(current_tid, foreground_tid, TRUE) != FALSE;
+  }
+
+  BringWindowToTop(hwnd);
+  if (!SetForegroundWindow(hwnd)) {
+    INPUT alt_up{};
+    alt_up.type = INPUT_KEYBOARD;
+    alt_up.ki.wVk = VK_MENU;
+    alt_up.ki.dwFlags = KEYEVENTF_KEYUP;
+    SendInput(1, &alt_up, sizeof(INPUT));
+    BringWindowToTop(hwnd);
+    SetForegroundWindow(hwnd);
+  }
+
+  if (attached) {
+    AttachThreadInput(current_tid, foreground_tid, FALSE);
+  }
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> query_app_paths_executable(
+    const std::wstring& exe_name) {
+  const std::wstring subkey =
+      L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\" + exe_name;
+  for (const HKEY root : {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE}) {
+    DWORD size = 0;
+    if (RegGetValueW(root, subkey.c_str(), nullptr, RRF_RT_REG_SZ | RRF_NOEXPAND,
+                     nullptr, nullptr, &size) != ERROR_SUCCESS ||
+        size == 0) {
+      continue;
+    }
+    std::wstring raw(size / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(root, subkey.c_str(), nullptr, RRF_RT_REG_SZ,
+                     nullptr, raw.data(), &size) != ERROR_SUCCESS) {
+      continue;
+    }
+    raw.resize(wcslen(raw.c_str()));
+    if (raw.size() >= 2 && raw.front() == L'"' && raw.back() == L'"') {
+      raw = raw.substr(1, raw.size() - 2);
+    }
+    std::error_code ec;
+    std::filesystem::path candidate(raw);
+    if (!candidate.empty() && std::filesystem::exists(candidate, ec)) {
+      return candidate;
+    }
+  }
+  return std::nullopt;
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> resolve_app_launch_path(
+    const AppCatalogEntry& entry) {
+  if (entry.target.empty()) return std::nullopt;
+  const std::filesystem::path expanded = expand_windows_path(entry.target);
+  if (expanded.empty()) return std::nullopt;
+
+  std::error_code ec;
+  if (expanded.has_parent_path()) {
+    if (std::filesystem::exists(expanded, ec)) return expanded;
+    return std::nullopt;
+  }
+
+  const std::wstring filename = expanded.wstring();
+  std::array<wchar_t, MAX_PATH * 4> search_buf{};
+  const DWORD found_len = SearchPathW(
+      nullptr, filename.c_str(),
+      expanded.has_extension() ? nullptr : L".exe",
+      static_cast<DWORD>(search_buf.size()), search_buf.data(), nullptr);
+  if (found_len > 0 && found_len < search_buf.size()) {
+    std::filesystem::path located(std::wstring_view(search_buf.data(), found_len));
+    if (std::filesystem::exists(located, ec)) return located;
+  }
+
+  std::wstring lookup_exe = filename;
+  if (!expanded.has_extension()) lookup_exe += L".exe";
+  return query_app_paths_executable(lookup_exe);
+}
+
 class WindowsActionBackend final : public IActionBackend {
  public:
   explicit WindowsActionBackend(WindowsActionConfig config) : config_(std::move(config)) {}
@@ -690,6 +853,7 @@ class WindowsActionBackend final : public IActionBackend {
         case ActionType::media_lyrics_show: return set_desktop_lyrics(true, stop);
         case ActionType::media_lyrics_hide: return set_desktop_lyrics(false, stop);
         case ActionType::media_search_play: return search_and_play(action, stop);
+        case ActionType::app_open: return open_app(action, stop);
       }
     } catch (const ActionTimeoutError& error) {
       return failure(action.type, adapter_for(action.type), "action_timeout", error.what());
@@ -1328,6 +1492,107 @@ class WindowsActionBackend final : public IActionBackend {
     }
     result.status = ActionStatus::succeeded;
     result.message = "endpoint master volume changed and was verified by read-back";
+    return result;
+  }
+
+  [[nodiscard]] ActionResult open_app(const PlannedAction& action,
+                                      std::stop_token stop) const {
+    if (!action.app_id || !is_valid_app_id(*action.app_id)) {
+      return failure(ActionType::app_open, "windows.app", "invalid_app_id",
+                     "app.open requires a valid app_id");
+    }
+    if (!config_.app_catalog) {
+      return failure(ActionType::app_open, "windows.app", "catalog_unavailable",
+                     "AppCatalog is not configured in WindowsActionBackend");
+    }
+    const auto* entry = config_.app_catalog->find_by_id(*action.app_id);
+    if (!entry) {
+      auto err = failure(ActionType::app_open, "windows.app", "unknown_app",
+                         "application is not registered in AppCatalog: " + *action.app_id);
+      err.requested_app_id = *action.app_id;
+      return err;
+    }
+
+    if (stop.stop_requested()) throw ActionCancelledError{};
+
+    std::vector<std::wstring> target_exe_names;
+    const auto add_exe_name = [&](const std::wstring& raw_name) {
+      if (raw_name.empty()) return;
+      auto lowered = lower_wide_ascii(raw_name);
+      if (std::ranges::find(target_exe_names, lowered) == target_exe_names.end()) {
+        target_exe_names.push_back(std::move(lowered));
+      }
+    };
+    for (const auto& proc_name : entry->process_names) {
+      add_exe_name(wide(proc_name));
+    }
+    if (!entry->target.empty()) {
+      const auto ext_lower = lower_wide_ascii(entry->target.extension().wstring());
+      if (ext_lower == L".exe") {
+        add_exe_name(entry->target.filename().wstring());
+      }
+    }
+
+    if (!target_exe_names.empty()) {
+      WindowSearchContext search_ctx{&target_exe_names, std::nullopt};
+      EnumWindows(enum_app_windows_proc, reinterpret_cast<LPARAM>(&search_ctx));
+      if (search_ctx.best.has_value()) {
+        activate_app_window(search_ctx.best->hwnd);
+        ActionResult result;
+        result.type = ActionType::app_open;
+        result.status = ActionStatus::succeeded;
+        result.adapter = "windows.app";
+        result.target_id = entry->id;
+        result.requested_app_id = entry->id;
+        result.verified = true;
+        result.message = "activated running window: " + search_ctx.best->title;
+        return result;
+      }
+    }
+
+    if (stop.stop_requested()) throw ActionCancelledError{};
+
+    const auto launch_path = resolve_app_launch_path(*entry);
+    if (!launch_path.has_value()) {
+      auto err = failure(
+          ActionType::app_open, "windows.app", "app_not_installed",
+          "application is neither running nor installed on this machine: " +
+              entry->display_name + " (" + entry->id + ")");
+      err.target_id = entry->id;
+      err.requested_app_id = entry->id;
+      return err;
+    }
+
+    const std::wstring wide_file = launch_path->wstring();
+    const std::wstring wide_dir = launch_path->has_parent_path()
+                                      ? launch_path->parent_path().wstring()
+                                      : std::wstring{};
+    std::wstring wide_params;
+    for (std::size_t i = 0; i < entry->arguments.size(); ++i) {
+      if (i != 0) wide_params.push_back(L' ');
+      wide_params += quote_argument(wide(entry->arguments[i]));
+    }
+
+    SHELLEXECUTEINFOW exec_info{};
+    exec_info.cbSize = sizeof(exec_info);
+    exec_info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+    exec_info.lpVerb = L"open";
+    exec_info.lpFile = wide_file.c_str();
+    exec_info.lpParameters = wide_params.empty() ? nullptr : wide_params.c_str();
+    exec_info.lpDirectory = wide_dir.empty() ? nullptr : wide_dir.c_str();
+    exec_info.nShow = SW_SHOWNORMAL;
+    if (!ShellExecuteExW(&exec_info)) {
+      winrt::throw_last_error();
+    }
+
+    ActionResult result;
+    result.type = ActionType::app_open;
+    result.status = ActionStatus::succeeded;
+    result.adapter = "windows.app";
+    result.target_id = entry->id;
+    result.requested_app_id = entry->id;
+    result.verified = true;
+    result.message = "launched application: " + entry->display_name;
     return result;
   }
 

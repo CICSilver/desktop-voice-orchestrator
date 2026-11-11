@@ -17,8 +17,39 @@ const char* to_string(ActionType type) {
     case ActionType::media_lyrics_show: return "media.lyrics.show";
     case ActionType::media_lyrics_hide: return "media.lyrics.hide";
     case ActionType::media_search_play: return "media.search_play";
+    case ActionType::app_open: return "app.open";
   }
   return "unknown";
+}
+
+std::optional<ActionType> parse_action_type(std::string_view value) {
+  if (value == "media.play") return ActionType::media_play;
+  if (value == "media.pause") return ActionType::media_pause;
+  if (value == "audio.volume.adjust") return ActionType::master_volume_adjust;
+  if (value == "media.next") return ActionType::media_next;
+  if (value == "media.like") return ActionType::media_like;
+  if (value == "media.play_daily") return ActionType::media_play_daily;
+  if (value == "media.mode.order") return ActionType::media_mode_order;
+  if (value == "media.mode.list_loop") return ActionType::media_mode_list_loop;
+  if (value == "media.mode.single_loop") return ActionType::media_mode_single_loop;
+  if (value == "media.mode.shuffle") return ActionType::media_mode_shuffle;
+  if (value == "media.lyrics.show") return ActionType::media_lyrics_show;
+  if (value == "media.lyrics.hide") return ActionType::media_lyrics_hide;
+  if (value == "media.search_play") return ActionType::media_search_play;
+  if (value == "app.open") return ActionType::app_open;
+  return std::nullopt;
+}
+
+bool is_valid_app_id(std::string_view app_id) {
+  if (app_id.empty() || app_id.size() > kMaxAppIdBytes) return false;
+  if (app_id.front() == '.' || app_id.back() == '.') return false;
+  if (app_id.find("..") != std::string_view::npos) return false;
+  for (const char ch : app_id) {
+    const bool ok = (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') ||
+                    ch == '_' || ch == '-' || ch == '.';
+    if (!ok) return false;
+  }
+  return true;
 }
 
 const char* to_string(MediaSearchType type) {

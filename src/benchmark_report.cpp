@@ -253,7 +253,9 @@ nlohmann::json command_plans(const std::vector<nlohmann::json>& events) {
                            {"search_type",
                             nullable_value(action, "search_type")},
                            {"search_artist",
-                            nullable_value(action, "search_artist")}});
+                            nullable_value(action, "search_artist")},
+                           {"app_id",
+                            nullable_value(action, "app_id")}});
       }
     }
     result.push_back({{"utterance_id", string_value(payload, "utterance_id")},
@@ -314,6 +316,8 @@ nlohmann::json dry_run_actions(const std::vector<nlohmann::json>& events) {
                         nullable_value(payload, "requested_search_type")},
                        {"requested_search_artist",
                         nullable_value(payload, "requested_search_artist")},
+                       {"requested_app_id",
+                        nullable_value(payload, "requested_app_id")},
                        {"message", string_value(payload, "message")}});
   }
   return {{"terminal_count", terminal_count},
@@ -508,7 +512,9 @@ nlohmann::json summarize_replayed_utterances(
                            {"search_type",
                             nullable_value(action, "search_type")},
                            {"search_artist",
-                            nullable_value(action, "search_artist")}});
+                            nullable_value(action, "search_artist")},
+                           {"app_id",
+                            nullable_value(action, "app_id")}});
       }
       record["actions"] = std::move(actions);
     } else if (type == "command_rejected") {

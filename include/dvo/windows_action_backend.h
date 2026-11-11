@@ -6,6 +6,7 @@
 #include <string>
 
 #include "dvo/action_executor.h"
+#include "dvo/app_catalog.h"
 
 namespace dvo {
 
@@ -35,6 +36,7 @@ struct WindowsActionConfig {
   // calls are synchronous and can only report their measured duration.
   std::uint32_t action_timeout_ms{2000};
   NeteaseActionConfig netease;
+  std::shared_ptr<const AppCatalog> app_catalog;
 };
 
 // The returned backend is invoked on OrderedActionExecutor's dedicated worker

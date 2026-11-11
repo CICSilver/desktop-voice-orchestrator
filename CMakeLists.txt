@@ -44,6 +44,8 @@ add_library(dvo_core STATIC
   src/streaming_recognizer.cpp
   src/command.cpp
   src/command_parser.cpp
+  src/app_catalog.cpp
+  src/openai_router.cpp
   src/netease.cpp
   src/netease_cdp.cpp
   src/action_executor.cpp
@@ -78,10 +80,13 @@ target_link_libraries(dvo_core
     nlohmann_json::nlohmann_json
     tomlplusplus::tomlplusplus
   PRIVATE
+    advapi32
     avrt
     ole32
     propsys
     runtimeobject
+    shell32
+    user32
     bcrypt
     winhttp
     # The Windows SDK's system SQLite, used read-only on the NetEase client's database.
@@ -132,7 +137,9 @@ if(BUILD_TESTING AND DVO_BUILD_TESTS)
     tests/test_inference.cpp
     tests/test_audio.cpp
     tests/test_streaming_recognizer.cpp
+    tests/test_app_catalog.cpp
     tests/test_command_parser.cpp
+    tests/test_openai_router.cpp
     tests/test_netease.cpp
     tests/test_action_executor.cpp
     tests/test_benchmark_report.cpp

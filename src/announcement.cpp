@@ -97,6 +97,15 @@ namespace {
       }
       return "播放歌曲 " + *action.search_query;
     }
+    case ActionType::app_open: {
+      if (action.app_display_name && !action.app_display_name->empty()) {
+        return "打开应用 " + *action.app_display_name;
+      }
+      if (action.app_id && !action.app_id->empty()) {
+        return "打开应用 " + *action.app_id;
+      }
+      return "打开应用";
+    }
   }
   return "未知操作";
 }
