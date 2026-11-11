@@ -61,11 +61,55 @@ struct CommandGrammar {
   std::size_t max_actions_per_utterance{kMaxCommandActions};
 };
 
+enum class CommandParserMode {
+  rules,
+  hybrid,
+  router,
+};
+
+[[nodiscard]] const char* to_string(CommandParserMode mode);
+[[nodiscard]] std::optional<CommandParserMode> parse_command_parser_mode(
+    std::string_view value);
+
+struct LlmRouteRequest {
+  std::string raw_text;
+  std::string stripped_text;
+  std::string wake_word;
+  std::string wake_position;
+  UtteranceOrigin origin{UtteranceOrigin::keyword};
+  std::size_t max_actions{kMaxCommandActions};
+  int default_volume_delta_percent{5};
+  int maximum_volume_delta_percent{20};
+};
+
+struct ProposedAction {
+  ActionType type{ActionType::media_play};
+  std::optional<int> volume_delta_percent;
+  std::optional<std::string> search_query;
+  std::optional<MediaSearchType> search_type;
+  std::optional<std::string> search_artist;
+};
+
+struct LlmRouteResult {
+  std::vector<ProposedAction> actions;
+  std::optional<CommandParseError> error;
+  std::string router_name;
+};
+
+class ILlmCommandRouter {
+ public:
+  virtual ~ILlmCommandRouter() = default;
+  [[nodiscard]] virtual LlmRouteResult route(
+      const LlmRouteRequest& request) const = 0;
+};
+
 class CommandParser {
  public:
   explicit CommandParser(int default_volume_delta_percent = 5,
                          int maximum_volume_delta_percent = 20,
-                         CommandGrammar grammar = {});
+                         CommandGrammar grammar = {},
+                         CommandParserMode mode = CommandParserMode::rules,
+                         std::shared_ptr<const ILlmCommandRouter> router = nullptr);
 
   [[nodiscard]] CommandParseResult parse(
       std::string_view text, const CommandParseContext& context) const;
@@ -79,12 +123,15 @@ class CommandParser {
   [[nodiscard]] std::size_t max_actions_per_utterance() const {
     return max_actions_per_utterance_;
   }
+  [[nodiscard]] CommandParserMode mode() const { return mode_; }
 
  private:
   struct Impl;
   int default_volume_delta_percent_;
   int maximum_volume_delta_percent_;
   std::size_t max_actions_per_utterance_;
+  CommandParserMode mode_{CommandParserMode::rules};
+  std::shared_ptr<const ILlmCommandRouter> router_;
   std::shared_ptr<const Impl> impl_;
 };
 

@@ -20,6 +20,9 @@ namespace dvo {
 struct EvaluationExpectedAction {
   std::string type;
   std::optional<int> volume_delta_percent;
+  std::optional<std::string> search_query;
+  std::optional<std::string> search_type;
+  std::optional<std::string> search_artist;
 };
 
 struct EvaluationTake {

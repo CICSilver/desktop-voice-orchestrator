@@ -222,6 +222,8 @@ AppConfig ConfigStore::load() const {
   c.asr.fallback_tokens = resolve_optional(project_root_, read_path(table, "asr.fallback_tokens", {}));
 
   c.commands.enabled = read<bool>(table, "commands.enabled", true);
+  c.commands.parser_mode = read<std::string>(table, "commands.parser_mode", "rules");
+  c.commands.router_backend = read<std::string>(table, "commands.router_backend", "none");
   c.commands.default_volume_step_percent =
       read<std::int64_t>(table, "commands.default_volume_step_percent", 5);
   c.commands.max_spoken_volume_step_percent =
@@ -380,6 +382,10 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
   range(c.asr.fallback_decoder == "none" ||
             (!c.asr.fallback_model.empty() && !c.asr.fallback_tokens.empty()),
         "asr.fallback_model and asr.fallback_tokens are required for a fallback decoder");
+  range(parse_command_parser_mode(c.commands.parser_mode).has_value(),
+        "commands.parser_mode must be 'rules', 'hybrid' or 'router'");
+  range(c.commands.router_backend == "none",
+        "commands.router_backend must be 'none'");
   range(c.commands.default_volume_step_percent >= 1 &&
             c.commands.default_volume_step_percent <= c.commands.max_spoken_volume_step_percent,
         "commands.default_volume_step_percent must be within the spoken volume range");
@@ -495,6 +501,8 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                {"final_decoder", c.asr.final_decoder},
                {"fallback_decoder", c.asr.fallback_decoder}}},
       {"commands", {{"enabled", c.commands.enabled},
+                    {"parser_mode", c.commands.parser_mode},
+                    {"router_backend", c.commands.router_backend},
                     {"default_volume_step_percent", c.commands.default_volume_step_percent},
                     {"max_spoken_volume_step_percent", c.commands.max_spoken_volume_step_percent},
                     {"max_actions_per_utterance", c.commands.max_actions_per_utterance},
@@ -612,6 +620,8 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                {"fallback_model", c.asr.fallback_model.string()},
                {"fallback_tokens", c.asr.fallback_tokens.string()}}},
       {"commands", {{"enabled", c.commands.enabled},
+                    {"parser_mode", c.commands.parser_mode},
+                    {"router_backend", c.commands.router_backend},
                     {"default_volume_step_percent", c.commands.default_volume_step_percent},
                     {"max_spoken_volume_step_percent", c.commands.max_spoken_volume_step_percent},
                     {"max_actions_per_utterance", c.commands.max_actions_per_utterance},
@@ -733,6 +743,8 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
     }
     if (const auto it = patch.find("commands"); it != patch.end()) {
       assign_if(*it, "enabled", candidate.commands.enabled);
+      assign_if(*it, "parser_mode", candidate.commands.parser_mode);
+      assign_if(*it, "router_backend", candidate.commands.router_backend);
       assign_if(*it, "default_volume_step_percent", candidate.commands.default_volume_step_percent);
       assign_if(*it, "max_spoken_volume_step_percent", candidate.commands.max_spoken_volume_step_percent);
       assign_if(*it, "max_actions_per_utterance", candidate.commands.max_actions_per_utterance);
@@ -843,6 +855,8 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
       << "\nfallback_model = " << toml_string(c.asr.fallback_model.generic_string())
       << "\nfallback_tokens = " << toml_string(c.asr.fallback_tokens.generic_string()) << "\n\n";
   out << "[commands]\nenabled = " << (c.commands.enabled ? "true" : "false")
+       << "\nparser_mode = " << toml_string(c.commands.parser_mode)
+       << "\nrouter_backend = " << toml_string(c.commands.router_backend)
        << "\ndefault_volume_step_percent = " << c.commands.default_volume_step_percent
        << "\nmax_spoken_volume_step_percent = " << c.commands.max_spoken_volume_step_percent
        << "\nmax_actions_per_utterance = " << c.commands.max_actions_per_utterance

@@ -9,6 +9,8 @@
 #include <endpointvolume.h>
 #include <mmdeviceapi.h>
 #include <roapi.h>
+#include <shellapi.h>
+#include <winhttp.h>
 #include <winsqlite/winsqlite3.h>
 #include <wrl/client.h>
 
@@ -151,6 +153,7 @@ template <typename AsyncOperation>
     case ActionType::media_mode_shuffle: return "netease.cdp";
     case ActionType::media_lyrics_show:
     case ActionType::media_lyrics_hide: return "netease.hotkey";
+    case ActionType::media_search_play: return "netease.search_play";
     default: return "windows.gsmtc";
   }
 }
@@ -509,6 +512,148 @@ void wait_for_netease_control(std::uint16_t port, std::chrono::steady_clock::tim
 // A cold client start takes several seconds before its page is ready.
 constexpr std::chrono::seconds kNeteaseStartTimeout{30};
 
+class WinHttpHandle {
+ public:
+  WinHttpHandle() = default;
+  explicit WinHttpHandle(HINTERNET handle) : handle_(handle) {}
+  ~WinHttpHandle() {
+    if (handle_) WinHttpCloseHandle(handle_);
+  }
+  WinHttpHandle(const WinHttpHandle&) = delete;
+  WinHttpHandle& operator=(const WinHttpHandle&) = delete;
+  WinHttpHandle(WinHttpHandle&& other) noexcept
+      : handle_(std::exchange(other.handle_, nullptr)) {}
+  WinHttpHandle& operator=(WinHttpHandle&& other) noexcept {
+    if (this != &other) {
+      if (handle_) WinHttpCloseHandle(handle_);
+      handle_ = std::exchange(other.handle_, nullptr);
+    }
+    return *this;
+  }
+  [[nodiscard]] HINTERNET get() const noexcept { return handle_; }
+  [[nodiscard]] explicit operator bool() const noexcept { return handle_ != nullptr; }
+
+ private:
+  HINTERNET handle_{};
+};
+
+[[nodiscard]] std::string url_encode_utf8(std::string_view input) {
+  static constexpr std::string_view kHex = "0123456789ABCDEF";
+  std::string out;
+  out.reserve(input.size() * 3);
+  for (const char raw : input) {
+    const auto ch = static_cast<unsigned char>(raw);
+    if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+        (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' ||
+        ch == '.' || ch == '~') {
+      out.push_back(static_cast<char>(ch));
+    } else {
+      out.push_back('%');
+      out.push_back(kHex[(ch >> 4U) & 0x0FU]);
+      out.push_back(kHex[ch & 0x0FU]);
+    }
+  }
+  return out;
+}
+
+[[nodiscard]] nlohmann::json winhttp_search_netease(
+    std::string_view keyword, MediaSearchType type,
+    std::chrono::steady_clock::time_point deadline, std::stop_token stop) {
+  if (stop.stop_requested()) throw ActionCancelledError{};
+  const auto now = std::chrono::steady_clock::now();
+  if (now >= deadline) throw ActionTimeoutError{};
+  const auto remaining_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                deadline - now)
+                                .count();
+  const int timeout_ms = static_cast<int>(
+      std::clamp<long long>(remaining_ms, 200, 15000));
+
+  WinHttpHandle session(WinHttpOpen(
+      L"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+      WINHTTP_NO_PROXY_BYPASS, 0));
+  if (!session) return nullptr;
+  WinHttpSetTimeouts(session.get(), timeout_ms, timeout_ms, timeout_ms,
+                     timeout_ms);
+
+  WinHttpHandle connection(WinHttpConnect(
+      session.get(), L"music.163.com", INTERNET_DEFAULT_HTTPS_PORT, 0));
+  if (!connection) return nullptr;
+
+  const int type_code = type == MediaSearchType::playlist ? 1000 : 1;
+  const std::string path_utf8 =
+      "/api/search/get/web?csrf_token=&s=" + url_encode_utf8(keyword) +
+      "&type=" + std::to_string(type_code) + "&offset=0&limit=20";
+  const auto wide_path = wide(path_utf8);
+
+  WinHttpHandle request(WinHttpOpenRequest(
+      connection.get(), L"POST", wide_path.c_str(), nullptr,
+      L"https://music.163.com/", WINHTTP_DEFAULT_ACCEPT_TYPES,
+      WINHTTP_FLAG_SECURE));
+  if (!request) return nullptr;
+
+  constexpr wchar_t kHeaders[] =
+      L"Content-Type: application/x-www-form-urlencoded\r\n"
+      L"Referer: https://music.163.com/\r\n";
+  if (!WinHttpSendRequest(request.get(), kHeaders, static_cast<DWORD>(-1L),
+                          WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+    return nullptr;
+  }
+  if (!WinHttpReceiveResponse(request.get(), nullptr)) {
+    if (stop.stop_requested()) throw ActionCancelledError{};
+    if (std::chrono::steady_clock::now() >= deadline) throw ActionTimeoutError{};
+    return nullptr;
+  }
+
+  DWORD status_code = 0;
+  DWORD status_size = sizeof(status_code);
+  if (!WinHttpQueryHeaders(
+          request.get(),
+          WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+          WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size,
+          WINHTTP_NO_HEADER_INDEX) ||
+      status_code != 200) {
+    return nullptr;
+  }
+
+  std::string response_body;
+  constexpr std::size_t kMaxBytes = 2 * 1024 * 1024;
+  for (;;) {
+    if (stop.stop_requested()) throw ActionCancelledError{};
+    if (std::chrono::steady_clock::now() >= deadline) throw ActionTimeoutError{};
+    DWORD available = 0;
+    if (!WinHttpQueryDataAvailable(request.get(), &available) || available == 0) {
+      break;
+    }
+    const auto to_read = static_cast<DWORD>(
+        std::min<std::size_t>(available, 16384));
+    const auto offset = response_body.size();
+    if (offset + to_read > kMaxBytes) return nullptr;
+    response_body.resize(offset + to_read);
+    DWORD downloaded = 0;
+    if (!WinHttpReadData(request.get(), response_body.data() + offset, to_read,
+                         &downloaded)) {
+      return nullptr;
+    }
+    response_body.resize(offset + downloaded);
+    if (downloaded == 0) break;
+  }
+  return nlohmann::json::parse(response_body, nullptr, false);
+}
+
+void open_orpheus_uri(std::string_view uri) {
+  const auto wide_uri = wide(uri);
+  SHELLEXECUTEINFOW info{};
+  info.cbSize = sizeof(info);
+  info.fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI;
+  info.lpVerb = L"open";
+  info.lpFile = wide_uri.c_str();
+  info.nShow = SW_SHOWNOACTIVATE;
+  if (!ShellExecuteExW(&info)) {
+    winrt::throw_last_error();
+  }
+}
+
 class WindowsActionBackend final : public IActionBackend {
  public:
   explicit WindowsActionBackend(WindowsActionConfig config) : config_(std::move(config)) {}
@@ -544,6 +689,7 @@ class WindowsActionBackend final : public IActionBackend {
         case ActionType::media_mode_shuffle: return control_netease(action.type, stop);
         case ActionType::media_lyrics_show: return set_desktop_lyrics(true, stop);
         case ActionType::media_lyrics_hide: return set_desktop_lyrics(false, stop);
+        case ActionType::media_search_play: return search_and_play(action, stop);
       }
     } catch (const ActionTimeoutError& error) {
       return failure(action.type, adapter_for(action.type), "action_timeout", error.what());
@@ -880,6 +1026,190 @@ class WindowsActionBackend final : public IActionBackend {
     }
     result.status = ActionStatus::succeeded;
     result.message = "play mode " + value.value("before", "") + " -> " + result.target_id;
+    return result;
+  }
+
+  [[nodiscard]] ActionResult search_and_play(const PlannedAction& action,
+                                             std::stop_token stop) const {
+    constexpr auto action_type = ActionType::media_search_play;
+    if (!action.search_query || action.search_query->empty()) {
+      return failure(action_type, "netease.search_play", "invalid_search_query",
+                     "media.search_play requires a non-empty search_query");
+    }
+    const auto search_type = action.search_type.value_or(MediaSearchType::song);
+    const std::string query = *action.search_query;
+    const std::string artist = action.search_artist.value_or("");
+    std::vector<std::string> keywords;
+    if (!artist.empty()) keywords.push_back(artist + " " + query);
+    keywords.push_back(query);
+
+    auto deadline = std::chrono::steady_clock::now() +
+                    std::chrono::milliseconds(config_.netease.timeout_ms);
+    const auto port = config_.netease.cdp_port;
+    bool cdp_available = false;
+
+    try {
+      const auto probe_deadline = std::min(
+          deadline, std::chrono::steady_clock::now() + std::chrono::seconds(2));
+      (void)netease_cdp_evaluate(port, netease_ready_script(), probe_deadline,
+                                 stop);
+      cdp_available = true;
+    } catch (const NeteaseCdpError& error) {
+      if (error.kind() == NeteaseCdpError::Kind::cancelled) {
+        throw ActionCancelledError{};
+      }
+      const bool running = !netease_processes().empty();
+      if (error.kind() == NeteaseCdpError::Kind::starting) {
+        try {
+          wait_for_netease_control(port, deadline, stop);
+          cdp_available = true;
+        } catch (const NeteaseCdpError& wait_err) {
+          if (wait_err.kind() == NeteaseCdpError::Kind::cancelled) {
+            throw ActionCancelledError{};
+          }
+          if (wait_err.kind() == NeteaseCdpError::Kind::timeout) {
+            throw ActionTimeoutError{};
+          }
+        }
+      } else if (error.kind() == NeteaseCdpError::Kind::unavailable && !running) {
+        // Client is not running at all: try launching it minimized with the
+        // DevTools control channel; if not installed, report cleanly.
+        std::filesystem::path exe;
+        try {
+          exe = netease_executable(config_.netease);
+        } catch (const std::exception& exe_err) {
+          return failure(action_type, "netease.search_play",
+                         "netease_not_installed", exe_err.what());
+        }
+        const auto start_deadline =
+            std::chrono::steady_clock::now() + kNeteaseStartTimeout;
+        launch_netease(exe, port);
+        try {
+          wait_for_netease_control(port, start_deadline, stop);
+          cdp_available = true;
+          deadline = std::max(
+              deadline,
+              std::chrono::steady_clock::now() +
+                  std::chrono::milliseconds(config_.netease.timeout_ms));
+        } catch (const NeteaseCdpError& start_err) {
+          if (start_err.kind() == NeteaseCdpError::Kind::cancelled) {
+            throw ActionCancelledError{};
+          }
+          if (start_err.kind() == NeteaseCdpError::Kind::timeout) {
+            throw ActionTimeoutError{};
+          }
+        }
+      }
+      // If `running` is true and CDP is unavailable, keep `cdp_available = false`
+      // and NEVER restart the playing client; fall back to WinHTTP + orpheus://.
+    }
+
+    std::optional<NeteaseSearchCandidate> chosen;
+    for (const auto& kw : keywords) {
+      if (stop.stop_requested()) throw ActionCancelledError{};
+      if (std::chrono::steady_clock::now() >= deadline) throw ActionTimeoutError{};
+
+      if (cdp_available) {
+        try {
+          const auto cdp_resp = netease_cdp_evaluate(
+              port, netease_search_script(search_type, kw, 20), deadline, stop);
+          if (cdp_resp.is_object() && cdp_resp.value("ok", false)) {
+            if (const auto body = cdp_resp.find("body");
+                body != cdp_resp.end() && body->is_object()) {
+              chosen = select_netease_search_candidate(*body, search_type, artist);
+            }
+          }
+        } catch (const NeteaseCdpError& error) {
+          if (error.kind() == NeteaseCdpError::Kind::cancelled) {
+            throw ActionCancelledError{};
+          }
+          if (error.kind() == NeteaseCdpError::Kind::timeout) {
+            throw ActionTimeoutError{};
+          }
+        }
+      }
+
+      if (!chosen) {
+        const auto web_body =
+            winhttp_search_netease(kw, search_type, deadline, stop);
+        if (web_body.is_object()) {
+          chosen = select_netease_search_candidate(web_body, search_type, artist);
+        }
+      }
+
+      if (!chosen && search_type == MediaSearchType::song) {
+        try {
+          const auto ncm = run_ncm_cli(
+              {L"search", L"song", L"--keyword", wide(kw), L"--limit", L"20"},
+              deadline, stop);
+          if (ncm.ok()) {
+            chosen = select_netease_search_candidate(ncm.body, search_type, artist);
+          }
+        } catch (const ActionCancelledError&) {
+          throw;
+        } catch (const ActionTimeoutError&) {
+          throw;
+        } catch (const std::exception&) {
+          // ncm-cli is optional when WinHTTP/CDP is used.
+        }
+      }
+
+      if (chosen) break;
+    }
+
+    if (!chosen) {
+      const std::string desc =
+          artist.empty() ? query : (artist + " - " + query);
+      return failure(action_type,
+                     cdp_available ? "netease.cdp" : "netease.orpheus",
+                     "search_no_match",
+                     "no matching NetEase " + std::string(to_string(search_type)) +
+                         " found for: " + desc);
+    }
+
+    ActionResult result;
+    result.type = action_type;
+    result.target_id = chosen->id;
+    result.requested_search_query = query;
+    result.requested_search_type = search_type;
+    if (!artist.empty()) result.requested_search_artist = artist;
+
+    if (cdp_available) {
+      try {
+        const auto play_val = netease_cdp_evaluate(
+            port, netease_play_item_script(search_type, chosen->id), deadline,
+            stop);
+        if (play_val.is_object() && play_val.value("ok", false)) {
+          result.status = ActionStatus::succeeded;
+          result.adapter = "netease.cdp";
+          result.verified = true;
+          result.message = "playing " + std::string(to_string(search_type)) +
+                           " via CDP: " + chosen->name + " (" + chosen->id + ")";
+          return result;
+        }
+      } catch (const NeteaseCdpError& error) {
+        if (error.kind() == NeteaseCdpError::Kind::cancelled) {
+          throw ActionCancelledError{};
+        }
+        if (error.kind() == NeteaseCdpError::Kind::timeout) {
+          throw ActionTimeoutError{};
+        }
+      }
+    }
+
+    const auto orpheus_url =
+        build_netease_orpheus_play_url(search_type, chosen->id);
+    if (!orpheus_url) {
+      return failure(action_type, "netease.orpheus", "invalid_target_id",
+                     "resolved item id is not a valid positive integer: " +
+                         chosen->id);
+    }
+    open_orpheus_uri(*orpheus_url);
+    result.status = ActionStatus::succeeded;
+    result.adapter = "netease.orpheus";
+    result.verified = false;
+    result.message = "launched playback via orpheus URI: " + chosen->name +
+                     " (" + chosen->id + ")";
     return result;
   }
 

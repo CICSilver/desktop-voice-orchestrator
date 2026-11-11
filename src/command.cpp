@@ -16,8 +16,23 @@ const char* to_string(ActionType type) {
     case ActionType::media_mode_shuffle: return "media.mode.shuffle";
     case ActionType::media_lyrics_show: return "media.lyrics.show";
     case ActionType::media_lyrics_hide: return "media.lyrics.hide";
+    case ActionType::media_search_play: return "media.search_play";
   }
   return "unknown";
+}
+
+const char* to_string(MediaSearchType type) {
+  switch (type) {
+    case MediaSearchType::song: return "song";
+    case MediaSearchType::playlist: return "playlist";
+  }
+  return "unknown";
+}
+
+std::optional<MediaSearchType> parse_media_search_type(std::string_view value) {
+  if (value == "song") return MediaSearchType::song;
+  if (value == "playlist") return MediaSearchType::playlist;
+  return std::nullopt;
 }
 
 const char* to_string(ExecutionSource source) {

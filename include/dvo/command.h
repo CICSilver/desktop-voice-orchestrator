@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "dvo/audio_types.h"
@@ -12,6 +13,7 @@ namespace dvo {
 
 inline constexpr std::size_t kMaxCommandActions = 8;
 inline constexpr const char* kCommandParserVersion = "rules.zh.v1";
+inline constexpr std::size_t kMaxMediaSearchTextBytes = 120;
 
 enum class ActionType {
   media_play,
@@ -30,6 +32,13 @@ enum class ActionType {
   // Shows or hides the NetEase client's desktop lyrics.
   media_lyrics_show,
   media_lyrics_hide,
+  // Searches NetEase Cloud Music for a song or playlist and starts playback.
+  media_search_play,
+};
+
+enum class MediaSearchType {
+  song,
+  playlist,
 };
 
 enum class ExecutionSource {
@@ -61,6 +70,10 @@ struct PlannedAction {
   // Only master_volume_adjust uses this field. It represents relative
   // Windows volume-slider percentage points, not an acoustic amplitude ratio.
   std::optional<int> volume_delta_percent;
+  // Only media_search_play uses these fields.
+  std::optional<std::string> search_query;
+  std::optional<MediaSearchType> search_type;
+  std::optional<std::string> search_artist;
 };
 
 struct CommandPlan {
@@ -106,6 +119,9 @@ struct ActionResult {
   std::string error_code;
   std::string message;
   std::optional<int> requested_volume_delta_percent;
+  std::optional<std::string> requested_search_query;
+  std::optional<MediaSearchType> requested_search_type;
+  std::optional<std::string> requested_search_artist;
   std::optional<double> volume_before;
   std::optional<double> volume_requested;
   std::optional<double> volume_after;
@@ -117,6 +133,8 @@ struct ActionResult {
 };
 
 [[nodiscard]] const char* to_string(ActionType type);
+[[nodiscard]] const char* to_string(MediaSearchType type);
+[[nodiscard]] std::optional<MediaSearchType> parse_media_search_type(std::string_view value);
 [[nodiscard]] const char* to_string(ExecutionSource source);
 [[nodiscard]] const char* to_string(ExecutionMode mode);
 [[nodiscard]] const char* to_string(ActionStatus status);

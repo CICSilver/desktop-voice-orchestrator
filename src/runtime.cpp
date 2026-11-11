@@ -109,6 +109,15 @@ nlohmann::json command_plan_json(const CommandPlan& plan) {
         action.volume_delta_percent
             ? nlohmann::json(*action.volume_delta_percent)
             : nlohmann::json(nullptr);
+    action_value["search_query"] =
+        action.search_query ? nlohmann::json(*action.search_query)
+                            : nlohmann::json(nullptr);
+    action_value["search_type"] =
+        action.search_type ? nlohmann::json(to_string(*action.search_type))
+                           : nlohmann::json(nullptr);
+    action_value["search_artist"] =
+        action.search_artist ? nlohmann::json(*action.search_artist)
+                             : nlohmann::json(nullptr);
     actions.push_back(std::move(action_value));
   }
   auto value = nlohmann::json{{"schema_version", plan.schema_version},
@@ -156,6 +165,7 @@ nlohmann::json parse_debug_success(std::string_view input_text,
                                    std::string_view kind) {
   auto value = parse_debug_base(input_text, context, kind, "parser");
   value["matched"] = true;
+  value["parser_version"] = plan.parser_version;
   value["normalized_text"] = plan.normalized_text;
   value["plan"] = command_plan_json(plan);
   value["error"] = nullptr;
@@ -197,6 +207,14 @@ nlohmann::json action_result_json(const ActionResult& result) {
   };
   value["requested_volume_delta_percent"] =
       optional_json(result.requested_volume_delta_percent);
+  value["requested_search_query"] =
+      optional_json(result.requested_search_query);
+  value["requested_search_type"] =
+      result.requested_search_type
+          ? nlohmann::json(to_string(*result.requested_search_type))
+          : nlohmann::json(nullptr);
+  value["requested_search_artist"] =
+      optional_json(result.requested_search_artist);
   value["volume_before"] = optional_json(result.volume_before);
   value["volume_requested"] = optional_json(result.volume_requested);
   value["volume_after"] = optional_json(result.volume_after);
@@ -455,7 +473,9 @@ void VoiceFrontendRuntime::initialize_pipeline() {
     command_parser_ = std::make_shared<const CommandParser>(
         static_cast<int>(config_.commands.default_volume_step_percent),
         static_cast<int>(config_.commands.max_spoken_volume_step_percent),
-        command_grammar(config_.commands));
+        command_grammar(config_.commands),
+        parse_command_parser_mode(config_.commands.parser_mode)
+            .value_or(CommandParserMode::rules));
     command_config_revision_ = config_.revision;
     commands_enabled_ = config_.commands.enabled;
     command_snapshots_.clear();
@@ -2928,6 +2948,8 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     changed(candidate.asr.tokens != current.asr.tokens, "asr.tokens");
     changed(candidate.asr.provider != current.asr.provider, "asr.provider");
     changed(candidate.asr.num_threads != current.asr.num_threads, "asr.num_threads");
+    changed(candidate.commands.router_backend != current.commands.router_backend,
+            "commands.router_backend");
     changed(candidate.commands.action_timeout_ms != current.commands.action_timeout_ms,
             "commands.action_timeout_ms");
     changed(candidate.commands.queue_capacity != current.commands.queue_capacity,
@@ -2977,6 +2999,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     active.commands = candidate.commands;
     // These shape the long-lived Windows backend/executor and are applied on
     // the next process start. Grammar and enablement remain true hot settings.
+    active.commands.router_backend = current.commands.router_backend;
     active.commands.action_timeout_ms = current.commands.action_timeout_ms;
     active.commands.queue_capacity = current.commands.queue_capacity;
     active.netease = current.netease;
@@ -3028,6 +3051,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         !current.announcements.barge_in &&
         (!active.announcements.enabled || active.announcements.barge_in);
     const bool parser_changed =
+        active.commands.parser_mode != current.commands.parser_mode ||
         active.commands.default_volume_step_percent !=
             current.commands.default_volume_step_percent ||
         active.commands.max_spoken_volume_step_percent !=
@@ -3073,7 +3097,9 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
       new_parser = std::make_shared<const CommandParser>(
           static_cast<int>(active.commands.default_volume_step_percent),
           static_cast<int>(active.commands.max_spoken_volume_step_percent),
-          command_grammar(active.commands));
+          command_grammar(active.commands),
+          parse_command_parser_mode(active.commands.parser_mode)
+              .value_or(CommandParserMode::rules));
     }
     if (save) config_store_.save_overrides(candidate);
     std::size_t cancelled_candidates{};

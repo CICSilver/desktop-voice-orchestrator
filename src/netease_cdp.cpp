@@ -215,4 +215,123 @@ std::string netease_play_mode_script(std::string_view mode) {
 })())JS";
 }
 
+std::string netease_search_script(MediaSearchType type, std::string_view keyword,
+                                  int limit) {
+  const int search_type = type == MediaSearchType::playlist ? 1000 : 1;
+  return std::string("(async () => {") +
+         "const kw = " + nlohmann::json(std::string(keyword)).dump() + ";" +
+         "const st = " + std::to_string(search_type) + ";" +
+         "const lim = " + std::to_string(limit > 0 ? limit : 20) + ";" + R"JS(
+  const urls = [
+    'https://music.163.com/api/cloudsearch/pc?s=' + encodeURIComponent(kw) + '&type=' + st + '&offset=0&limit=' + lim,
+    'https://music.163.com/api/search/get/web?csrf_token=&s=' + encodeURIComponent(kw) + '&type=' + st + '&offset=0&limit=' + lim
+  ];
+  for (const url of urls) {
+    try {
+      const resp = await fetch(url, {method: 'POST', credentials: 'include'});
+      if (!resp.ok) continue;
+      const body = await resp.json();
+      if (body && typeof body === 'object' && body.result) {
+        return {ok: true, body};
+      }
+    } catch (_) {}
+  }
+  return {ok: false};
+})())JS";
+}
+
+std::string netease_play_item_script(MediaSearchType type,
+                                     std::string_view item_id) {
+  const bool is_playlist = type == MediaSearchType::playlist;
+  return std::string("(async () => {") + std::string(kStorePrelude) +
+         "const strId = " + nlohmann::json(std::string(item_id)).dump() + ";" +
+         "const isPlaylist = " + (is_playlist ? "true" : "false") + ";" + R"JS(
+  const numId = Number(strId);
+  const tool = dvoStore();
+  const dispatch = tool.getDispatch();
+  const state = () => {
+    const s = tool.getStore();
+    const current = (s.playing && s.playing.curPlaying) || {};
+    const track = current.track || current || {};
+    return {
+      scene: current.scene || '',
+      resourceId: String(current.resourceId || ''),
+      trackId: String(track.id || current.id || ''),
+      name: track.name || '',
+      playing: s.playing ? s.playing.playingState : 0,
+      queue: ((s.playingList && s.playingList.curPlayingList) || []).length
+    };
+  };
+  if (isPlaylist) {
+    await dispatch({
+      type: 'async:action/doAction',
+      payload: {
+        actionId: 'playAll',
+        data: {
+          resource: {id: numId},
+          resourceType: 'playlist',
+          from: {sourceData: {id: strId}, scene: 'playlist', pldScene: 'musicDesktop'}
+        }
+      }
+    });
+    for (let i = 0; i < 30; i++) {
+      const now = state();
+      if (now.resourceId === strId && now.queue > 0) {
+        return {ok: true, ...now};
+      }
+      await dvoSleep(100);
+    }
+    return {ok: false, ...state()};
+  }
+
+  let trackObj = null;
+  try {
+    const detailUrl = 'https://music.163.com/api/v3/song/detail?id=' + encodeURIComponent(strId) +
+                      '&c=' + encodeURIComponent(JSON.stringify([{id: numId}]));
+    const resp = await fetch(detailUrl, {method: 'POST', credentials: 'include'});
+    if (resp.ok) {
+      const data = await resp.json();
+      if (data && Array.isArray(data.songs) && data.songs.length > 0) {
+        trackObj = data.songs[0];
+      }
+    }
+  } catch (_) {}
+
+  try {
+    await dispatch({
+      type: 'async:action/doAction',
+      payload: {
+        actionId: 'play',
+        data: {
+          resource: trackObj || {id: numId},
+          resourceType: 'song',
+          from: {sourceData: {id: strId}, scene: 'search', pldScene: 'musicDesktop'}
+        }
+      }
+    });
+  } catch (_) {}
+
+  for (let i = 0; i < 15; i++) {
+    const now = state();
+    if (now.trackId === strId) return {ok: true, ...now};
+    await dvoSleep(100);
+  }
+
+  if (trackObj) {
+    for (const actionType of ['playing/play', 'async:playing/play']) {
+      try {
+        await dispatch({type: actionType, payload: {track: trackObj, id: numId}});
+      } catch (_) {}
+      for (let i = 0; i < 10; i++) {
+        const now = state();
+        if (now.trackId === strId) return {ok: true, ...now};
+        await dvoSleep(100);
+      }
+    }
+  }
+
+  return {ok: false, ...state()};
+})())JS";
+}
+
 }  // namespace dvo

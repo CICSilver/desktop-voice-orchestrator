@@ -149,13 +149,17 @@ exact_final_redecode = true
 final_decoder = "sense_voice"
 final_model = "models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/model.int8.onnx"
 final_tokens = "models/sherpa-onnx-sense-voice-funasr-nano-int8-2025-12-17/tokens.txt"
-# 冷：主识别文本解析失败时，才改用此模型的文本；它同样必须完整匹配命令语法。"none" 关闭。
-fallback_decoder = "zipformer_ctc"
+# 冷：主识别文本解析失败时，才改用此模型的文本；它同样必须完整匹配命令语法。默认 "none" 关闭串行解码开销。
+fallback_decoder = "none"
 fallback_model = "models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/model.int8.onnx"
 fallback_tokens = "models/sherpa-onnx-zipformer-ctc-zh-int8-2025-07-03/tokens.txt"
 
 [commands]
 enabled = true
+# 热：解析模式："rules"（仅本地规则）、"hybrid"（规则快通道优先，未覆盖表达转纯规划路由器）、"router"（仅纯规划路由器）。
+parser_mode = "rules"
+# 冷：纯规划路由器后端；默认 "none" 保持零外部网络请求安全。
+router_backend = "none"
 # 热：未口述数值时调整的Windows音量滑块百分点。
 default_volume_step_percent = 5
 # 热：口述相对幅度上限；合法范围1..20，超范围整句拒绝。

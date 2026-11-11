@@ -121,6 +121,17 @@ TEST_CASE("Action summaries are deterministic and use structured actions") {
         "正在执行：播放音乐，然后暂停音乐，然后增加音量 5%，然后降低音量 7%");
   CHECK(dvo::format_action_summary({}).empty());
 
+  std::vector<dvo::PlannedAction> search_actions{
+      {"s1", 1, dvo::ActionType::media_search_play, {}, "晴天",
+       dvo::MediaSearchType::song, "周杰伦"},
+      {"s2", 2, dvo::ActionType::media_search_play, {}, "稻香",
+       dvo::MediaSearchType::song, std::nullopt},
+      {"s3", 3, dvo::ActionType::media_search_play, {}, "轻音乐",
+       dvo::MediaSearchType::playlist, std::nullopt},
+  };
+  CHECK(dvo::format_action_summary(search_actions) ==
+        "正在执行：播放 周杰伦 的 晴天，然后播放歌曲 稻香，然后播放歌单 轻音乐");
+
   auto plan = command_plan("summary-correlation");
   plan.activation_id = "activation-summary";
   plan.turn_index = 4;

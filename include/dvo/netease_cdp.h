@@ -10,6 +10,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "dvo/command.h"
+
 namespace dvo {
 
 // Controls the NetEase Cloud Music client from inside its own page through
@@ -56,5 +58,12 @@ class NeteaseCdpError : public std::runtime_error {
 [[nodiscard]] std::string netease_play_daily_script();
 // Sets the play mode: "playOrder", "playCycle", "playOneCycle" or "playRandom".
 [[nodiscard]] std::string netease_play_mode_script(std::string_view mode);
+// Searches NetEase from inside the client page context and returns {ok, body}.
+[[nodiscard]] std::string netease_search_script(MediaSearchType type,
+                                                std::string_view keyword,
+                                                int limit = 20);
+// Plays a specific song or playlist by numeric id silently without stealing focus.
+[[nodiscard]] std::string netease_play_item_script(MediaSearchType type,
+                                                   std::string_view item_id);
 
 }  // namespace dvo

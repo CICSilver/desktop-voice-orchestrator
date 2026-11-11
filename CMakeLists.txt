@@ -83,6 +83,7 @@ target_link_libraries(dvo_core
     propsys
     runtimeobject
     bcrypt
+    winhttp
     # The Windows SDK's system SQLite, used read-only on the NetEase client's database.
     winsqlite3
 )
@@ -144,7 +145,7 @@ if(BUILD_TESTING AND DVO_BUILD_TESTS)
   target_compile_options(dvo_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
   target_link_libraries(dvo_tests PRIVATE dvo_core Catch2::Catch2WithMain)
   include(Catch)
-  catch_discover_tests(dvo_tests)
+  catch_discover_tests(dvo_tests PROPERTIES SKIP_RETURN_CODE 4)
 
   # Keep the real-model smoke test independently runnable while other
   # subsystems are under active development. The prefix avoids duplicate CTest
@@ -152,5 +153,5 @@ if(BUILD_TESTING AND DVO_BUILD_TESTS)
   add_executable(dvo_asr_tests tests/test_streaming_recognizer.cpp)
   target_compile_options(dvo_asr_tests PRIVATE /W4 /permissive- /utf-8 /EHsc)
   target_link_libraries(dvo_asr_tests PRIVATE dvo_core Catch2::Catch2WithMain)
-  catch_discover_tests(dvo_asr_tests TEST_PREFIX "asr::")
+  catch_discover_tests(dvo_asr_tests TEST_PREFIX "asr::" PROPERTIES SKIP_RETURN_CODE 4)
 endif()

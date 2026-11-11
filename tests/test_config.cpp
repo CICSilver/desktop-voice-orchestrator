@@ -67,11 +67,14 @@ TEST_CASE("checked-in default configuration is valid") {
   unsafe.web.bind = "localhost";
   REQUIRE_FALSE(store.validate(unsafe).ok());
 
-  // The checked-in defaults use offline final decoders with resolved paths.
+  // The checked-in defaults use offline final decoders with resolved paths,
+  // while keeping the serial fallback decoder disabled by default.
   CHECK(config.asr.final_decoder == "sense_voice");
   CHECK(config.asr.final_model.filename() == "model.int8.onnx");
   CHECK(config.asr.final_model.is_absolute());
-  CHECK(config.asr.fallback_decoder == "zipformer_ctc");
+  CHECK(config.asr.fallback_decoder == "none");
+  CHECK(config.commands.parser_mode == "rules");
+  CHECK(config.commands.router_backend == "none");
 
   auto decoders = config;
   decoders.asr.final_decoder = "whisper";
@@ -80,6 +83,8 @@ TEST_CASE("checked-in default configuration is valid") {
   decoders.asr.final_model.clear();
   CHECK_FALSE(store.validate(decoders).ok());
   decoders = config;
+  decoders.asr.fallback_decoder = "zipformer_ctc";
+  CHECK(store.validate(decoders).ok());
   decoders.asr.final_decoder = "streaming";  // fallback needs an offline primary
   decoders.kws.asr_probe = false;
   CHECK_FALSE(store.validate(decoders).ok());
@@ -205,7 +210,8 @@ TEST_CASE("command grammar patch uses nested phrases and survives overlay reload
   auto result = store.apply_patch(
       config,
       {{"commands",
-        {{"default_volume_step_percent", 7},
+        {{"parser_mode", "hybrid"},
+         {"default_volume_step_percent", 7},
          {"max_actions_per_utterance", 2},
          {"action_timeout_ms", 1350},
          {"queue_capacity", 17},
@@ -216,19 +222,32 @@ TEST_CASE("command grammar patch uses nested phrases and survives overlay reload
            {"volume_up", {"音量加"}},
            {"volume_down", {"音量减"}}}}}}});
   REQUIRE(result.ok());
+  CHECK(config.commands.parser_mode == "hybrid");
   CHECK(config.commands.default_volume_step_percent == 7);
   CHECK(config.commands.max_actions_per_utterance == 2);
   CHECK(config.commands.play_phrases == std::vector<std::string>{"开始播放"});
   const auto public_config = store.to_public_json(config);
+  CHECK(public_config["commands"]["parser_mode"] == "hybrid");
+  CHECK(public_config["commands"]["router_backend"] == "none");
   CHECK(public_config["commands"]["phrases"]["play"] ==
         nlohmann::json::array({"开始播放"}));
 
   store.save_overrides(config);
   const auto reloaded = store.load();
+  CHECK(reloaded.commands.parser_mode == "hybrid");
+  CHECK(reloaded.commands.router_backend == "none");
   CHECK(reloaded.commands.connectors == std::vector<std::string>{"接下来"});
   CHECK(reloaded.commands.volume_down_phrases == std::vector<std::string>{"音量减"});
   CHECK(reloaded.commands.action_timeout_ms == 1350);
   CHECK(reloaded.commands.queue_capacity == 17);
+
+  auto invalid_router = original;
+  CHECK_FALSE(
+      store.apply_patch(invalid_router, {{"commands", {{"parser_mode", "invalid"}}}})
+          .ok());
+  CHECK_FALSE(
+      store.apply_patch(invalid_router, {{"commands", {{"router_backend", "mcp"}}}})
+          .ok());
 
   auto invalid = original;
   result = store.apply_patch(

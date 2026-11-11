@@ -5,6 +5,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <utility>
@@ -12,7 +13,66 @@
 namespace dvo {
 namespace {
 
-[[nodiscard]] std::optional<std::string> validate_plan(const CommandPlan& plan) {
+[[nodiscard]] bool is_space_cp(char32_t cp) {
+  return cp == U' ' || cp == U'\t' || cp == U'\n' || cp == U'\r' ||
+         cp == U'\f' || cp == U'\v' || cp == 0xA0 || cp == 0x1680 ||
+         (cp >= 0x2000 && cp <= 0x200A) || cp == 0x2028 || cp == 0x2029 ||
+         cp == 0x202F || cp == 0x205F || cp == 0x3000;
+}
+
+[[nodiscard]] std::optional<std::string> normalize_search_field(
+    std::string_view input) {
+  std::size_t first_non_space = input.size();
+  std::size_t last_non_space = 0;
+  for (std::size_t offset = 0; offset < input.size();) {
+    const auto lead = static_cast<unsigned char>(input[offset]);
+    std::size_t length = 1;
+    char32_t cp = lead;
+    char32_t minimum = 0;
+    if (lead <= 0x7F) {
+      length = 1;
+    } else if ((lead & 0xE0) == 0xC0) {
+      length = 2;
+      cp = lead & 0x1F;
+      minimum = 0x80;
+    } else if ((lead & 0xF0) == 0xE0) {
+      length = 3;
+      cp = lead & 0x0F;
+      minimum = 0x800;
+    } else if ((lead & 0xF8) == 0xF0) {
+      length = 4;
+      cp = lead & 0x07;
+      minimum = 0x10000;
+    } else {
+      return std::nullopt;
+    }
+    if (offset + length > input.size()) return std::nullopt;
+    for (std::size_t i = 1; i < length; ++i) {
+      const auto next = static_cast<unsigned char>(input[offset + i]);
+      if ((next & 0xC0) != 0x80) return std::nullopt;
+      cp = (cp << 6) | (next & 0x3F);
+    }
+    if (cp < minimum || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
+      return std::nullopt;
+    }
+    if ((cp < 0x20 || cp == 0x7F) && !is_space_cp(cp)) return std::nullopt;
+    if (!is_space_cp(cp)) {
+      if (first_non_space == input.size()) first_non_space = offset;
+      last_non_space = offset + length;
+    }
+    offset += length;
+  }
+  if (first_non_space >= last_non_space) return std::nullopt;
+  const auto trimmed =
+      input.substr(first_non_space, last_non_space - first_non_space);
+  if (trimmed.empty() || trimmed.size() > kMaxMediaSearchTextBytes) {
+    return std::nullopt;
+  }
+  return std::string(trimmed);
+}
+
+[[nodiscard]] std::optional<std::string> validate_and_normalize_plan(
+    CommandPlan& plan) {
   if (plan.command_id.empty()) return "command_id is required";
   if (plan.utterance_id.empty()) return "utterance_id is required";
   if (plan.actions.empty()) return "a plan must contain at least one action";
@@ -20,17 +80,54 @@ namespace {
 
   std::unordered_set<std::string> ids;
   for (std::size_t i = 0; i < plan.actions.size(); ++i) {
-    const auto& action = plan.actions[i];
+    auto& action = plan.actions[i];
     if (action.sequence != i + 1) return "action sequences must be contiguous and one-based";
     if (action.action_id.empty()) return "action_id is required";
     if (!ids.insert(action.action_id).second) return "action_id values must be unique within a plan";
+    if (std::string_view(to_string(action.type)) == "unknown") {
+      return "action type is unknown";
+    }
     if (action.type == ActionType::master_volume_adjust) {
+      if (action.search_query || action.search_type || action.search_artist) {
+        return "only media.search_play actions may carry search parameters";
+      }
       if (!action.volume_delta_percent || *action.volume_delta_percent == 0 ||
           *action.volume_delta_percent < -20 || *action.volume_delta_percent > 20) {
         return "volume actions require a non-zero delta in [-20, 20]";
       }
-    } else if (action.volume_delta_percent) {
-      return "only volume actions may carry a volume delta";
+    } else if (action.type == ActionType::media_search_play) {
+      if (action.volume_delta_percent) {
+        return "only volume actions may carry a volume delta";
+      }
+      if (!action.search_query) {
+        return "media.search_play requires a non-empty search_query";
+      }
+      const auto normalized_query = normalize_search_field(*action.search_query);
+      if (!normalized_query) {
+        return "media.search_play search_query must be valid non-empty UTF-8 within 120 bytes";
+      }
+      action.search_query = *normalized_query;
+      const auto effective_type =
+          action.search_type.value_or(MediaSearchType::song);
+      if (std::string_view(to_string(effective_type)) == "unknown") {
+        return "media.search_play search_type is invalid";
+      }
+      action.search_type = effective_type;
+      if (action.search_artist) {
+        const auto normalized_artist =
+            normalize_search_field(*action.search_artist);
+        if (!normalized_artist) {
+          return "media.search_play search_artist must be valid non-empty UTF-8 within 120 bytes";
+        }
+        action.search_artist = *normalized_artist;
+      }
+    } else {
+      if (action.volume_delta_percent) {
+        return "only volume actions may carry a volume delta";
+      }
+      if (action.search_query || action.search_type || action.search_artist) {
+        return "only media.search_play actions may carry search parameters";
+      }
     }
   }
   return {};
@@ -54,7 +151,7 @@ struct OrderedActionExecutor::Impl {
   ~Impl() { stop(false); }
 
   SubmitResult submit(CommandPlan plan, const AcceptedCallback& accepted) {
-    if (const auto validation = validate_plan(plan)) {
+    if (const auto validation = validate_and_normalize_plan(plan)) {
       return {SubmitStatus::invalid_plan, *validation};
     }
     {
@@ -130,6 +227,9 @@ struct OrderedActionExecutor::Impl {
       result.source = plan.source;
       result.timestamp_sample = plan.timestamp_sample;
       result.requested_volume_delta_percent = action.volume_delta_percent;
+      result.requested_search_query = action.search_query;
+      result.requested_search_type = action.search_type;
+      result.requested_search_artist = action.search_artist;
 
       if (ledger.contains(action.action_id)) {
         result.status = ActionStatus::deduplicated;
@@ -171,6 +271,15 @@ struct OrderedActionExecutor::Impl {
               result.timestamp_sample = plan.timestamp_sample;
               if (!result.requested_volume_delta_percent) {
                 result.requested_volume_delta_percent = action.volume_delta_percent;
+              }
+              if (!result.requested_search_query) {
+                result.requested_search_query = action.search_query;
+              }
+              if (!result.requested_search_type) {
+                result.requested_search_type = action.search_type;
+              }
+              if (!result.requested_search_artist) {
+                result.requested_search_artist = action.search_artist;
               }
             } catch (const std::exception& error) {
               result.status = ActionStatus::failed;

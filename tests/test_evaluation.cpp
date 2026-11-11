@@ -309,3 +309,45 @@ TEST_CASE("background takes count every wake and plan, except in excluded spans"
   CHECK(text.find("2:05 唤醒（asr_probe）") != std::string::npos);
   CHECK(text.find("唤醒召回") == std::string::npos);
 }
+
+
+TEST_CASE("evaluation expected_actions strictly match media.search_play parameters") {
+  auto doc = labels_document();
+  doc["takes"] = nlohmann::json::array({take(
+      "s1", "command", "小助手，放首周杰伦的晴天", "prefix",
+      nlohmann::json::array({{{"type", "media.search_play"},
+                              {"search_query", "晴天"},
+                              {"search_type", "song"},
+                              {"search_artist", "周杰伦"}}}),
+      1.0, 5.0)});
+  const auto labels = dvo::parse_evaluation_labels(doc);
+  dvo::SessionReference reference;
+  reference.takes.resize(1);
+  reference.takes[0].available = true;
+
+  const nlohmann::json matched_summary{
+      {"keyword_hits", nlohmann::json::array({hit(1.8)})},
+      {"utterances",
+       nlohmann::json::array({utterance(
+           "u1", 1.2, 4.0, "小助手放首周杰伦的晴天", "plan",
+           nlohmann::json::array({{{"type", "media.search_play"},
+                                   {"search_query", "晴天"},
+                                   {"search_type", "song"},
+                                   {"search_artist", "周杰伦"}}}))})}};
+  const auto ok_report =
+      dvo::evaluate_labeled_session(labels, matched_summary, reference);
+  CHECK(ok_report["takes"][0]["verdict"] == "correct");
+
+  const nlohmann::json wrong_artist_summary{
+      {"keyword_hits", nlohmann::json::array({hit(1.8)})},
+      {"utterances",
+       nlohmann::json::array({utterance(
+           "u1", 1.2, 4.0, "小助手放首晴天", "plan",
+           nlohmann::json::array({{{"type", "media.search_play"},
+                                   {"search_query", "晴天"},
+                                   {"search_type", "song"},
+                                   {"search_artist", "林俊杰"}}}))})}};
+  const auto mismatch_report =
+      dvo::evaluate_labeled_session(labels, wrong_artist_summary, reference);
+  CHECK(mismatch_report["takes"][0]["verdict"] != "correct");
+}

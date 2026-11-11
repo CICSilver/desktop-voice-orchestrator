@@ -296,3 +296,53 @@ TEST_CASE("Executor validates plans before enqueueing") {
   executor.stop();
   CHECK(executor.try_submit(plan("after-stop")).status == dvo::SubmitStatus::stopped);
 }
+
+
+TEST_CASE("Executor validates and audits media.search_play parameters") {
+  auto backend = std::make_shared<FakeBackend>();
+  dvo::OrderedActionExecutor invalid_executor(backend);
+
+  auto empty_search = plan("invalid-search-empty");
+  empty_search.actions[0].type = dvo::ActionType::media_search_play;
+  empty_search.actions[0].search_query = "   ";
+  CHECK(invalid_executor.try_submit(std::move(empty_search)).status ==
+        dvo::SubmitStatus::invalid_plan);
+
+  auto control_char_search = plan("invalid-search-ctrl");
+  control_char_search.actions[0].type = dvo::ActionType::media_search_play;
+  control_char_search.actions[0].search_query = std::string("晴天\x07", 7);
+  CHECK(invalid_executor.try_submit(std::move(control_char_search)).status ==
+        dvo::SubmitStatus::invalid_plan);
+
+  auto polluted_pause = plan("invalid-pause-with-search");
+  polluted_pause.actions[0].type = dvo::ActionType::media_pause;
+  polluted_pause.actions[0].search_query = "晴天";
+  CHECK(invalid_executor.try_submit(std::move(polluted_pause)).status ==
+        dvo::SubmitStatus::invalid_plan);
+
+  CHECK(backend->call_count() == 0);
+  invalid_executor.stop();
+
+  std::mutex audit_mutex;
+  std::vector<dvo::ActionResult> audit_results;
+  dvo::OrderedActionExecutor search_executor(
+      backend, {}, [&](const dvo::ActionResult& r) {
+        std::scoped_lock lock(audit_mutex);
+        audit_results.push_back(r);
+      });
+  auto valid_search = plan("valid-search");
+  valid_search.actions[0].type = dvo::ActionType::media_search_play;
+  valid_search.actions[0].search_query = "  晴天  ";
+  valid_search.actions[0].search_artist = " 周杰伦 ";
+  REQUIRE(search_executor.try_submit(valid_search).accepted());
+  REQUIRE(search_executor.wait_until_idle(std::chrono::seconds(2)));
+  {
+    std::scoped_lock lock(audit_mutex);
+    REQUIRE(audit_results.size() == 2);
+    CHECK(audit_results[1].status == dvo::ActionStatus::succeeded);
+    CHECK(audit_results[1].requested_search_query == "晴天");
+    CHECK(audit_results[1].requested_search_type == dvo::MediaSearchType::song);
+    CHECK(audit_results[1].requested_search_artist == "周杰伦");
+  }
+  search_executor.stop();
+}

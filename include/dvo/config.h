@@ -130,6 +130,8 @@ struct AsrConfig {
 
 struct CommandsConfig {
   bool enabled{true};
+  std::string parser_mode{"rules"};
+  std::string router_backend{"none"};
   std::uint32_t default_volume_step_percent{5};
   std::uint32_t max_spoken_volume_step_percent{20};
   std::uint32_t max_actions_per_utterance{8};

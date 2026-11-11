@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <cstdlib>
 #include <cstdint>
 #include <span>
 #include <stdexcept>
@@ -176,11 +177,11 @@ void correct_wake_confirmed_asr_confusions(
     bool wake_confirmed_in_text) {
   if (!wake_confirmed_in_text) return;
 
-  // These substitutions are deliberately sentence-wide and wake-confirmed:
-  // they cannot turn arbitrary follow-up speech into a command, and they are
-  // enabled only when the canonical pause phrase remains configured.
+  // Deliberately sentence-wide and wake-confirmed, enabled only when the
+  // canonical pause phrase remains configured. Do NOT map natural-language
+  // listen requests such as "再听音乐" / "想听音乐" onto pause.
   if (contains_rule(rules, "暂停音乐", ActionType::media_pause) &&
-      (value == "再连音乐" || value == "再听音乐")) {
+      value == "再连音乐") {
     value = "暂停音乐";
   }
 }
@@ -617,7 +618,356 @@ struct DraftParse {
   std::optional<CommandParseError> error;
 };
 
+[[nodiscard]] bool is_hard_policy_error(std::string_view code) {
+  return code == "volume_amount_out_of_range" ||
+         code == "invalid_volume_amount" ||
+         code == "too_many_actions";
+}
+
+[[nodiscard]] bool is_leading_interjection(char32_t cp) {
+  return cp == U'啊' || cp == U'呃' || cp == U'嗯' ||
+         cp == U'哦' || cp == U'唉' || cp == U'诶';
+}
+
+[[nodiscard]] std::span<const char32_t> trim_space_and_separators(
+    std::span<const char32_t> text) {
+  while (!text.empty() &&
+         (is_space(text.front()) || is_separator(text.front()))) {
+    text = text.subspan(1);
+  }
+  while (!text.empty() &&
+         (is_space(text.back()) || is_separator(text.back()))) {
+    text = text.first(text.size() - 1);
+  }
+  return text;
+}
+
+[[nodiscard]] std::optional<std::string> clean_router_text_field(
+    std::string_view input, std::size_t max_bytes) {
+  std::vector<char32_t> cps;
+  bool prev_space = true;
+  for (std::size_t offset = 0; offset < input.size();) {
+    const auto decoded = decode_one(input, offset);
+    if (!decoded) return std::nullopt;
+    const auto [cp, length] = *decoded;
+    offset += length;
+    if ((cp < 0x20 || cp == 0x7F) && !is_space(cp)) return std::nullopt;
+    if (is_space(cp)) {
+      if (!prev_space) {
+        cps.push_back(U' ');
+        prev_space = true;
+      }
+      continue;
+    }
+    cps.push_back(cp);
+    prev_space = false;
+  }
+  if (!cps.empty() && cps.back() == U' ') cps.pop_back();
+  auto cleaned = to_utf8(cps);
+  if (cleaned.empty() || cleaned.size() > max_bytes) return std::nullopt;
+  return cleaned;
+}
+
+[[nodiscard]] std::string build_router_stripped_text(
+    std::string_view raw_text, std::string_view wake_word) {
+  std::vector<char32_t> cps;
+  bool prev_space = true;
+  for (std::size_t offset = 0; offset < raw_text.size();) {
+    const auto decoded = decode_one(raw_text, offset);
+    if (!decoded) break;
+    auto [cp, length] = *decoded;
+    offset += length;
+    if (is_space(cp)) {
+      if (!prev_space) {
+        cps.push_back(U' ');
+        prev_space = true;
+      }
+      continue;
+    }
+    if (cp >= 0xFF10 && cp <= 0xFF19) cp = U'0' + (cp - 0xFF10);
+    if (cp == U'％') cp = U'%';
+    cps.push_back(cp);
+    prev_space = false;
+  }
+  auto view = trim_space_and_separators(cps);
+
+  std::vector<char32_t> wake_cps;
+  for (std::size_t offset = 0; offset < wake_word.size();) {
+    const auto decoded = decode_one(wake_word, offset);
+    if (!decoded) break;
+    const auto [cp, length] = *decoded;
+    offset += length;
+    if (is_space(cp) || is_separator(cp) ||
+        (wake_cps.empty() && cp == U'@')) {
+      continue;
+    }
+    wake_cps.push_back(cp);
+  }
+
+  std::vector<char32_t> stripped(view.begin(), view.end());
+  if (!wake_cps.empty() && !stripped.empty()) {
+    if (const auto found = std::ranges::search(stripped, wake_cps); !found.empty()) {
+      const auto begin = static_cast<std::size_t>(found.begin() - stripped.begin());
+      const auto end = begin + wake_cps.size();
+      if (begin == 0) {
+        auto rest = trim_space_and_separators(
+            std::span<const char32_t>(stripped).subspan(end));
+        stripped.assign(rest.begin(), rest.end());
+      } else if (end == stripped.size() ||
+                 (end + 1 == stripped.size() &&
+                  !is_space(stripped.back()) && !is_separator(stripped.back()))) {
+        auto rest = trim_space_and_separators(
+            std::span<const char32_t>(stripped).first(begin));
+        stripped.assign(rest.begin(), rest.end());
+      } else {
+        auto left = trim_space_and_separators(
+            std::span<const char32_t>(stripped).first(begin));
+        auto right = trim_space_and_separators(
+            std::span<const char32_t>(stripped).subspan(end));
+        std::vector<char32_t> merged;
+        merged.insert(merged.end(), left.begin(), left.end());
+        if (!left.empty() && !right.empty()) merged.push_back(U'，');
+        merged.insert(merged.end(), right.begin(), right.end());
+        stripped = std::move(merged);
+      }
+    } else if (stripped.size() >= wake_cps.size()) {
+      const auto span_view = std::span<const char32_t>(stripped);
+      const auto wake_view = std::span<const char32_t>(wake_cps);
+      bool stripped_near_miss = false;
+      for (const bool at_start : {true, false}) {
+        const auto length = wake_view.size();
+        const auto begin = at_start ? 0 : span_view.size() - length;
+        const auto window = span_view.subspan(begin, length);
+        if (std::ranges::any_of(window, [](char32_t c) {
+              return is_space(c) || is_separator(c);
+            })) {
+          continue;
+        }
+        if (wake_view.size() >= 2 &&
+            common_subsequence(window, wake_view) + 1 >= wake_view.size()) {
+          auto rest = at_start
+                          ? trim_space_and_separators(span_view.subspan(length))
+                          : trim_space_and_separators(
+                                span_view.first(span_view.size() - length));
+          if (!rest.empty()) {
+            stripped.assign(rest.begin(), rest.end());
+            stripped_near_miss = true;
+            break;
+          }
+        }
+      }
+      if (!stripped_near_miss && wake_view.size() >= 2 && stripped.size() >= 2) {
+        for (auto length = std::min(wake_view.size(), stripped.size()) - 1;
+             length > 0; --length) {
+          if (!std::ranges::equal(
+                  std::span<const char32_t>(stripped).last(length),
+                  wake_view.first(length))) {
+            continue;
+          }
+          auto rest = trim_space_and_separators(
+              std::span<const char32_t>(stripped).first(stripped.size() - length));
+          if (!rest.empty()) {
+            stripped.assign(rest.begin(), rest.end());
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  auto current = trim_space_and_separators(stripped);
+  while (current.size() >= 2 && is_leading_interjection(current.front()) &&
+         (is_space(current[1]) || is_separator(current[1]))) {
+    current = trim_space_and_separators(current.subspan(1));
+  }
+
+  auto result = to_utf8(current);
+  static constexpr std::array<std::string_view, 4> polite_prefixes{
+      "麻烦帮我", "请帮我", "帮我", "请"};
+  for (const auto prefix : polite_prefixes) {
+    if (!result.starts_with(prefix)) continue;
+    auto remaining_cps = codepoints(result.substr(prefix.size()));
+    auto trimmed_remaining = trim_space_and_separators(remaining_cps);
+    if (!trimmed_remaining.empty()) {
+      result = to_utf8(trimmed_remaining);
+    }
+    break;
+  }
+  return result;
+}
+
+[[nodiscard]] CommandPlan make_command_plan_header(
+    const CommandParseContext& context, std::string_view raw_text,
+    std::string parser_version) {
+  CommandPlan plan;
+  plan.command_id = "cmd:" + std::to_string(context.runtime_session_id.size()) + ":" +
+                    context.runtime_session_id + ":" +
+                    std::to_string(context.utterance_id.size()) + ":" +
+                    context.utterance_id + ":g" +
+                    std::to_string(context.recognition_generation) + ":r" +
+                    std::to_string(context.final_revision) + ":c" +
+                    std::to_string(context.config_revision) + ":" + parser_version;
+  plan.runtime_session_id = context.runtime_session_id;
+  plan.utterance_id = context.utterance_id;
+  plan.origin = context.origin;
+  plan.activation_id = context.activation_id;
+  plan.turn_index = context.turn_index;
+  plan.trigger_sample = context.trigger_sample;
+  plan.wake_position = context.wake_position;
+  plan.raw_text = std::string(raw_text);
+  plan.parser_version = std::move(parser_version);
+  plan.config_revision = context.config_revision;
+  plan.recognition_generation = context.recognition_generation;
+  plan.final_revision = context.final_revision;
+  plan.timestamp_sample = context.timestamp_sample;
+  plan.source = context.source;
+  plan.execution_mode = context.source == ExecutionSource::live
+                            ? context.execution_mode
+                            : ExecutionMode::dry_run;
+  return plan;
+}
+
+[[nodiscard]] CommandParseResult build_validated_router_plan(
+    const LlmRouteResult& route_result, const CommandParseContext& context,
+    std::string_view raw_text, int maximum_volume_delta_percent,
+    std::size_t max_actions_per_utterance) {
+  if (route_result.error) return {{}, route_result.error};
+  if (route_result.actions.empty()) {
+    return failure("no_command_intent",
+                   "router determined text has no executable command intent", 0);
+  }
+  if (route_result.actions.size() > max_actions_per_utterance) {
+    return failure("too_many_actions",
+                   "command plan exceeds the configured action limit", 0);
+  }
+
+  std::string router_version = "llm.router";
+  if (!route_result.router_name.empty()) {
+    const auto cleaned_name = clean_router_text_field(route_result.router_name, 64);
+    if (!cleaned_name) {
+      return failure("invalid_router_result", "router_name is invalid", 0);
+    }
+    router_version = *cleaned_name;
+  }
+
+  auto plan = make_command_plan_header(context, raw_text, std::move(router_version));
+  plan.actions.reserve(route_result.actions.size());
+
+  for (std::size_t i = 0; i < route_result.actions.size(); ++i) {
+    const auto& proposed = route_result.actions[i];
+    const auto type_name = std::string_view(to_string(proposed.type));
+    if (type_name == "unknown") {
+      return failure("invalid_action_type", "router returned an unknown action type", i);
+    }
+
+    PlannedAction action;
+    action.sequence = static_cast<std::uint32_t>(i + 1);
+    action.action_id = plan.command_id + ":" + std::to_string(action.sequence);
+    action.type = proposed.type;
+
+    std::string canonical;
+    if (proposed.type == ActionType::master_volume_adjust) {
+      if (proposed.search_query || proposed.search_type || proposed.search_artist) {
+        return failure("invalid_action_parameters",
+                       "master_volume_adjust must not carry search parameters", i);
+      }
+      if (!proposed.volume_delta_percent || *proposed.volume_delta_percent == 0) {
+        return failure("invalid_volume_amount",
+                       "volume adjustment requires a non-zero integer percentage", i);
+      }
+      const int delta = *proposed.volume_delta_percent;
+      if (delta < -maximum_volume_delta_percent ||
+          delta > maximum_volume_delta_percent) {
+        return failure(
+            "volume_amount_out_of_range",
+            "volume percentage must be between 1 and the configured maximum", i);
+      }
+      action.volume_delta_percent = delta;
+      canonical = (delta > 0 ? "增加音量" : "降低音量") +
+                  std::to_string(std::abs(delta)) + "%";
+    } else if (proposed.type == ActionType::media_search_play) {
+      if (proposed.volume_delta_percent) {
+        return failure("invalid_action_parameters",
+                       "media.search_play must not carry volume_delta_percent", i);
+      }
+      if (!proposed.search_query) {
+        return failure("invalid_search_query",
+                       "media.search_play requires search_query", i);
+      }
+      const auto cleaned_query =
+          clean_router_text_field(*proposed.search_query, kMaxMediaSearchTextBytes);
+      if (!cleaned_query) {
+        return failure("invalid_search_query",
+                       "media.search_play search_query must be non-empty valid UTF-8",
+                       i);
+      }
+      const auto search_type =
+          proposed.search_type.value_or(MediaSearchType::song);
+      if (std::string_view(to_string(search_type)) == "unknown") {
+        return failure("invalid_search_type",
+                       "media.search_play search_type is invalid", i);
+      }
+      std::optional<std::string> cleaned_artist;
+      if (proposed.search_artist) {
+        bool all_ws = true;
+        for (std::size_t off = 0; off < proposed.search_artist->size();) {
+          const auto dec = decode_one(*proposed.search_artist, off);
+          if (!dec) {
+            return failure("invalid_search_artist",
+                           "media.search_play search_artist is not valid UTF-8", i);
+          }
+          if (!is_space(dec->first)) all_ws = false;
+          off += dec->second;
+        }
+        if (!all_ws) {
+          cleaned_artist = clean_router_text_field(*proposed.search_artist,
+                                                   kMaxMediaSearchTextBytes);
+          if (!cleaned_artist) {
+            return failure("invalid_search_artist",
+                           "media.search_play search_artist is invalid", i);
+          }
+        }
+      }
+      action.search_query = *cleaned_query;
+      action.search_type = search_type;
+      action.search_artist = std::move(cleaned_artist);
+      canonical = std::string("media.search_play:") + to_string(search_type) + ":";
+      if (action.search_artist) canonical += *action.search_artist + "/";
+      canonical += *action.search_query;
+    } else {
+      if (proposed.volume_delta_percent || proposed.search_query ||
+          proposed.search_type || proposed.search_artist) {
+        return failure("invalid_action_parameters",
+                       "action must not carry unexpected parameters", i);
+      }
+      canonical = std::string(type_name);
+    }
+
+    if (!plan.normalized_text.empty()) plan.normalized_text.push_back(';');
+    plan.normalized_text += canonical;
+    plan.actions.push_back(std::move(action));
+  }
+
+  return {std::move(plan), {}};
+}
+
 }  // namespace
+
+const char* to_string(CommandParserMode mode) {
+  switch (mode) {
+    case CommandParserMode::rules: return "rules";
+    case CommandParserMode::hybrid: return "hybrid";
+    case CommandParserMode::router: return "router";
+  }
+  return "unknown";
+}
+
+std::optional<CommandParserMode> parse_command_parser_mode(std::string_view value) {
+  if (value == "rules") return CommandParserMode::rules;
+  if (value == "hybrid") return CommandParserMode::hybrid;
+  if (value == "router") return CommandParserMode::router;
+  return std::nullopt;
+}
 
 struct CommandParser::Impl {
   std::vector<PhraseRule> rules;
@@ -626,10 +976,14 @@ struct CommandParser::Impl {
 
 CommandParser::CommandParser(int default_volume_delta_percent,
                              int maximum_volume_delta_percent,
-                             CommandGrammar grammar)
+                             CommandGrammar grammar,
+                             CommandParserMode mode,
+                             std::shared_ptr<const ILlmCommandRouter> router)
     : default_volume_delta_percent_(default_volume_delta_percent),
       maximum_volume_delta_percent_(maximum_volume_delta_percent),
-      max_actions_per_utterance_(grammar.max_actions_per_utterance) {
+      max_actions_per_utterance_(grammar.max_actions_per_utterance),
+      mode_(mode),
+      router_(std::move(router)) {
   if (maximum_volume_delta_percent_ < 1 || maximum_volume_delta_percent_ > 20) {
     throw std::invalid_argument("maximum volume delta must be in [1, 20]");
   }
@@ -868,44 +1222,59 @@ CommandParseResult CommandParser::parse(std::string_view text,
     }
   }
 
+  const auto route_with_llm = [&]() -> CommandParseResult {
+    if (!router_) {
+      return failure("router_unavailable",
+                     "no LLM command router is configured", 0);
+    }
+    auto stripped = build_router_stripped_text(text, context.wake_word);
+    if (stripped.empty()) {
+      return failure("empty_text", "ASR text does not contain a command", 0);
+    }
+    LlmRouteRequest request;
+    request.raw_text = std::string(text);
+    request.stripped_text = std::move(stripped);
+    request.wake_word = context.wake_word;
+    request.wake_position = context.wake_position;
+    request.origin = context.origin;
+    request.max_actions = max_actions_per_utterance_;
+    request.default_volume_delta_percent = default_volume_delta_percent_;
+    request.maximum_volume_delta_percent = maximum_volume_delta_percent_;
+    const auto route_result = router_->route(request);
+    return build_validated_router_plan(
+        route_result, context, text, maximum_volume_delta_percent_,
+        max_actions_per_utterance_);
+  };
+
+  if (mode_ == CommandParserMode::router) {
+    return route_with_llm();
+  }
+
   std::optional<DraftParse> accepted;
   std::optional<CommandParseError> first_error;
+  std::optional<CommandParseError> hard_policy_error;
   for (const auto& reading : readings) {
     auto parsed = parse_drafts(reading);
     if (!parsed.error) {
       accepted = std::move(parsed);
       break;
     }
+    if (!hard_policy_error && is_hard_policy_error(parsed.error->code)) {
+      hard_policy_error = parsed.error;
+    }
     if (!first_error) first_error = std::move(parsed.error);
   }
-  if (!accepted) return {{}, first_error};
+  if (!accepted) {
+    if (hard_policy_error) return {{}, hard_policy_error};
+    if (mode_ == CommandParserMode::hybrid && router_) {
+      return route_with_llm();
+    }
+    return {{}, first_error};
+  }
   const auto& drafts = accepted->drafts;
 
-  CommandPlan plan;
-  plan.command_id = "cmd:" + std::to_string(context.runtime_session_id.size()) + ":" +
-                    context.runtime_session_id + ":" +
-                    std::to_string(context.utterance_id.size()) + ":" +
-                    context.utterance_id + ":g" +
-                    std::to_string(context.recognition_generation) + ":r" +
-                    std::to_string(context.final_revision) + ":c" +
-                    std::to_string(context.config_revision) + ":" + kCommandParserVersion;
-  plan.runtime_session_id = context.runtime_session_id;
-  plan.utterance_id = context.utterance_id;
-  plan.origin = context.origin;
-  plan.activation_id = context.activation_id;
-  plan.turn_index = context.turn_index;
-  plan.trigger_sample = context.trigger_sample;
-  plan.wake_position = context.wake_position;
-  plan.raw_text = std::string(text);
-  plan.parser_version = kCommandParserVersion;
-  plan.config_revision = context.config_revision;
-  plan.recognition_generation = context.recognition_generation;
-  plan.final_revision = context.final_revision;
-  plan.timestamp_sample = context.timestamp_sample;
-  plan.source = context.source;
-  plan.execution_mode = context.source == ExecutionSource::live
-                            ? context.execution_mode
-                            : ExecutionMode::dry_run;
+  auto plan = make_command_plan_header(context, text, kCommandParserVersion);
+  plan.actions.reserve(drafts.size());
 
   for (std::size_t i = 0; i < drafts.size(); ++i) {
     if (!plan.normalized_text.empty()) plan.normalized_text.push_back(';');

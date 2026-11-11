@@ -12,6 +12,7 @@
 #include <tuple>
 
 #include "dvo/audio_types.h"
+#include "dvo/command.h"
 #include "dvo/inference.h"
 #include "dvo/preprocessor.h"
 #include "dvo/streaming_recognizer.h"
@@ -87,6 +88,22 @@ EvaluationTake parse_take(const nlohmann::json& value, std::size_t index) {
       if (const auto delta = action.find("volume_delta_percent");
           delta != action.end() && delta->is_number_integer()) {
         expected.volume_delta_percent = delta->get<int>();
+      }
+      if (const auto query = action.find("search_query");
+          query != action.end() && query->is_string()) {
+        expected.search_query = query->get<std::string>();
+      }
+      if (const auto search_type = action.find("search_type");
+          search_type != action.end() && search_type->is_string()) {
+        const auto value_str = search_type->get<std::string>();
+        if (!parse_media_search_type(value_str)) {
+          throw std::invalid_argument(where + " has an invalid search_type");
+        }
+        expected.search_type = value_str;
+      }
+      if (const auto artist = action.find("search_artist");
+          artist != action.end() && artist->is_string()) {
+        expected.search_artist = artist->get<std::string>();
       }
       take.expected_actions.push_back(std::move(expected));
     }
@@ -342,6 +359,27 @@ bool actions_match(const nlohmann::json& actual,
       const auto delta = action.find("volume_delta_percent");
       if (delta == action.end() || !delta->is_number_integer() ||
           delta->get<int>() != *expected[index].volume_delta_percent) {
+        return false;
+      }
+    }
+    if (expected[index].search_query) {
+      const auto query = action.find("search_query");
+      if (query == action.end() || !query->is_string() ||
+          query->get<std::string>() != *expected[index].search_query) {
+        return false;
+      }
+    }
+    if (expected[index].search_type) {
+      const auto search_type = action.find("search_type");
+      if (search_type == action.end() || !search_type->is_string() ||
+          search_type->get<std::string>() != *expected[index].search_type) {
+        return false;
+      }
+    }
+    if (expected[index].search_artist) {
+      const auto artist = action.find("search_artist");
+      if (artist == action.end() || !artist->is_string() ||
+          artist->get<std::string>() != *expected[index].search_artist) {
         return false;
       }
     }
@@ -662,6 +700,18 @@ nlohmann::json evaluate_labeled_session(const EvaluationLabels& labels,
                           {"volume_delta_percent",
                            action.volume_delta_percent
                                ? nlohmann::json(*action.volume_delta_percent)
+                               : nlohmann::json(nullptr)},
+                          {"search_query",
+                           action.search_query
+                               ? nlohmann::json(*action.search_query)
+                               : nlohmann::json(nullptr)},
+                          {"search_type",
+                           action.search_type
+                               ? nlohmann::json(*action.search_type)
+                               : nlohmann::json(nullptr)},
+                          {"search_artist",
+                           action.search_artist
+                               ? nlohmann::json(*action.search_artist)
                                : nlohmann::json(nullptr)}});
     }
     nlohmann::json result = {{"id", take.id}, {"kind", take.kind}, {"status", take.status},

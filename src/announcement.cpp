@@ -79,6 +79,24 @@ namespace {
       return "打开桌面歌词";
     case ActionType::media_lyrics_hide:
       return "关闭桌面歌词";
+    case ActionType::media_search_play: {
+      if (!action.search_query || action.search_query->empty()) {
+        return "搜索播放音乐";
+      }
+      const auto search_type =
+          action.search_type.value_or(MediaSearchType::song);
+      if (search_type == MediaSearchType::playlist) {
+        if (action.search_artist && !action.search_artist->empty()) {
+          return "播放 " + *action.search_artist + " 的歌单 " +
+                 *action.search_query;
+        }
+        return "播放歌单 " + *action.search_query;
+      }
+      if (action.search_artist && !action.search_artist->empty()) {
+        return "播放 " + *action.search_artist + " 的 " + *action.search_query;
+      }
+      return "播放歌曲 " + *action.search_query;
+    }
   }
   return "未知操作";
 }

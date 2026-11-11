@@ -69,6 +69,17 @@ function parseActionLabel(action) {
   if (action.type === 'media.mode.shuffle') return '随机播放';
   if (action.type === 'media.lyrics.show') return '打开歌词';
   if (action.type === 'media.lyrics.hide') return '关闭歌词';
+  if (action.type === 'media.search_play') {
+    const query = action.search_query || '';
+    if (action.search_type === 'playlist') {
+      return action.search_artist
+        ? `播放歌单：${action.search_artist} · ${query}`
+        : `播放歌单：${query}`;
+    }
+    return action.search_artist
+      ? `搜歌播放：${action.search_artist} - ${query}`
+      : `搜歌播放：${query}`;
+  }
   if (action.type === 'audio.volume.adjust') {
     const delta = Number(action.volume_delta_percent || 0);
     return `音量${delta >= 0 ? '+' : ''}${delta}%`;

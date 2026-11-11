@@ -45,6 +45,7 @@ void print_usage() {
                "           [--since=<YYYYMMDD-HHMMSS>]   (only sessions recorded from then on)\n"
                "  parse [--wake=<wake word>]   (one recognized text per stdin line)\n"
                "  act <next|like|daily|order|list-loop|single-loop|shuffle|lyrics-on|lyrics-off>\n"
+               "  act search-play <query> [--playlist] [--artist=<artist>]\n"
                "      (runs one action for real, bypassing speech)\n"
                "  netease-start [--restart]   (starts NetEase Cloud Music with its control channel;\n"
                "      --restart closes a client running without it first)\n";
@@ -103,25 +104,36 @@ std::vector<std::filesystem::path> labeled_sessions(const std::filesystem::path&
   return sessions;
 }
 
-// argv is in the ANSI code page on Windows; non-ASCII options such as a
-// Chinese wake word must come from the UTF-16 command line instead.
-std::optional<std::string> utf8_option_value(std::string_view name) {
+std::vector<std::string> utf8_command_line_args() {
   int count{};
   wchar_t** wide = CommandLineToArgvW(GetCommandLineW(), &count);
-  if (!wide) return std::nullopt;
-  std::optional<std::string> result;
-  for (int index = 2; index < count && !result; ++index) {
+  if (!wide) return {};
+  std::vector<std::string> args;
+  args.reserve(static_cast<std::size_t>(count));
+  for (int index = 0; index < count; ++index) {
     const int size = WideCharToMultiByte(CP_UTF8, 0, wide[index], -1, nullptr, 0, nullptr, nullptr);
     std::string argument(size > 0 ? static_cast<std::size_t>(size - 1) : 0, '\0');
     if (size > 1) {
       WideCharToMultiByte(CP_UTF8, 0, wide[index], -1, argument.data(), size, nullptr, nullptr);
     }
-    if (argument.starts_with(name) && argument.size() > name.size() && argument[name.size()] == '=') {
-      result = argument.substr(name.size() + 1);
-    }
+    args.push_back(std::move(argument));
   }
   LocalFree(wide);
-  return result;
+  return args;
+}
+
+// argv is in the ANSI code page on Windows; non-ASCII options such as a
+// Chinese wake word must come from the UTF-16 command line instead.
+std::optional<std::string> utf8_option_value(std::string_view name) {
+  const auto args = utf8_command_line_args();
+  for (std::size_t index = 2; index < args.size(); ++index) {
+    const std::string_view argument = args[index];
+    if (argument.starts_with(name) && argument.size() > name.size() &&
+        argument[name.size()] == '=') {
+      return std::string(argument.substr(name.size() + 1));
+    }
+  }
+  return std::nullopt;
 }
 
 // Executes one action through the live Windows backend, for checking an
@@ -130,20 +142,55 @@ int run_action(const dvo::AppConfig& config, std::string_view name) {
   dvo::PlannedAction action;
   action.action_id = "act-cli";
   action.sequence = 1;
-  const std::array<std::pair<std::string_view, dvo::ActionType>, 9> actions{{
-      {"next", dvo::ActionType::media_next},
-      {"like", dvo::ActionType::media_like},
-      {"daily", dvo::ActionType::media_play_daily},
-      {"order", dvo::ActionType::media_mode_order},
-      {"list-loop", dvo::ActionType::media_mode_list_loop},
-      {"single-loop", dvo::ActionType::media_mode_single_loop},
-      {"shuffle", dvo::ActionType::media_mode_shuffle},
-      {"lyrics-on", dvo::ActionType::media_lyrics_show},
-      {"lyrics-off", dvo::ActionType::media_lyrics_hide},
-  }};
-  const auto found = std::ranges::find(actions, name, &decltype(actions)::value_type::first);
-  if (found == actions.end()) throw std::invalid_argument("unknown action for act");
-  action.type = found->second;
+  if (name == "search-play") {
+    const auto args = utf8_command_line_args();
+    dvo::MediaSearchType search_type = dvo::MediaSearchType::song;
+    std::optional<std::string> artist;
+    std::string query;
+    for (std::size_t index = 3; index < args.size(); ++index) {
+      const std::string_view arg = args[index];
+      if (arg == "--playlist") {
+        search_type = dvo::MediaSearchType::playlist;
+      } else if (arg == "--song") {
+        search_type = dvo::MediaSearchType::song;
+      } else if (arg.starts_with("--artist=")) {
+        auto value = std::string(arg.substr(std::string_view{"--artist="}.size()));
+        if (!value.empty()) artist = std::move(value);
+      } else if (arg.starts_with("--")) {
+        throw std::invalid_argument("unknown option for act search-play: " +
+                                    std::string(arg));
+      } else {
+        if (!query.empty()) query.push_back(' ');
+        query.append(arg);
+      }
+    }
+    if (query.empty()) {
+      throw std::invalid_argument(
+          "act search-play requires a <query> [--playlist] [--artist=<artist>]");
+    }
+    action.type = dvo::ActionType::media_search_play;
+    action.search_query = std::move(query);
+    action.search_type = search_type;
+    action.search_artist = std::move(artist);
+  } else {
+    const std::array<std::pair<std::string_view, dvo::ActionType>, 9> actions{{
+        {"next", dvo::ActionType::media_next},
+        {"like", dvo::ActionType::media_like},
+        {"daily", dvo::ActionType::media_play_daily},
+        {"order", dvo::ActionType::media_mode_order},
+        {"list-loop", dvo::ActionType::media_mode_list_loop},
+        {"single-loop", dvo::ActionType::media_mode_single_loop},
+        {"shuffle", dvo::ActionType::media_mode_shuffle},
+        {"lyrics-on", dvo::ActionType::media_lyrics_show},
+        {"lyrics-off", dvo::ActionType::media_lyrics_hide},
+    }};
+    const auto found = std::ranges::find(
+        actions, name, &decltype(actions)::value_type::first);
+    if (found == actions.end()) {
+      throw std::invalid_argument("unknown action for act");
+    }
+    action.type = found->second;
+  }
   const auto backend = dvo::create_windows_action_backend(
       {config.audio.loopback_device, config.commands.action_timeout_ms,
        netease_action_config(config)});
@@ -151,14 +198,32 @@ int run_action(const dvo::AppConfig& config, std::string_view name) {
   const auto result = backend->execute(action, std::stop_source{}.get_token());
   const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
       std::chrono::steady_clock::now() - started);
-  std::cout << nlohmann::json{{"type", dvo::to_string(result.type)},
-                              {"status", dvo::to_string(result.status)},
-                              {"adapter", result.adapter},
-                              {"target_id", result.target_id},
-                              {"error_code", result.error_code},
-                              {"message", result.message},
-                              {"elapsed_ms", elapsed.count()}}
-                   .dump(2, ' ', false, nlohmann::json::error_handler_t::replace)
+  nlohmann::json out{{"type", dvo::to_string(result.type)},
+                     {"status", dvo::to_string(result.status)},
+                     {"adapter", result.adapter},
+                     {"target_id", result.target_id},
+                     {"error_code", result.error_code},
+                     {"message", result.message},
+                     {"elapsed_ms", elapsed.count()}};
+  if (result.type == dvo::ActionType::media_search_play) {
+    out["search_query"] = result.requested_search_query
+                              ? nlohmann::json(*result.requested_search_query)
+                              : (action.search_query
+                                     ? nlohmann::json(*action.search_query)
+                                     : nlohmann::json(nullptr));
+    const auto effective_type = result.requested_search_type.has_value()
+                                    ? result.requested_search_type
+                                    : action.search_type;
+    out["search_type"] = effective_type
+                             ? nlohmann::json(dvo::to_string(*effective_type))
+                             : nlohmann::json(nullptr);
+    const auto effective_artist = result.requested_search_artist.has_value()
+                                      ? result.requested_search_artist
+                                      : action.search_artist;
+    out["search_artist"] = effective_artist ? nlohmann::json(*effective_artist)
+                                            : nlohmann::json(nullptr);
+  }
+  std::cout << out.dump(2, ' ', false, nlohmann::json::error_handler_t::replace)
             << "\n";
   return result.status == dvo::ActionStatus::failed ? 1 : 0;
 }
@@ -170,7 +235,9 @@ int run_parse(const dvo::AppConfig& config) {
   const dvo::CommandParser parser(
       static_cast<int>(config.commands.default_volume_step_percent),
       static_cast<int>(config.commands.max_spoken_volume_step_percent),
-      dvo::command_grammar(config.commands));
+      dvo::command_grammar(config.commands),
+      dvo::parse_command_parser_mode(config.commands.parser_mode)
+          .value_or(dvo::CommandParserMode::rules));
   std::string line;
   std::uint64_t index{};
   while (std::getline(std::cin, line)) {
@@ -191,8 +258,21 @@ int run_parse(const dvo::AppConfig& config) {
                            {"volume_delta_percent",
                             action.volume_delta_percent
                                 ? nlohmann::json(*action.volume_delta_percent)
+                                : nlohmann::json(nullptr)},
+                           {"search_query",
+                            action.search_query
+                                ? nlohmann::json(*action.search_query)
+                                : nlohmann::json(nullptr)},
+                           {"search_type",
+                            action.search_type
+                                ? nlohmann::json(dvo::to_string(*action.search_type))
+                                : nlohmann::json(nullptr)},
+                           {"search_artist",
+                            action.search_artist
+                                ? nlohmann::json(*action.search_artist)
                                 : nlohmann::json(nullptr)}});
       }
+      result["parser_version"] = parsed.plan->parser_version;
       result["normalized_text"] = parsed.plan->normalized_text;
       result["actions"] = std::move(actions);
     } else if (parsed.error) {

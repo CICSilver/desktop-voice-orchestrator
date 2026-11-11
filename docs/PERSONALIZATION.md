@@ -137,6 +137,16 @@ Ctrl+Alt+D（先确认该快捷键确实被占用），再核对窗口状态，�
 训练在 WSL2 + CUDA（RTX 4090）中进行，录音留在 E: 盘，通过 `/mnt/e` 访问。安装步骤见
 [WSL_TRAINING_SETUP.md](WSL_TRAINING_SETUP.md)。
 
+## M3 自然语言扩词与个人音色克隆防失真训练（Colab `asr-personal-v2`）
+
+针对未录足的新命令（如“换歌”“切歌”“放每日推荐”“顺序播放”“打开/关闭桌面歌词”“收藏这首歌”）、个人常听歌手/歌名及自由口语多步指令，M3 阶段引入 Google Colab 云端训练流水线（`training/colab_m3_pipeline.ipynb`），在不冲淡真机抗噪能力的前提下扩充词表：
+
+- **黄金参考音频池（`tools/prepare_voice_prompts.py`）**：从安静录音中结合 Silero VAD 与 10 ms 能量包络精确切除末尾空格键咔哒声，保留句尾后 `0.15~0.20 s` 原生房间底噪（严禁二次频谱降噪以免引入电音伪影），筛选 `2.5~8.0 s`、不削波（`-24.0 ~ -1.5 dBFS`）、基线识别零错字且覆盖多句式的 Top 20 参考音频。
+- **文本前端防失真规范化（`tools/build_nl_tts_prompts.py`）**：可选只读提取本机网易云 `Library/webdb.dat` 个人华语曲库并合并流行曲目种子库，将所有数字与 `%` 转为纯中文读法（如 `15%` → `百分之十五`），严格限制单句 `4~20` 个汉字，生成 25 条试听清单（`pilot_prompts_25.jsonl`）与 3,600 条全量均衡清单（`full_prompts_3600.jsonl`）。
+- **零样本克隆与独立裁判闭环过滤（`training/asr/synthesize_personal_tts.py`）**：采用 `CosyVoice2-0.5B`（80% 本人参考池克隆 + 20% 多样化防过拟合），经 `scipy.signal.resample_poly` 抗混叠下采样至 16 kHz 后，先检验有效语速（`[1.8, 7.5]` 字/秒），再由原始未微调 `SenseVoice` 独立裁判复核识别（命令类要求 `CER = 0`，歌名/歌手专有名词允许无调拼音 `100%` 一致的同音字）；不达标自动换参考音重试最多 3 次，仍失败则隔离进 `rejected.jsonl`。
+- **戴耳机游戏背景录音无感挖掘（`tools/mine_game_sessions.py`）**：严格只读 `mic.wav`（忽略含队友与游戏声的 `loopback.wav`）并遵守 `labels.json` 的 `discarded` 区间，剔除团战喊叫削波段与短碎词；在 `--transcribe` 模式下由 `SenseVoice` 与 `faster-whisper large-v3` 交叉转写，仅当两异构模型规范化中文文本 100% 逐字一致（`>= 3` 字）才作为 `game_verified` 正样本，不一致切片对半分流至 `train` 无字负样本池与 `test` 防误触发压力集。
+- **真机主锚点配比与音乐混音精调（`training/asr/finetune.py`）**：本人真实录音每轮重复 `--repeat 4`，合成 TTS 语料每轮随机抽样上限 `--tts-max-per-epoch 1800`，配合 `--unfreeze-encoder-layers 3` 并对真实与合成样本统一以 50% 概率动态混入 `0~15 dB` 真实外放背景音乐，掩盖声码器高频痕迹并保持音乐场景识别率。
+
 ## 风险
 
 - 只用命令数据微调识别模型，会让它倾向于把任何话语识别成命令。需要混入通用中文语料，并用日常背景录音检查误执行。

@@ -7,6 +7,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "dvo/command.h"
+
 namespace dvo {
 
 // A song as the NetEase Cloud Music client records it in its local play
@@ -43,5 +45,28 @@ struct NcmSearchHit {
 // an exact id counts: different versions of a song share its title and artist.
 [[nodiscard]] std::optional<NcmSearchHit> find_ncm_search_hit(const nlohmann::json& body,
                                                             std::string_view original_id);
+
+// Builds an `orpheus://<base64>` URI for {"type":"song"|"playlist","id":"<item_id>","cmd":"play"}.
+// Returns std::nullopt when item_id is not a positive integer string.
+[[nodiscard]] std::optional<std::string> build_netease_orpheus_play_url(
+    MediaSearchType type, std::string_view item_id);
+
+struct NeteaseSearchCandidate {
+  std::string id;  // positive integer item id
+  std::string name;
+  std::vector<std::string> artists;  // song artists/aliases or playlist creator
+};
+
+// Extracts playable song or playlist candidates from NetEase web/PC search JSON
+// (`result.songs` / `result.playlists`) or `ncm-cli` output (`data.records`).
+[[nodiscard]] std::vector<NeteaseSearchCandidate> parse_netease_search_candidates(
+    const nlohmann::json& body, MediaSearchType type);
+
+// Selects the best search candidate. When `artist` is non-empty, prioritizes
+// entries matching the requested artist to avoid playing unrelated covers;
+// when `artist` is empty, selects the first valid candidate.
+[[nodiscard]] std::optional<NeteaseSearchCandidate> select_netease_search_candidate(
+    const nlohmann::json& body, MediaSearchType type,
+    std::string_view artist = {});
 
 }  // namespace dvo

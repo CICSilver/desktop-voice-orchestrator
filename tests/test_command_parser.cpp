@@ -1,11 +1,16 @@
 #include <array>
 #include <filesystem>
+#include <functional>
+#include <memory>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "dvo/action_executor.h"
+#include "dvo/announcement.h"
 #include "dvo/command_parser.h"
 #include "dvo/config.h"
 #include "dvo/runtime.h"
@@ -202,11 +207,10 @@ TEST_CASE("Wake text, plus separators and one-character ASR omissions remain exe
         dvo::ActionType::media_pause);
   CHECK(pause_confusion.plan->normalized_text == "暂停音乐");
 
-  const auto alternate_pause_confusion =
+  // Natural-language listen requests ("再听音乐") must NEVER be rewritten to pause.
+  const auto listen_again =
       parser.parse("再听音乐小助手", wake_context);
-  REQUIRE(alternate_pause_confusion.ok());
-  CHECK(alternate_pause_confusion.plan->actions[0].type ==
-        dvo::ActionType::media_pause);
+  CHECK_FALSE(listen_again.ok());
 
   CHECK_FALSE(parser.parse("再连音乐", wake_context).ok());
 }
@@ -648,4 +652,211 @@ TEST_CASE("Parser rejects invalid context empty input and invalid UTF-8") {
   CHECK_FALSE(result.ok());
   REQUIRE(result.error.has_value());
   CHECK(result.error->code == "invalid_utf8");
+}
+
+TEST_CASE("Natural-language listen intents are never hijacked as media.pause in rules mode") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  dvo::ConfigStore store(root / "config/default.toml",
+                         std::filesystem::temp_directory_path() / "dvo-no-overrides.toml", root);
+  const auto config = store.load();
+  const dvo::CommandParser parser(
+      static_cast<int>(config.commands.default_volume_step_percent),
+      static_cast<int>(config.commands.max_spoken_volume_step_percent),
+      dvo::command_grammar(config.commands));
+
+  auto wake = context("listen-intent");
+  wake.origin = dvo::UtteranceOrigin::keyword;
+  wake.wake_word = "小克";
+
+  for (const char* text : {"小克，我想听音乐", "小克，再听音乐", "小克，在听音乐",
+                           "小克，听一下音乐", "我想听音乐，小克", "再听音乐，小克"}) {
+    CAPTURE(text);
+    const auto parsed = parser.parse(text, wake);
+    CHECK_FALSE(parsed.ok());
+    CHECK_FALSE(parsed.plan.has_value());
+  }
+}
+
+namespace {
+
+class MockCommandRouter final : public dvo::ILlmCommandRouter {
+ public:
+  using Handler = std::function<dvo::LlmRouteResult(const dvo::LlmRouteRequest&)>;
+
+  explicit MockCommandRouter(Handler handler) : handler_(std::move(handler)) {}
+
+  dvo::LlmRouteResult route(const dvo::LlmRouteRequest& request) const override {
+    requests.push_back(request);
+    return handler_(request);
+  }
+
+  mutable std::vector<dvo::LlmRouteRequest> requests;
+
+ private:
+  Handler handler_;
+};
+
+class RecordingExecutorBackend final : public dvo::IActionBackend {
+ public:
+  dvo::ActionResult execute(const dvo::PlannedAction& action,
+                            std::stop_token) override {
+    executed.push_back(action);
+    dvo::ActionResult result;
+    result.type = action.type;
+    result.adapter = "mock-backend";
+    result.status = dvo::ActionStatus::succeeded;
+    return result;
+  }
+
+  std::vector<dvo::PlannedAction> executed;
+};
+
+}  // namespace
+
+TEST_CASE("Hybrid parser keeps fast-path rules local, routes natural phrasings, and enforces strict validation") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  dvo::ConfigStore store(root / "config/default.toml",
+                         std::filesystem::temp_directory_path() / "dvo-no-overrides.toml", root);
+  const auto config = store.load();
+
+  dvo::LlmRouteResult next_response;
+  auto router = std::make_shared<MockCommandRouter>(
+      [&](const dvo::LlmRouteRequest&) { return next_response; });
+
+  const dvo::CommandParser parser(
+      static_cast<int>(config.commands.default_volume_step_percent),
+      static_cast<int>(config.commands.max_spoken_volume_step_percent),
+      dvo::command_grammar(config.commands),
+      dvo::CommandParserMode::hybrid,
+      router);
+
+  auto wake = context("hybrid-case");
+  wake.origin = dvo::UtteranceOrigin::keyword;
+  wake.wake_word = "小克";
+
+  // 1. Fast-path rule commands match locally without invoking the router.
+  const auto fast_pause = parser.parse("小克，暂停音乐", wake);
+  REQUIRE(fast_pause.ok());
+  CHECK(fast_pause.plan->parser_version == dvo::kCommandParserVersion);
+  REQUIRE(fast_pause.plan->actions.size() == 1);
+  CHECK(fast_pause.plan->actions[0].type == dvo::ActionType::media_pause);
+  CHECK(router->requests.empty());
+
+  // Hard parameter range violations in rules must NOT fall through to the router.
+  const auto excessive_vol = parser.parse("小克，增加音量50%", wake);
+  CHECK_FALSE(excessive_vol.ok());
+  REQUIRE(excessive_vol.error.has_value());
+  CHECK(excessive_vol.error->code == "volume_amount_out_of_range");
+  CHECK(router->requests.empty());
+
+  // 2. Natural-language listen intent reaches the router with both raw_text and clean stripped_text.
+  next_response = dvo::LlmRouteResult{
+      .actions = {{.type = dvo::ActionType::media_play}},
+      .error = std::nullopt,
+      .router_name = "llm.mock",
+  };
+  const auto listen = parser.parse("小克，我想听音乐", wake);
+  REQUIRE(listen.ok());
+  REQUIRE(router->requests.size() == 1);
+  CHECK(router->requests[0].raw_text == "小克，我想听音乐");
+  CHECK(router->requests[0].stripped_text == "我想听音乐");
+  CHECK(router->requests[0].wake_word == "小克");
+  CHECK(router->requests[0].default_volume_delta_percent == 5);
+  CHECK(router->requests[0].maximum_volume_delta_percent == 20);
+  CHECK(listen.plan->parser_version == "llm.mock");
+  REQUIRE(listen.plan->actions.size() == 1);
+  CHECK(listen.plan->actions[0].type == dvo::ActionType::media_play);
+
+  // 3. Compound action ("先把声音调小5%，再放首周杰伦的晴天") preserves order, deduplicates, and announces.
+  next_response = dvo::LlmRouteResult{
+      .actions =
+          {
+              {.type = dvo::ActionType::master_volume_adjust,
+               .volume_delta_percent = -5},
+              {.type = dvo::ActionType::media_search_play,
+               .search_query = "晴天",
+               .search_type = dvo::MediaSearchType::song,
+               .search_artist = "周杰伦"},
+          },
+      .error = std::nullopt,
+      .router_name = "llm.mock",
+  };
+  auto compound_ctx = wake;
+  compound_ctx.utterance_id = "compound-jay-chou";
+  compound_ctx.source = dvo::ExecutionSource::live;
+  compound_ctx.execution_mode = dvo::ExecutionMode::live;
+  const auto compound =
+      parser.parse("小克，先把声音调小5%，再放首周杰伦的晴天", compound_ctx);
+  REQUIRE(compound.ok());
+  REQUIRE(router->requests.size() == 2);
+  CHECK(router->requests[1].raw_text == "小克，先把声音调小5%，再放首周杰伦的晴天");
+  CHECK(router->requests[1].stripped_text == "先把声音调小5%，再放首周杰伦的晴天");
+  REQUIRE(compound.plan->actions.size() == 2);
+  CHECK(compound.plan->actions[0].sequence == 1);
+  CHECK(compound.plan->actions[0].type == dvo::ActionType::master_volume_adjust);
+  CHECK(compound.plan->actions[0].volume_delta_percent == -5);
+  CHECK(compound.plan->actions[1].sequence == 2);
+  CHECK(compound.plan->actions[1].type == dvo::ActionType::media_search_play);
+  CHECK(compound.plan->actions[1].search_query == "晴天");
+  CHECK(compound.plan->actions[1].search_type == dvo::MediaSearchType::song);
+  CHECK(compound.plan->actions[1].search_artist == "周杰伦");
+
+  const auto announcement =
+      dvo::make_plan_announcement(*compound.plan, "announce-compound");
+  CHECK(announcement.text == "正在执行：降低音量 5%，然后播放 周杰伦 的 晴天");
+
+  auto exec_backend = std::make_shared<RecordingExecutorBackend>();
+  std::vector<dvo::ActionResult> exec_results;
+  dvo::OrderedActionExecutor executor(
+      exec_backend, {},
+      [&](const dvo::ActionResult& r) { exec_results.push_back(r); });
+  REQUIRE(executor.try_submit(*compound.plan).accepted());
+  REQUIRE(executor.try_submit(*compound.plan).accepted());
+  REQUIRE(executor.wait_until_idle(std::chrono::seconds(2)));
+  REQUIRE(exec_backend->executed.size() == 2);
+  CHECK(exec_backend->executed[0].type == dvo::ActionType::master_volume_adjust);
+  CHECK(exec_backend->executed[1].type == dvo::ActionType::media_search_play);
+  CHECK(exec_backend->executed[1].search_query == "晴天");
+  CHECK(exec_backend->executed[1].search_artist == "周杰伦");
+  // First submission: 2*(started + succeeded) = 4; duplicate submission: 2*deduplicated = 2 -> total 6.
+  REQUIRE(exec_results.size() == 6);
+  CHECK(exec_results[4].status == dvo::ActionStatus::deduplicated);
+  CHECK(exec_results[5].status == dvo::ActionStatus::deduplicated);
+  executor.stop();
+
+  // 4. Router validation strictly rejects chitchat empty arrays and malformed parameters.
+  next_response = dvo::LlmRouteResult{.actions = {}, .router_name = "llm.mock"};
+  const auto chitchat = parser.parse("小克，今天天气真不错", wake);
+  CHECK_FALSE(chitchat.ok());
+  REQUIRE(chitchat.error.has_value());
+  CHECK(chitchat.error->code == "no_command_intent");
+
+  next_response = dvo::LlmRouteResult{
+      .actions = {{.type = dvo::ActionType::media_search_play,
+                   .search_query = "   "}},
+      .router_name = "llm.mock",
+  };
+  const auto empty_query = parser.parse("小克，随便搜首歌", wake);
+  CHECK_FALSE(empty_query.ok());
+  REQUIRE(empty_query.error.has_value());
+  CHECK(empty_query.error->code == "invalid_search_query");
+
+  next_response = dvo::LlmRouteResult{
+      .actions = {{.type = dvo::ActionType::master_volume_adjust,
+                   .volume_delta_percent = 50}},
+      .router_name = "llm.mock",
+  };
+  const auto bad_router_volume = parser.parse("小克，声音拉满", wake);
+  CHECK_FALSE(bad_router_volume.ok());
+  REQUIRE(bad_router_volume.error.has_value());
+  CHECK(bad_router_volume.error->code == "volume_amount_out_of_range");
+
+  dvo::LlmRouteResult nine_actions;
+  nine_actions.router_name = "llm.mock";
+  nine_actions.actions.assign(9, dvo::ProposedAction{.type = dvo::ActionType::media_next});
+  next_response = nine_actions;
+  const auto too_many = parser.parse("小克，一直切歌", wake);
+  CHECK_FALSE(too_many.ok());
+  REQUIRE(too_many.error.has_value());
+  CHECK(too_many.error->code == "too_many_actions");
 }

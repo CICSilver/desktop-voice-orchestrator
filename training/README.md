@@ -29,10 +29,12 @@ SenseVoiceEncoderSmall → 5 层 Transformer（`ctc_decoder`）→ CTC 输出层
 
 | 文件 | 作用 |
 | --- | --- |
-| `asr/finetune.py` | 默认只训练 `ctc_decoder`（与官方配方一致，编码器和输出层冻结）；个人录音 + AISHELL-1，一半叠加音乐，约 30% 拼成长句 |
-| `asr/export.py` | 导出 `model.onnx` 与 QUInt8 的 `model.int8.onnx`，写入与上游相同的元数据 |
-| `asr/evaluate.py` | test split 上的字错率（安静/音乐），以及日常背景里被识别出命令短语的片段数 |
-| `asr/run.sh` | 微调、逐轮导出并评估 |
+| `asr/finetune.py` | 默认只训练 `ctc_decoder`（支持 `--unfreeze-encoder-layers` 解冻编码器尾层）；支持 `--extra-manifests` 与 `--tts-max-per-epoch` 多源均衡采样，一半叠加音乐，约 30% 拼成长句 |
+| `asr/synthesize_personal_tts.py` | 基于 `CosyVoice2-0.5B` 零样本克隆个人音色 + 原始 `SenseVoice` 独立裁判闭环防失真质检（拦截错字、语速异常与截断坏样本） |
+| `asr/export.py` | 导出 `model.onnx` 与 QUInt8 的 `model.int8.onnx`，写入与上游相同的元数据（支持 `--sherpa-nano-dir` / `--tokens`） |
+| `asr/evaluate.py` | test split 上的字错率（安静/音乐）、新命令子集准确率，以及日常背景里被识别出命令短语的片段数 |
+| `asr/run.sh` | 微调、逐轮导出并评估（WSL） |
+| `colab_m3_pipeline.ipynb` | Google Colab（L4 / A100）一键运行流水线：试听 25 条克隆小样 → 可选游戏录音双模型打标 → 3,600 条扩词造数 → 微调并导出 `asr-personal-v2` |
 
 ```bash
 bash training/asr/run.sh asr-ft1 --num-epochs 3
@@ -40,3 +42,23 @@ bash training/asr/run.sh asr-ft1 --num-epochs 3
 
 替换时把 `export-epoch-N/model.int8.onnx` 和 `tokens.txt` 拷到 `models/` 下，修改 `asr.final_model` 和 `asr.final_tokens`。
 二级唤醒同样使用这个模型。
+
+## M3 个人音色克隆扩词与 Colab 训练工具链
+
+当本机未启用 WSL 或需要批量扩充新命令、歌手/歌名与自然语言口语句式时，按以下步骤配合 Google Drive 与 Colab 运行：
+
+1. **筛选本人黄金参考音频池**（自动裁除尾部空格键瞬态咔哒声，仅保留高信噪比安静原声，不做频谱降噪）：
+   ```powershell
+   python tools/prepare_voice_prompts.py --manifest data/dataset/manifest.jsonl `
+     --out-dir "H:\我的云端硬盘\desktop-voice-orchestrator-data\m3_tts_prep\prompt_pool"
+   ```
+2. **生成防失真 TTS 扩词清单**（自动读取本机网易云 `webdb.dat` 华语曲库并转换全部数字/`%` 为纯中文，单句严格限制 4~20 字）：
+   ```powershell
+   python tools/build_nl_tts_prompts.py `
+     --out-dir "H:\我的云端硬盘\desktop-voice-orchestrator-data\m3_tts_prep"
+   ```
+3. **（可选）清洗戴耳机游戏背景录音**（只读 `mic.wav`，遵守 `discarded` 区间，Silero VAD 切分 + Colab 双异构模型 `SenseVoice` & `faster-whisper large-v3` 100% 逐字一致交叉打标）：
+   ```powershell
+   python tools/mine_game_sessions.py --sessions data/sessions --out data/game_mined
+   ```
+4. **Colab 一键合成、微调与导出**：在 Google Colab 打开 `training/colab_m3_pipeline.ipynb`，依次运行 Cell 1~6，先在线试听 25 条 Pilot 小样确认音色自然无电音，再批量合成并导出 `models/asr-personal-v2/model.int8.onnx`。
