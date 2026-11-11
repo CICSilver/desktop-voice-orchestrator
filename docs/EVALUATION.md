@@ -220,4 +220,4 @@
    - 在已覆盖词表的安静与外放音乐场景中均达到 `26/26 (100%)` 动作正确率与 `0.86%` 极低字错率，且在通用朗读集 `dev_read` 上字错率（`11.93%`）优于原始模型（`12.23%`），证明微调未破坏通用中文识别能力；
    - 在晚间新录制的 51 条扩展指令上错失 4 条，全部集中在训练集中未出现过的 3 个新短语：`"换歌"`（被误听为 `"放克"` / `"旺克"`）、`"放每日推荐"`（被误听为 `"放美日开金"`）、`"顺序播放"`（被误听为 `"数据播放"`）。通过将这批录音合入训练集并在 Colab 上补充合成语料做第二轮微调（`asr-personal-v2`）即可解决。
 3. **后续演进方向**：
-   - 保持本地 SenseVoice 作为唯一极速主 ASR，将 OpenAI API 预算重点投入在**自然语言 HTTP 意图路由（`gpt-4o-mini`）**、**合成训练数据生成**与**带本地磁盘缓存的 TTS 播报（`gpt-4o-mini-tts`）**。完整四阶段路线图详见 [`docs/NATURAL_LANGUAGE_ROADMAP.md`](NATURAL_LANGUAGE_ROADMAP.md)。
+   - 保持本地 SenseVoice 作为唯一极速主 ASR（主力机 7800X3D 4 线程下 `~30 ms`），日常看书/写字由 RTX 4090 常驻 `3B/4B` 专属路由模型（`< 80 ms`），游戏模式一键卸载显存热切至 OpenAI `gpt-4o-mini`；数据合成与模型微调全量交由 Colab A100，TTS 播报改用带本地磁盘缓存的 Google `gemini-3.8-flash-tts`（规避 2027-01-06 退役的 `gpt-4o-mini-tts`）搭配 `sherpa-onnx` `Kokoro v1.1` 纯离线兜底。完整四阶段路线图详见 [`docs/NATURAL_LANGUAGE_ROADMAP.md`](NATURAL_LANGUAGE_ROADMAP.md)。
