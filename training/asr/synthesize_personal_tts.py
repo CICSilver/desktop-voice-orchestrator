@@ -134,6 +134,120 @@ def resample_to_16k_poly(signal: np.ndarray, orig_sr: int) -> np.ndarray:
         return (np.fft.irfft(out_spec, target_len) * (target_len / len(sig))).astype(np.float32)
 
 
+def _load_wav_soundfile_tensor(wav_path: str | Path, target_sr: int | None = None):
+    """Deterministic, idempotent audio loader using soundfile + polyphase resampling.
+
+    Loads WAV as float32, averages channels to mono, resamples via polyphase filter
+    if target_sr is requested and differs from file sr, and returns a (1, N) float32 tensor
+    (torch.Tensor if torch is installed, else numpy array).
+    If target_sr is None, returns (tensor_1xN, sr); otherwise returns tensor_1xN.
+    """
+    path_str = str(wav_path)
+    try:
+        import soundfile as sf
+        data, sr = sf.read(path_str, dtype="float32", always_2d=True)
+    except Exception:
+        # Fallback to standard library wave for simple PCM WAV
+        import wave
+        with wave.open(path_str, "rb") as wf:
+            sr = wf.getframerate()
+            n_ch = wf.getnchannels()
+            n_frames = wf.getnframes()
+            sampwidth = wf.getsampwidth()
+            raw_bytes = wf.readframes(n_frames)
+            if sampwidth == 2:
+                data = (np.frombuffer(raw_bytes, dtype="<i2").astype(np.float32) / 32768.0).reshape(-1, n_ch)
+            elif sampwidth == 4:
+                data = (np.frombuffer(raw_bytes, dtype="<i4").astype(np.float32) / 2147483648.0).reshape(-1, n_ch)
+            elif sampwidth == 1:
+                data = ((np.frombuffer(raw_bytes, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0).reshape(-1, n_ch)
+            else:
+                data = np.frombuffer(raw_bytes, dtype=np.float32).reshape(-1, n_ch)
+
+    if data.shape[1] > 1:
+        mono = np.mean(data, axis=1)
+    else:
+        mono = data[:, 0]
+
+    out_sr = sr
+    if target_sr is not None and target_sr != sr and len(mono) > 0:
+        g = math.gcd(int(target_sr), int(sr))
+        up = int(target_sr) // g
+        down = int(sr) // g
+        try:
+            from scipy.signal import resample_poly
+            mono = resample_poly(mono, up=up, down=down).astype(np.float32)
+        except ImportError:
+            target_len = int(round(len(mono) * target_sr / sr))
+            if target_len == 0:
+                mono = np.zeros(0, dtype=np.float32)
+            else:
+                spec = np.fft.rfft(mono)
+                out_spec = np.zeros(target_len // 2 + 1, dtype=np.complex128)
+                bins = min(len(spec), len(out_spec))
+                out_spec[:bins] = spec[:bins]
+                mono = (np.fft.irfft(out_spec, target_len) * (target_len / len(mono))).astype(np.float32)
+        out_sr = target_sr
+
+    mono_2d = mono.reshape(1, -1).astype(np.float32, copy=False)
+    try:
+        import torch
+        res_tensor = torch.from_numpy(mono_2d)
+    except ImportError:
+        res_tensor = mono_2d
+
+    if target_sr is None:
+        return res_tensor, out_sr
+    return res_tensor
+
+
+def _install_torchaudio_soundfile_shim() -> None:
+    """Installs an idempotent torchaudio.load shim bypassing torchcodec on file paths."""
+    try:
+        import torchaudio
+    except ImportError:
+        return
+
+    if getattr(torchaudio.load, "_dvo_sf_patched", False):
+        return
+
+    orig_load = torchaudio.load
+
+    def _sf_load(uri, frame_offset: int = 0, num_frames: int = -1, normalize: bool = True, channels_first: bool = True, format: str | None = None, buffer_size: int = 4096):
+        import torch
+        if isinstance(uri, (str, os.PathLike)) and os.path.exists(str(uri)):
+            try:
+                try:
+                    import soundfile as sf
+                    start = frame_offset if frame_offset > 0 else 0
+                    frames = num_frames if num_frames > 0 else -1
+                    data, sr = sf.read(str(uri), frames=frames, start=start, dtype="float32", always_2d=True)
+                    # data is (frames, channels)
+                    sig = data.T if channels_first else data
+                    return torch.from_numpy(sig.astype(np.float32, copy=False)), sr
+                except Exception:
+                    data, sr = _load_wav_soundfile_tensor(uri, target_sr=None)
+                    if not isinstance(data, torch.Tensor):
+                        data = torch.from_numpy(data)
+                    return data, sr
+            except Exception:
+                pass
+
+        try:
+            return orig_load(uri, frame_offset=frame_offset, num_frames=num_frames, normalize=normalize, channels_first=channels_first, format=format, buffer_size=buffer_size)
+        except (RuntimeError, ImportError):
+            if isinstance(uri, (str, os.PathLike)) and os.path.exists(str(uri)):
+                data, sr = _load_wav_soundfile_tensor(uri, target_sr=None)
+                if not isinstance(data, torch.Tensor):
+                    data = torch.from_numpy(data)
+                return data, sr
+            raise
+
+    _sf_load._dvo_sf_patched = True
+    _sf_load._orig_load = orig_load
+    torchaudio.load = _sf_load
+
+
 def write_pcm16_16k(path: Path, signal: np.ndarray) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     pcm = np.clip(np.round(signal * 32767.0), -32768, 32767).astype("<i2")
@@ -350,10 +464,17 @@ class CosyVoice2Synthesizer:
             if str(repo) not in sys.path:
                 sys.path.insert(0, str(repo))
 
+        _install_torchaudio_soundfile_shim()
         from cosyvoice.cli.cosyvoice import CosyVoice2
-        from cosyvoice.utils.file_utils import load_wav
+        import cosyvoice.utils.file_utils as cosy_file_utils
 
-        self._load_wav = load_wav
+        # Patch cosyvoice load_wav to bypass torchcodec
+        def _cosy_safe_load_wav(wav_file, target_sr=16000):
+            return _load_wav_soundfile_tensor(wav_file, target_sr=target_sr)
+
+        cosy_file_utils.load_wav = _cosy_safe_load_wav
+        self._load_wav = _cosy_safe_load_wav
+
         init_sig = inspect.signature(CosyVoice2.__init__)
         kwargs = {}
         if "fp16" in init_sig.parameters:
@@ -367,13 +488,16 @@ class CosyVoice2Synthesizer:
         self._prompt_expects_path: bool | None = None
 
     def zero_shot(self, tts_text: str, prompt_text: str, prompt_wav: Path, speed: float = 1.0) -> np.ndarray:
-        import torch
+        try:
+            import torch
+        except ImportError:
+            torch = None
 
         def _collect(gen) -> np.ndarray:
             chunks = []
             for out in gen:
                 speech = out["tts_speech"]
-                if isinstance(speech, torch.Tensor):
+                if torch is not None and isinstance(speech, torch.Tensor):
                     speech = speech.detach().cpu().numpy()
                 chunks.append(np.asarray(speech, dtype=np.float32).reshape(-1))
             return np.concatenate(chunks) if chunks else np.zeros(0, dtype=np.float32)
@@ -389,15 +513,18 @@ class CosyVoice2Synthesizer:
             prompt_16k = self._load_wav(str(prompt_wav), 16000)
             return _collect(self.model.inference_zero_shot(tts_text, prompt_text, prompt_16k, **extra_kw))
 
-        # Auto-probe once on first call so both legacy (Tensor) and newer (str path) CosyVoice2 APIs work
+        # Auto-probe once on first call so both newer (str path) and legacy (Tensor) CosyVoice2 APIs work.
+        # Probe str(prompt_wav) FIRST matching modern CosyVoice2!
         try:
+            audio = _collect(self.model.inference_zero_shot(tts_text, prompt_text, str(prompt_wav), **extra_kw))
+            if len(audio) > 0:
+                self._prompt_expects_path = True
+            return audio
+        except (TypeError, AssertionError, AttributeError, RuntimeError, ValueError):
             prompt_16k = self._load_wav(str(prompt_wav), 16000)
             audio = _collect(self.model.inference_zero_shot(tts_text, prompt_text, prompt_16k, **extra_kw))
-            self._prompt_expects_path = False
-            return audio
-        except (TypeError, AssertionError, AttributeError):
-            audio = _collect(self.model.inference_zero_shot(tts_text, prompt_text, str(prompt_wav), **extra_kw))
-            self._prompt_expects_path = True
+            if len(audio) > 0:
+                self._prompt_expects_path = False
             return audio
 
 
@@ -490,6 +617,125 @@ def run_self_test() -> int:
     )
     assert not ok_wrong_app
 
+    # 6. Unit test (a): torchaudio soundfile shim and _load_wav_soundfile_tensor
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        tmp_wav = Path(td) / "test_24k.wav"
+        sr_test = 24000
+        n_samples = int(0.5 * sr_test)
+        samples = (0.2 * np.sin(2.0 * math.pi * 440.0 * np.arange(n_samples) / sr_test)).astype(np.float32)
+        pcm_bytes = np.clip(np.round(samples * 32767.0), -32768, 32767).astype("<i2").tobytes()
+        with wave.open(str(tmp_wav), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sr_test)
+            wf.writeframes(pcm_bytes)
+
+        _install_torchaudio_soundfile_shim()
+
+        try:
+            import torchaudio
+            t_wave, t_sr = torchaudio.load(str(tmp_wav))
+            assert t_sr == 24000
+            assert t_wave.shape[0] == 1
+        except ImportError:
+            t_arr, t_sr = _load_wav_soundfile_tensor(tmp_wav, target_sr=None)
+            assert t_sr == 24000
+            assert t_arr.shape[0] == 1
+
+        res_16k = _load_wav_soundfile_tensor(tmp_wav, target_sr=16000)
+        assert res_16k.shape[0] == 1
+        expected_len = int(round(n_samples * 16000 / 24000))
+        assert abs(res_16k.shape[1] - expected_len) <= 2
+
+    # 7. Unit test (b): zero_shot auto-probe logic mocked with fake model
+    class MockCosyModelPathOnly:
+        def __init__(self):
+            self.sample_rate = 24000
+            self.calls = []
+
+        def inference_zero_shot(self, tts_text, prompt_text, prompt_wav, **kwargs):
+            self.calls.append(type(prompt_wav))
+            if isinstance(prompt_wav, str):
+                return [{"tts_speech": np.zeros(1600, dtype=np.float32)}]
+            raise RuntimeError("Failed to create AudioDecoder for tensor(...): video_tensor must be kUInt8")
+
+    class MockCosyModelTensorOnly:
+        def __init__(self):
+            self.sample_rate = 24000
+            self.calls = []
+
+        def inference_zero_shot(self, tts_text, prompt_text, prompt_wav, **kwargs):
+            self.calls.append(type(prompt_wav))
+            if not isinstance(prompt_wav, str):
+                return [{"tts_speech": np.zeros(1600, dtype=np.float32)}]
+            raise TypeError("expected Tensor, got str")
+
+    with tempfile.TemporaryDirectory() as td:
+        dummy_wav = Path(td) / "dummy.wav"
+        with wave.open(str(dummy_wav), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            wf.writeframes(np.zeros(160, dtype="<i2").tobytes())
+
+        # Test path-only model (probe str succeeds first)
+        synth_path = CosyVoice2Synthesizer.__new__(CosyVoice2Synthesizer)
+        synth_path.model = MockCosyModelPathOnly()
+        synth_path._load_wav = _load_wav_soundfile_tensor
+        synth_path.sample_rate = 24000
+        synth_path._prompt_expects_path = None
+        out_a = synth_path.zero_shot("测试", "参考", dummy_wav)
+        assert len(out_a) == 1600
+        assert synth_path._prompt_expects_path is True
+
+        # Test tensor-only model (probe str fails with TypeError, falls back to tensor)
+        synth_tensor = CosyVoice2Synthesizer.__new__(CosyVoice2Synthesizer)
+        synth_tensor.model = MockCosyModelTensorOnly()
+        synth_tensor._load_wav = _load_wav_soundfile_tensor
+        synth_tensor.sample_rate = 24000
+        synth_tensor._prompt_expects_path = None
+        out_b = synth_tensor.zero_shot("测试", "参考", dummy_wav)
+        assert len(out_b) == 1600
+        assert synth_tensor._prompt_expects_path is False
+
+    # 8. Unit test (c): safe --resume filtering of tts_exception entries
+    with tempfile.TemporaryDirectory() as td:
+        test_dir = Path(td)
+        man_f = test_dir / "manifest.jsonl"
+        rej_f = test_dir / "rejected.jsonl"
+        man_f.write_text(json.dumps({"id": "item_ok", "audio": "clip.wav"}) + "\n", "utf-8")
+        rej_content = [
+            {"id": "item_crashed", "attempts": [{"attempt": 1, "reason": "tts_exception:RuntimeError('torchcodec')"}]},
+            {"id": "item_quality_fail", "attempts": [{"attempt": 1, "reason": "abnormal_speaking_rate"}]},
+        ]
+        rej_f.write_text("\n".join(json.dumps(x) for x in rej_content) + "\n", "utf-8")
+
+        d_ids: set[str] = set()
+        v_rejs: list[str] = []
+        if man_f.is_file():
+            for line in man_f.read_text("utf-8").splitlines():
+                if line.strip():
+                    d_ids.add(json.loads(line)["id"])
+        if rej_f.is_file():
+            for line in rej_f.read_text("utf-8").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                atts = rec.get("attempts", [])
+                pure_c = bool(atts) and all(str(a.get("reason", "")).startswith("tts_exception:") for a in atts)
+                if pure_c:
+                    continue
+                d_ids.add(rec["id"])
+                v_rejs.append(line)
+            rej_f.write_text("\n".join(v_rejs) + ("\n" if v_rejs else ""), "utf-8")
+
+        assert "item_ok" in d_ids
+        assert "item_quality_fail" in d_ids
+        assert "item_crashed" not in d_ids
+        remaining_rejs = [json.loads(x)["id"] for x in rej_f.read_text("utf-8").splitlines() if x.strip()]
+        assert remaining_rejs == ["item_quality_fail"]
+
     print(
         "SELF-TEST PASSED! Resampling, acoustic/rate gate, and mixed ZH-EN SenseVoice judge gate verified."
     )
@@ -576,10 +822,27 @@ def main() -> int:
                     done_ids.add(json.loads(line)["id"])
                     accepted_count += 1
         if rejected_path.is_file():
+            valid_rejections: list[str] = []
             for line in rejected_path.read_text("utf-8").splitlines():
-                if line.strip():
-                    done_ids.add(json.loads(line)["id"])
-                    rejected_count += 1
+                if not line.strip():
+                    continue
+                entry = json.loads(line)
+                attempts = entry.get("attempts", [])
+                pure_crash = bool(attempts) and all(
+                    str(att.get("reason", "")).startswith("tts_exception:")
+                    for att in attempts
+                )
+                if pure_crash:
+                    # Environment crash rather than genuine quality gate rejection; do NOT skip on resume!
+                    continue
+                done_ids.add(entry["id"])
+                valid_rejections.append(line)
+                rejected_count += 1
+            # Rewrite rejected_path keeping only genuine quality-gate rejections
+            rejected_path.write_text(
+                "\n".join(valid_rejections) + ("\n" if valid_rejections else ""),
+                "utf-8",
+            )
     else:
         manifest_path.unlink(missing_ok=True)
         rejected_path.unlink(missing_ok=True)
@@ -592,6 +855,8 @@ def main() -> int:
     rng = random.Random(args.seed)
     stats = Counter()
     t_start = time.perf_counter()
+    consecutive_tts_exceptions = 0
+    last_exc = ""
 
     with open(manifest_path, "a", encoding="utf-8", newline="\n") as mf, \
          open(rejected_path, "a", encoding="utf-8", newline="\n") as rf:
@@ -681,6 +946,7 @@ def main() -> int:
                 mf.flush()
                 accepted_count += 1
                 stats["accepted"] += 1
+                consecutive_tts_exceptions = 0
                 if passed_record["attempt"] > 1:
                     stats["recovered_by_retry"] += 1
             else:
@@ -695,6 +961,21 @@ def main() -> int:
                 rf.flush()
                 rejected_count += 1
                 stats["quarantined_rejected"] += 1
+
+                # Fail-fast check: if the first 5 processed items in a row fail with pure tts_exception
+                is_pure_tts_exc = bool(attempt_logs) and all(
+                    str(att.get("reason", "")).startswith("tts_exception:")
+                    for att in attempt_logs
+                )
+                if is_pure_tts_exc:
+                    consecutive_tts_exceptions += 1
+                    last_exc = attempt_logs[-1].get("reason", "")
+                    if consecutive_tts_exceptions >= 5:
+                        err_msg = f"Aborting: {consecutive_tts_exceptions} consecutive items failed with TTS exception: {last_exc}"
+                        print(f"\n[FATAL ERROR] {err_msg}", file=sys.stderr)
+                        raise RuntimeError(err_msg)
+                else:
+                    consecutive_tts_exceptions = 0
 
             if idx % 25 == 0 or idx == len(prompt_items):
                 elapsed = time.perf_counter() - t_start
@@ -719,6 +1000,15 @@ def main() -> int:
     )
     print("\n=== TTS Synthesis & Closed-Loop Quality Report ===")
     print(json.dumps(report, ensure_ascii=False, indent=2))
+
+    if len(prompt_items) > 0 and accepted_count == 0 and total_processed > 0:
+        top_reasons = stats.most_common(5) if hasattr(stats, "most_common") else list(stats.items())[:5]
+        print(
+            f"\n[ERROR] 0/{total_processed} items accepted! Top rejection/exception reasons: {top_reasons}",
+            file=sys.stderr,
+        )
+        return 2
+
     return 0
 
 

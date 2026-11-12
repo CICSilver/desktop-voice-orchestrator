@@ -26,6 +26,93 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set, Union
 
 
+def discover_cuda_lib_dirs() -> List[str]:
+    """Discovers directories containing CUDA/cuDNN/PyTorch shared libraries.
+
+    Searches site-packages for nvidia/*/lib (e.g. nvidia/cudnn/lib, nvidia/cublas/lib)
+    and torch/lib across site roots and sys.path.
+    """
+    import site
+
+    candidate_roots: List[Path] = []
+    try:
+        if hasattr(site, "getsitepackages"):
+            for sp in site.getsitepackages():
+                candidate_roots.append(Path(sp))
+    except Exception:
+        pass
+
+    try:
+        if hasattr(site, "getusersitepackages"):
+            candidate_roots.append(Path(site.getusersitepackages()))
+    except Exception:
+        pass
+
+    for p in sys.path:
+        try:
+            pp = Path(p)
+            if pp.is_dir() and pp not in candidate_roots:
+                candidate_roots.append(pp)
+        except Exception:
+            continue
+
+    found_dirs: List[str] = []
+    seen: Set[str] = set()
+
+    for root in candidate_roots:
+        if not root.is_dir():
+            continue
+
+        # Check nvidia/*/lib
+        nvidia_dir = root / "nvidia"
+        if nvidia_dir.is_dir():
+            try:
+                for sub in sorted(nvidia_dir.iterdir()):
+                    if sub.is_dir():
+                        lib_dir = sub / "lib"
+                        if lib_dir.is_dir():
+                            resolved = str(lib_dir.resolve())
+                            if resolved not in seen:
+                                seen.add(resolved)
+                                found_dirs.append(resolved)
+            except Exception:
+                pass
+
+        # Check torch/lib
+        torch_lib = root / "torch" / "lib"
+        if torch_lib.is_dir():
+            try:
+                resolved = str(torch_lib.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    found_dirs.append(resolved)
+            except Exception:
+                pass
+
+    return found_dirs
+
+
+def inject_cuda_ld_library_path(env: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """Prepends discovered CUDA/cuDNN/torch lib directories to LD_LIBRARY_PATH in env dict."""
+    target_env = dict(env if env is not None else os.environ)
+    cuda_dirs = discover_cuda_lib_dirs()
+    if not cuda_dirs:
+        return target_env
+
+    curr_ld = target_env.get("LD_LIBRARY_PATH", "")
+    existing_parts = [p for p in curr_ld.split(os.pathsep) if p]
+
+    new_parts: List[str] = []
+    seen: Set[str] = set()
+    for d in cuda_dirs:
+        if d not in seen and d not in existing_parts:
+            seen.add(d)
+            new_parts.append(d)
+
+    target_env["LD_LIBRARY_PATH"] = os.pathsep.join(new_parts + existing_parts)
+    return target_env
+
+
 class ColabJobHook:
     """Colab job lifecycle, telemetry, heartbeat, and remote rescue hook."""
 
@@ -309,6 +396,7 @@ class ColabJobHook:
         run_env = os.environ.copy()
         if env:
             run_env.update(env)
+        run_env = inject_cuda_ld_library_path(run_env)
 
         proc = subprocess.Popen(
             cmd,
@@ -853,6 +941,39 @@ def _run_self_tests() -> None:
         assert final_status["error"]["exception_type"] == "ValueError"
         assert "Unrecoverable error" in final_status["error"]["message"]
         print("✅ Test 3 Passed: Rescue timeout cleanly transitioned to failed, error logged, and disconnect triggered.")
+
+    # Test 4: CUDA LD_LIBRARY_PATH Injection
+    print("\n--- Test 4: CUDA LD_LIBRARY_PATH Injection ---")
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        temp_site = Path(tmp_dir) / "site_pkgs"
+        cudnn_lib = temp_site / "nvidia" / "cudnn" / "lib"
+        torch_lib = temp_site / "torch" / "lib"
+        cudnn_lib.mkdir(parents=True)
+        torch_lib.mkdir(parents=True)
+
+        orig_sys_path = list(sys.path)
+        try:
+            sys.path.insert(0, str(temp_site))
+            discovered = discover_cuda_lib_dirs()
+            assert str(cudnn_lib.resolve()) in discovered
+            assert str(torch_lib.resolve()) in discovered
+
+            # Test injection
+            test_env = {"EXISTING_VAR": "val", "LD_LIBRARY_PATH": "/usr/local/cuda/lib64"}
+            injected = inject_cuda_ld_library_path(test_env)
+            ld_parts = injected["LD_LIBRARY_PATH"].split(os.pathsep)
+
+            # Cudnn lib and torch lib should be prepended before existing
+            assert str(cudnn_lib.resolve()) in ld_parts
+            assert str(torch_lib.resolve()) in ld_parts
+            assert ld_parts.index(str(cudnn_lib.resolve())) < ld_parts.index("/usr/local/cuda/lib64")
+
+            # Idempotency / Deduplication test
+            injected_again = inject_cuda_ld_library_path(injected)
+            assert injected_again["LD_LIBRARY_PATH"] == injected["LD_LIBRARY_PATH"]
+            print("✅ Test 4 Passed: discover_cuda_lib_dirs and inject_cuda_ld_library_path verified.")
+        finally:
+            sys.path = orig_sys_path
 
     print("\n🎉 ALL SELF-TESTS PASSED SUCCESSFULLY! (COLAB_HOOK_SELF_TEST_OK)")
 
