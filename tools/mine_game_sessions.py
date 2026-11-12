@@ -343,10 +343,95 @@ def normalize_zh(text: str) -> str:
     return "".join(re.findall(r"[\u4e00-\u9fff]", cleaned))
 
 
+def _preload_cuda_runtime_libs() -> None:
+    """Discovers and preloads cuBLAS/cuDNN runtime shared libraries on Linux CUDA environments."""
+    import ctypes
+    import os
+    import site
+
+    candidate_roots: list[Path] = []
+    try:
+        if hasattr(site, "getsitepackages"):
+            for sp in site.getsitepackages():
+                candidate_roots.append(Path(sp))
+    except Exception:
+        pass
+    try:
+        if hasattr(site, "getusersitepackages"):
+            candidate_roots.append(Path(site.getusersitepackages()))
+    except Exception:
+        pass
+    for p in sys.path:
+        try:
+            pp = Path(p)
+            if pp.is_dir() and pp not in candidate_roots:
+                candidate_roots.append(pp)
+        except Exception:
+            continue
+
+    lib_dirs: list[str] = []
+    seen_dirs: set[str] = set()
+
+    for root in candidate_roots:
+        if not root.is_dir():
+            continue
+        nvidia_dir = root / "nvidia"
+        if nvidia_dir.is_dir():
+            try:
+                for sub in sorted(nvidia_dir.iterdir()):
+                    if sub.is_dir():
+                        ld = sub / "lib"
+                        if ld.is_dir():
+                            r_str = str(ld.resolve())
+                            if r_str not in seen_dirs:
+                                seen_dirs.add(r_str)
+                                lib_dirs.append(r_str)
+            except Exception:
+                pass
+        torch_lib = root / "torch" / "lib"
+        if torch_lib.is_dir():
+            try:
+                r_str = str(torch_lib.resolve())
+                if r_str not in seen_dirs:
+                    seen_dirs.add(r_str)
+                    lib_dirs.append(r_str)
+            except Exception:
+                pass
+
+    if lib_dirs:
+        curr_ld = os.environ.get("LD_LIBRARY_PATH", "")
+        existing_parts = [p for p in curr_ld.split(os.pathsep) if p]
+        new_parts = [d for d in lib_dirs if d not in existing_parts]
+        if new_parts:
+            os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(new_parts + existing_parts)
+
+    so_patterns = [
+        "libcublasLt.so*",
+        "libcublas.so*",
+        "libcudnn.so*",
+        "libcudnn_ops*.so*",
+        "libcudnn_cnn*.so*",
+    ]
+    for d_str in lib_dirs:
+        d_path = Path(d_str)
+        for pattern in so_patterns:
+            try:
+                for so_file in sorted(d_path.glob(pattern)):
+                    try:
+                        ctypes.CDLL(str(so_file), mode=ctypes.RTLD_GLOBAL)
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+
 class DualAsrVerifier:
     """Heterogeneous dual-ASR verifier: SenseVoice (CTC) + faster-whisper large-v3 (AED)."""
 
     def __init__(self, sensevoice_dir: Path, whisper_model: str, device: str = "cuda"):
+        if device == "cuda" and sys.platform.startswith("linux"):
+            _preload_cuda_runtime_libs()
+
         import sherpa_onnx
         from faster_whisper import WhisperModel
 
