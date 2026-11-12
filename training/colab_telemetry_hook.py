@@ -493,6 +493,10 @@ class ColabJobHook:
                             cmd_id = cmd.get("cmd_id")
                             if cmd_id:
                                 self._consumed_cmd_ids.add(cmd_id)
+                                try:
+                                    (self.run_dir / "command.json").unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                             self._log_event("command_received", {
                                 "cmd_id": cmd_id,
                                 "action": action,
@@ -550,16 +554,19 @@ class ColabJobHook:
     # -------------------------------------------------------------------------
     def finish_job(
         self,
-        artifacts: Optional[List[Union[str, Path]]] = None,
+        artifacts: Optional[List[Union[str, Path, Dict[str, Any]]]] = None,
         summary_metrics: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Mark job succeeded, resolve artifact sizes, stop heartbeat, and disconnect."""
         resolved_artifacts: List[Dict[str, Any]] = []
         if artifacts:
             for art in artifacts:
-                p = Path(art)
-                size = p.stat().st_size if p.is_file() else 0
-                resolved_artifacts.append({"path": str(p), "size_bytes": size})
+                if isinstance(art, dict):
+                    resolved_artifacts.append(dict(art))
+                else:
+                    p = Path(art)
+                    size = p.stat().st_size if p.is_file() else 0
+                    resolved_artifacts.append({"path": str(p), "size_bytes": size})
 
         with self._lock:
             self.state = "succeeded"
@@ -690,7 +697,8 @@ def _run_self_tests() -> None:
         def stage3():
             out_file = repo_dir / "artifact.bin"
             out_file.write_bytes(b"dummy_model_bytes_12345")
-            hook.finish_job(artifacts=[out_file], summary_metrics={"accuracy": 0.99})
+            preformed = {"path": "preformed_dict_artifact.bin", "size_bytes": 999}
+            hook.finish_job(artifacts=[out_file, preformed], summary_metrics={"accuracy": 0.99})
             return "stage3_ok"
 
         res1 = hook.run_stage("stage1", 1, stage1)
@@ -715,10 +723,12 @@ def _run_self_tests() -> None:
         assert status_data["schema_version"] == 1
         assert status_data["state"] == "succeeded"
         assert status_data["error"] is None
-        assert len(status_data["artifacts"]) == 1
+        assert len(status_data["artifacts"]) == 2
         assert status_data["artifacts"][0]["size_bytes"] == len(b"dummy_model_bytes_12345")
+        assert status_data["artifacts"][1]["path"] == "preformed_dict_artifact.bin"
+        assert status_data["artifacts"][1]["size_bytes"] == 999
         assert status_data["summary_metrics"]["accuracy"] == 0.99
-        print("✅ Test 1 Passed: Normal run reached succeeded and schema matches exactly.")
+        print("✅ Test 1 Passed: Normal run reached succeeded, schema matches, and dict-tolerant artifacts verified.")
 
     # Test 2: Rescue via command.json (sync_and_retry)
     print("\n--- Test 2: Failing Stage Rescue via sync_and_retry ---")
@@ -789,7 +799,9 @@ def _run_self_tests() -> None:
         final_status = json.loads(status_file.read_text("utf-8"))
         assert final_status["state"] == "succeeded"
         assert final_status["error"] is None
-        print("✅ Test 2 Passed: Waiting_for_fix -> command sync_and_retry -> stage re-executed -> succeeded.")
+        cmd_file_check = drive_root / "colab_runs" / "test_rescue" / "command.json"
+        assert not cmd_file_check.exists(), "command.json must be unlinked after consumption!"
+        print("✅ Test 2 Passed: Waiting_for_fix -> command sync_and_retry -> command.json unlinked -> succeeded.")
 
     # Test 3: Rescue Timeout -> Failed + Disconnect
     print("\n--- Test 3: Rescue Timeout -> Failed State & Disconnect ---")
