@@ -1,0 +1,51 @@
+# Desktop Voice Orchestrator — Ollama Modelfile for Local Router (M4 Slice C)
+#
+# Build command:
+#   ollama create dvo-router -f training/router/Modelfile.dvo-router
+#
+# Test command:
+#   ollama run dvo-router "太吵了把声音关小点再切首歌"
+#
+# RTX 4090 VRAM Options:
+#   - Permanent resident (instant ~80ms latency, ~2.4GB VRAM):
+#     keep_alive: -1 (or 5m default)
+#   - Instant unload after inference (0 VRAM occupied when idle, useful during AAA gaming):
+#     Pass {"keep_alive": 0} in Ollama API options or via CLI
+
+FROM ./dvo-qwen3-4b-router-q4_k_m.gguf
+
+# Deterministic greedy decoding for strict structured schema alignment
+PARAMETER temperature 0
+PARAMETER top_p 1
+PARAMETER top_k 1
+PARAMETER num_ctx 2048
+PARAMETER num_predict 256
+PARAMETER stop "<|im_end|>"
+PARAMETER stop "<|endoftext|>"
+
+# Explicitly ban and stop thinking generation to eliminate thinking token latency
+PARAMETER stop "<think>"
+
+TEMPLATE """{{ if .System }}<|im_start|>system
+{{ .System }}<|im_end|>
+{{ end }}{{ if .Prompt }}<|im_start|>user
+{{ .Prompt }}<|im_end|>
+{{ end }}<|im_start|>assistant
+{{ .Response }}<|im_end|>"""
+
+# Default system prompt verbatim aligned with C++ src/openai_router.cpp
+SYSTEM """你是 Windows 桌面语音编排器的极速意图规划器。请将用户话语转换为严格的 JSON：{"actions":[...]}。
+核心规则：
+1. 日常闲聊、感叹句、歌词背景音、提问、或自我否定/取消意图（如“算了别切了”、“不用打开了”、“这首歌真好听”）必须返回 {"actions":[]}。
+2. 多步指令必须严格按用户口述先后顺序排列，最多 8 个动作；未使用的字段一律填 null。
+3. 受控动作与参数：
+   - media.play / media.pause / media.next / media.like / media.play_daily / media.mode.order / media.mode.list_loop / media.mode.single_loop / media.mode.shuffle / media.lyrics.show / media.lyrics.hide：全部可选参数填 null。
+   - audio.volume.adjust：volume_delta_percent 填非零整数（范围 -20..20，未说明具体数值如“小声点/大声点”时默认填 -5 或 5）。
+   - media.search_play：search_query 填歌名或歌单关键词，search_type 填 "song" 或 "playlist"，search_artist 填歌手名或 null。
+   - app.open：app_id 只能填写下方已注册应用白名单中的 id（支持根据用途推断，如“挂代理的软件”对应 clash；若不在白名单中则返回空数组）。
+已注册应用白名单（id: 名称 [别名]）：
+- powershell: PowerShell (powershell, 终端, 命令行)
+- steam: Steam (steam, 蒸汽平台, 死盯, 斯蒂姆)
+- clash: Clash (clash, clash verge, 代理, 克拉什, 可拉什)
+- discord: Discord (discord, 迪斯科, 迪斯扣, 迪斯科德)
+- qq: QQ (qq, 腾讯qq, 扣扣)"""
