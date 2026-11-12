@@ -170,6 +170,16 @@ router_api_key_env = "OPENAI_API_KEY"
 router_timeout_ms = 2500
 # 热：是否启用 OpenAI Strict Structured Outputs（json_schema）；旧本地推理端不支持时可设为 false 退回 json_object。
 router_structured_outputs = true
+# 路由预设："reading"（看书/写字桌面模式，本地4090常驻）、"game"（游戏模式，0显存占用，切云端或纯规则）、"custom"（自定义手动配置）。
+router_profile = "custom"
+# 本地 4090 推理接口（用于看书/写字模式，支持 Ollama、vLLM 等，带 /v1 OpenAI 兼容路径）
+local_router_base_url = "http://127.0.0.1:11434/v1"
+local_router_model = "qwen3:4b"
+# 游戏模式下的路由后端："openai_compatible"（切云端如 GPT-4o-mini）或 "none"（切纯本地规则）
+game_router_backend = "openai_compatible"
+# 游戏模式云端接口与模型
+cloud_router_base_url = "https://api.openai.com/v1"
+cloud_router_model = "gpt-4o-mini"
 # 热：未口述数值时调整的Windows音量滑块百分点。
 default_volume_step_percent = 5
 # 热：口述相对幅度上限；合法范围1..20，超范围整句拒绝。
@@ -273,12 +283,25 @@ cdp_port = 9223
 executable = ""
 
 [announcements]
-# 当前仅实现结构化文字日志；未来TTS后端复用同一非阻塞接口。
+# 播报后端："log"（仅文字日志）、"google_tts"（云端 Gemini TTS）、"sherpa_kokoro"（本地 CPU/GPU 离线 Kokoro TTS）、"auto"（优先网络，失败降级离线）。
 enabled = true
 backend = "log"
 queue_capacity = 32
 barge_in = false
 tail_guard_ms = 200
+# 本地音频缓存目录（以文本与参数的 SHA-256 为键存为 WAV，命中直接秒播）。
+cache_dir = "data/tts_cache"
+# Google TTS 配置
+google_model = "gemini-3.8-flash-tts"
+google_voice = "Kore"
+google_api_key_env = "GEMINI_API_KEY"
+google_base_url = "https://generativelanguage.googleapis.com"
+google_timeout_ms = 2500
+# 本地 Kokoro TTS 配置
+kokoro_model_dir = "models/kokoro-int8-multi-lang-v1_1"
+kokoro_speaker_id = 45
+kokoro_speed = 1.0
+kokoro_num_threads = 2
 
 [web]
 enabled = true

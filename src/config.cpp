@@ -322,6 +322,18 @@ AppConfig ConfigStore::load() const {
       read<std::int64_t>(table, "commands.router_timeout_ms", 2500));
   c.commands.router_structured_outputs =
       read<bool>(table, "commands.router_structured_outputs", true);
+  c.commands.router_profile =
+      read<std::string>(table, "commands.router_profile", "custom");
+  c.commands.local_router_base_url =
+      read<std::string>(table, "commands.local_router_base_url", "http://127.0.0.1:11434/v1");
+  c.commands.local_router_model =
+      read<std::string>(table, "commands.local_router_model", "qwen3:4b");
+  c.commands.game_router_backend =
+      read<std::string>(table, "commands.game_router_backend", "openai_compatible");
+  c.commands.cloud_router_base_url =
+      read<std::string>(table, "commands.cloud_router_base_url", "https://api.openai.com/v1");
+  c.commands.cloud_router_model =
+      read<std::string>(table, "commands.cloud_router_model", "gpt-4o-mini");
   c.commands.default_volume_step_percent =
       read<std::int64_t>(table, "commands.default_volume_step_percent", 5);
   c.commands.max_spoken_volume_step_percent =
@@ -391,6 +403,26 @@ AppConfig ConfigStore::load() const {
   c.announcements.barge_in = read<bool>(table, "announcements.barge_in", false);
   c.announcements.tail_guard_ms =
       read<std::int64_t>(table, "announcements.tail_guard_ms", 200);
+  c.announcements.cache_dir =
+      resolve(project_root_, read_path(table, "announcements.cache_dir", "data/tts_cache"));
+  c.announcements.google_model =
+      read<std::string>(table, "announcements.google_model", "gemini-3.8-flash-tts");
+  c.announcements.google_voice =
+      read<std::string>(table, "announcements.google_voice", "Kore");
+  c.announcements.google_api_key_env =
+      read<std::string>(table, "announcements.google_api_key_env", "GEMINI_API_KEY");
+  c.announcements.google_base_url =
+      read<std::string>(table, "announcements.google_base_url", "https://generativelanguage.googleapis.com");
+  c.announcements.google_timeout_ms = static_cast<std::uint32_t>(
+      read<std::int64_t>(table, "announcements.google_timeout_ms", 2500));
+  c.announcements.kokoro_model_dir =
+      resolve(project_root_, read_path(table, "announcements.kokoro_model_dir", "models/kokoro-int8-multi-lang-v1_1"));
+  c.announcements.kokoro_speaker_id = static_cast<std::int32_t>(
+      read<std::int64_t>(table, "announcements.kokoro_speaker_id", 45));
+  c.announcements.kokoro_speed = static_cast<float>(
+      read<double>(table, "announcements.kokoro_speed", 1.0));
+  c.announcements.kokoro_num_threads = static_cast<std::int32_t>(
+      read<std::int64_t>(table, "announcements.kokoro_num_threads", 2));
 
   c.web.enabled = read<bool>(table, "web.enabled", true);
   c.web.bind = read<std::string>(table, "web.bind", "127.0.0.1");
@@ -524,6 +556,21 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
         "commands.router_api_key_env must be a valid environment variable name [A-Za-z_][A-Za-z0-9_]*");
   range(c.commands.router_timeout_ms >= 200 && c.commands.router_timeout_ms <= 15000,
         "commands.router_timeout_ms must be in [200, 15000]");
+  range(c.commands.router_profile == "custom" ||
+            c.commands.router_profile == "reading" ||
+            c.commands.router_profile == "game",
+        "commands.router_profile must be 'custom', 'reading' or 'game'");
+  range(is_valid_http_base_url(c.commands.local_router_base_url),
+        "commands.local_router_base_url must be a valid http:// or https:// URL");
+  range(is_non_blank_token(c.commands.local_router_model, 128),
+        "commands.local_router_model must be a non-empty model identifier");
+  range(c.commands.game_router_backend == "openai_compatible" ||
+            c.commands.game_router_backend == "none",
+        "commands.game_router_backend must be 'openai_compatible' or 'none'");
+  range(is_valid_http_base_url(c.commands.cloud_router_base_url),
+        "commands.cloud_router_base_url must be a valid http:// or https:// URL");
+  range(is_non_blank_token(c.commands.cloud_router_model, 128),
+        "commands.cloud_router_model must be a non-empty model identifier");
   {
     std::unordered_set<std::string> seen_app_ids;
     for (const auto& entry : c.apps.entries) {
@@ -552,8 +599,26 @@ ConfigValidation ConfigStore::validate(const AppConfig& c) const {
   range(c.netease.timeout_ms >= 1000 && c.netease.timeout_ms <= 30000,
         "netease.timeout_ms must be in [1000, 30000]");
   range(c.netease.cdp_port >= 1024, "netease.cdp_port must be in [1024, 65535]");
-  range(c.announcements.backend == "log",
-        "announcements.backend must be 'log'");
+  range(c.announcements.backend == "log" ||
+            c.announcements.backend == "google_tts" ||
+            c.announcements.backend == "sherpa_kokoro" ||
+            c.announcements.backend == "auto",
+        "announcements.backend must be 'log', 'google_tts', 'sherpa_kokoro' or 'auto'");
+  range(c.announcements.google_timeout_ms >= 200 &&
+            c.announcements.google_timeout_ms <= 15000,
+        "announcements.google_timeout_ms must be in [200, 15000]");
+  range(c.announcements.kokoro_speaker_id >= 0,
+        "announcements.kokoro_speaker_id must be >= 0");
+  range(c.announcements.kokoro_speed >= 0.25F &&
+            c.announcements.kokoro_speed <= 4.0F,
+        "announcements.kokoro_speed must be in [0.25, 4.0]");
+  range(c.announcements.kokoro_num_threads >= 1 &&
+            c.announcements.kokoro_num_threads <= 16,
+        "announcements.kokoro_num_threads must be in [1, 16]");
+  range(is_valid_env_var_name(c.announcements.google_api_key_env),
+        "announcements.google_api_key_env must be a valid environment variable name [A-Za-z_][A-Za-z0-9_]*");
+  range(is_valid_http_base_url(c.announcements.google_base_url),
+        "announcements.google_base_url must be a valid http:// or https:// URL");
   range(c.announcements.queue_capacity >= 1 &&
             c.announcements.queue_capacity <= 256,
         "announcements.queue_capacity must be in [1, 256]");
@@ -659,6 +724,12 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                     {"router_api_key_env", c.commands.router_api_key_env},
                     {"router_timeout_ms", c.commands.router_timeout_ms},
                     {"router_structured_outputs", c.commands.router_structured_outputs},
+                    {"router_profile", c.commands.router_profile},
+                    {"local_router_base_url", c.commands.local_router_base_url},
+                    {"local_router_model", c.commands.local_router_model},
+                    {"game_router_backend", c.commands.game_router_backend},
+                    {"cloud_router_base_url", c.commands.cloud_router_base_url},
+                    {"cloud_router_model", c.commands.cloud_router_model},
                     {"default_volume_step_percent", c.commands.default_volume_step_percent},
                     {"max_spoken_volume_step_percent", c.commands.max_spoken_volume_step_percent},
                     {"max_actions_per_utterance", c.commands.max_actions_per_utterance},
@@ -676,7 +747,17 @@ nlohmann::json ConfigStore::to_public_json(const AppConfig& c) const {
                           {"backend", c.announcements.backend},
                           {"queue_capacity", c.announcements.queue_capacity},
                           {"barge_in", c.announcements.barge_in},
-                          {"tail_guard_ms", c.announcements.tail_guard_ms}}},
+                          {"tail_guard_ms", c.announcements.tail_guard_ms},
+                          {"cache_dir", path_to_utf8(c.announcements.cache_dir)},
+                          {"google_model", c.announcements.google_model},
+                          {"google_voice", c.announcements.google_voice},
+                          {"google_api_key_env", c.announcements.google_api_key_env},
+                          {"google_base_url", c.announcements.google_base_url},
+                          {"google_timeout_ms", c.announcements.google_timeout_ms},
+                          {"kokoro_model_dir", path_to_utf8(c.announcements.kokoro_model_dir)},
+                          {"kokoro_speaker_id", c.announcements.kokoro_speaker_id},
+                          {"kokoro_speed", c.announcements.kokoro_speed},
+                          {"kokoro_num_threads", c.announcements.kokoro_num_threads}}},
       {"web", {{"telemetry_hz", c.web.telemetry_hz}}},
       {"cold", {{"microphone_device", c.audio.microphone_device},
                  {"loopback_device", c.audio.loopback_device},
@@ -784,6 +865,12 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                     {"router_api_key_env", c.commands.router_api_key_env},
                     {"router_timeout_ms", c.commands.router_timeout_ms},
                     {"router_structured_outputs", c.commands.router_structured_outputs},
+                    {"router_profile", c.commands.router_profile},
+                    {"local_router_base_url", c.commands.local_router_base_url},
+                    {"local_router_model", c.commands.local_router_model},
+                    {"game_router_backend", c.commands.game_router_backend},
+                    {"cloud_router_base_url", c.commands.cloud_router_base_url},
+                    {"cloud_router_model", c.commands.cloud_router_model},
                     {"default_volume_step_percent", c.commands.default_volume_step_percent},
                     {"max_spoken_volume_step_percent", c.commands.max_spoken_volume_step_percent},
                     {"max_actions_per_utterance", c.commands.max_actions_per_utterance},
@@ -805,7 +892,17 @@ nlohmann::json ConfigStore::to_manifest_json(const AppConfig& c) const {
                           {"backend", c.announcements.backend},
                           {"queue_capacity", c.announcements.queue_capacity},
                           {"barge_in", c.announcements.barge_in},
-                          {"tail_guard_ms", c.announcements.tail_guard_ms}}},
+                          {"tail_guard_ms", c.announcements.tail_guard_ms},
+                          {"cache_dir", path_to_utf8(c.announcements.cache_dir)},
+                          {"google_model", c.announcements.google_model},
+                          {"google_voice", c.announcements.google_voice},
+                          {"google_api_key_env", c.announcements.google_api_key_env},
+                          {"google_base_url", c.announcements.google_base_url},
+                          {"google_timeout_ms", c.announcements.google_timeout_ms},
+                          {"kokoro_model_dir", path_to_utf8(c.announcements.kokoro_model_dir)},
+                          {"kokoro_speaker_id", c.announcements.kokoro_speaker_id},
+                          {"kokoro_speed", c.announcements.kokoro_speed},
+                          {"kokoro_num_threads", c.announcements.kokoro_num_threads}}},
       {"web", {{"enabled", c.web.enabled}, {"bind", c.web.bind}, {"port", c.web.port},
                {"telemetry_hz", c.web.telemetry_hz}, {"static_root", c.web.static_root.string()}}},
       {"recording", {{"session_root", c.recording.session_root.string()},
@@ -913,6 +1010,12 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
       assign_if(*it, "router_api_key_env", candidate.commands.router_api_key_env);
       assign_if(*it, "router_timeout_ms", candidate.commands.router_timeout_ms);
       assign_if(*it, "router_structured_outputs", candidate.commands.router_structured_outputs);
+      assign_if(*it, "router_profile", candidate.commands.router_profile);
+      assign_if(*it, "local_router_base_url", candidate.commands.local_router_base_url);
+      assign_if(*it, "local_router_model", candidate.commands.local_router_model);
+      assign_if(*it, "game_router_backend", candidate.commands.game_router_backend);
+      assign_if(*it, "cloud_router_base_url", candidate.commands.cloud_router_base_url);
+      assign_if(*it, "cloud_router_model", candidate.commands.cloud_router_model);
       assign_if(*it, "default_volume_step_percent", candidate.commands.default_volume_step_percent);
       assign_if(*it, "max_spoken_volume_step_percent", candidate.commands.max_spoken_volume_step_percent);
       assign_if(*it, "max_actions_per_utterance", candidate.commands.max_actions_per_utterance);
@@ -966,6 +1069,22 @@ ConfigValidation ConfigStore::apply_patch(AppConfig& config, const nlohmann::jso
       assign_if(*it, "queue_capacity", candidate.announcements.queue_capacity);
       assign_if(*it, "barge_in", candidate.announcements.barge_in);
       assign_if(*it, "tail_guard_ms", candidate.announcements.tail_guard_ms);
+      if (const auto value = it->find("cache_dir"); value != it->end() && value->is_string()) {
+        candidate.announcements.cache_dir =
+            resolve(project_root_, std::filesystem::u8path(value->get<std::string>()));
+      }
+      assign_if(*it, "google_model", candidate.announcements.google_model);
+      assign_if(*it, "google_voice", candidate.announcements.google_voice);
+      assign_if(*it, "google_api_key_env", candidate.announcements.google_api_key_env);
+      assign_if(*it, "google_base_url", candidate.announcements.google_base_url);
+      assign_if(*it, "google_timeout_ms", candidate.announcements.google_timeout_ms);
+      if (const auto value = it->find("kokoro_model_dir"); value != it->end() && value->is_string()) {
+        candidate.announcements.kokoro_model_dir =
+            resolve(project_root_, std::filesystem::u8path(value->get<std::string>()));
+      }
+      assign_if(*it, "kokoro_speaker_id", candidate.announcements.kokoro_speaker_id);
+      assign_if(*it, "kokoro_speed", candidate.announcements.kokoro_speed);
+      assign_if(*it, "kokoro_num_threads", candidate.announcements.kokoro_num_threads);
     }
     if (const auto it = patch.find("web"); it != patch.end()) {
       assign_if(*it, "telemetry_hz", candidate.web.telemetry_hz);
@@ -1055,6 +1174,12 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
        << "\nrouter_timeout_ms = " << c.commands.router_timeout_ms
        << "\nrouter_structured_outputs = "
        << (c.commands.router_structured_outputs ? "true" : "false")
+       << "\nrouter_profile = " << toml_string(c.commands.router_profile)
+       << "\nlocal_router_base_url = " << toml_string(c.commands.local_router_base_url)
+       << "\nlocal_router_model = " << toml_string(c.commands.local_router_model)
+       << "\ngame_router_backend = " << toml_string(c.commands.game_router_backend)
+       << "\ncloud_router_base_url = " << toml_string(c.commands.cloud_router_base_url)
+       << "\ncloud_router_model = " << toml_string(c.commands.cloud_router_model)
        << "\ndefault_volume_step_percent = " << c.commands.default_volume_step_percent
        << "\nmax_spoken_volume_step_percent = " << c.commands.max_spoken_volume_step_percent
        << "\nmax_actions_per_utterance = " << c.commands.max_actions_per_utterance
@@ -1090,7 +1215,17 @@ void ConfigStore::save_overrides(const AppConfig& c) const {
       << "\nbackend = " << toml_string(c.announcements.backend)
       << "\nqueue_capacity = " << c.announcements.queue_capacity
       << "\nbarge_in = " << (c.announcements.barge_in ? "true" : "false")
-      << "\ntail_guard_ms = " << c.announcements.tail_guard_ms << "\n\n";
+      << "\ntail_guard_ms = " << c.announcements.tail_guard_ms
+      << "\ncache_dir = " << toml_string(c.announcements.cache_dir.generic_string())
+      << "\ngoogle_model = " << toml_string(c.announcements.google_model)
+      << "\ngoogle_voice = " << toml_string(c.announcements.google_voice)
+      << "\ngoogle_api_key_env = " << toml_string(c.announcements.google_api_key_env)
+      << "\ngoogle_base_url = " << toml_string(c.announcements.google_base_url)
+      << "\ngoogle_timeout_ms = " << c.announcements.google_timeout_ms
+      << "\nkokoro_model_dir = " << toml_string(c.announcements.kokoro_model_dir.generic_string())
+      << "\nkokoro_speaker_id = " << c.announcements.kokoro_speaker_id
+      << "\nkokoro_speed = " << c.announcements.kokoro_speed
+      << "\nkokoro_num_threads = " << c.announcements.kokoro_num_threads << "\n\n";
   out << "[web]\ntelemetry_hz = " << c.web.telemetry_hz << "\n";
   out.close();
   if (!out) throw std::runtime_error("failed while writing config override file");

@@ -2,14 +2,21 @@
 
 #include "dvo/benchmark_report.h"
 
+#include <Windows.h>
+#include <winhttp.h>
+
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <fstream>
+#include <mutex>
 #include <random>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -21,6 +28,293 @@
 
 namespace dvo {
 namespace {
+
+class ScopedWinHttpHandle {
+ public:
+  ScopedWinHttpHandle() = default;
+  explicit ScopedWinHttpHandle(HINTERNET handle) : handle_(handle) {}
+  ~ScopedWinHttpHandle() {
+    if (handle_ != nullptr) WinHttpCloseHandle(handle_);
+  }
+  ScopedWinHttpHandle(const ScopedWinHttpHandle&) = delete;
+  ScopedWinHttpHandle& operator=(const ScopedWinHttpHandle&) = delete;
+  ScopedWinHttpHandle(ScopedWinHttpHandle&& other) noexcept
+      : handle_(std::exchange(other.handle_, nullptr)) {}
+  ScopedWinHttpHandle& operator=(ScopedWinHttpHandle&& other) noexcept {
+    if (this != &other) {
+      if (handle_ != nullptr) WinHttpCloseHandle(handle_);
+      handle_ = std::exchange(other.handle_, nullptr);
+    }
+    return *this;
+  }
+  [[nodiscard]] HINTERNET get() const noexcept { return handle_; }
+  [[nodiscard]] explicit operator bool() const noexcept {
+    return handle_ != nullptr;
+  }
+
+ private:
+  HINTERNET handle_{nullptr};
+};
+
+struct ParsedLoopbackEndpoint {
+  bool is_loopback{false};
+  bool secure{false};
+  std::string host;
+  INTERNET_PORT port{80};
+  std::string base_path;
+};
+
+[[nodiscard]] bool is_loopback_host(std::string_view host) {
+  if (host == "localhost" || host == "127.0.0.1" || host == "::1" ||
+      host == "[::1]") {
+    return true;
+  }
+  if (host.starts_with("127.")) {
+    return true;
+  }
+  return false;
+}
+
+[[nodiscard]] ParsedLoopbackEndpoint parse_loopback_url(
+    std::string_view raw_url) {
+  ParsedLoopbackEndpoint ep;
+  std::string_view rest = raw_url;
+  while (!rest.empty() &&
+         std::isspace(static_cast<unsigned char>(rest.front()))) {
+    rest.remove_prefix(1);
+  }
+  while (!rest.empty() &&
+         std::isspace(static_cast<unsigned char>(rest.back()))) {
+    rest.remove_suffix(1);
+  }
+  if (rest.starts_with("http://")) {
+    ep.secure = false;
+    ep.port = 80;
+    rest.remove_prefix(7);
+  } else if (rest.starts_with("https://")) {
+    ep.secure = true;
+    ep.port = 443;
+    rest.remove_prefix(8);
+  } else {
+    return ep;
+  }
+  if (rest.empty()) return ep;
+
+  const std::size_t slash_pos = rest.find('/');
+  const std::string_view authority =
+      (slash_pos == std::string_view::npos) ? rest : rest.substr(0, slash_pos);
+  std::string path =
+      (slash_pos == std::string_view::npos) ? "" : std::string(rest.substr(slash_pos));
+
+  if (authority.empty()) return ep;
+
+  if (authority.front() == '[') {
+    const std::size_t close_bracket = authority.find(']');
+    if (close_bracket == std::string_view::npos) return ep;
+    ep.host = std::string(authority.substr(1, close_bracket - 1));
+    if (close_bracket + 1 < authority.size() &&
+        authority[close_bracket + 1] == ':') {
+      const auto port_sv = authority.substr(close_bracket + 2);
+      unsigned int p = 0;
+      if (std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), p)
+              .ec == std::errc{}) {
+        ep.port = static_cast<INTERNET_PORT>(p);
+      }
+    }
+  } else {
+    const std::size_t colon_pos = authority.rfind(':');
+    if (colon_pos != std::string_view::npos) {
+      ep.host = std::string(authority.substr(0, colon_pos));
+      const auto port_sv = authority.substr(colon_pos + 1);
+      unsigned int p = 0;
+      if (std::from_chars(port_sv.data(), port_sv.data() + port_sv.size(), p)
+              .ec == std::errc{}) {
+        ep.port = static_cast<INTERNET_PORT>(p);
+      }
+    } else {
+      ep.host = std::string(authority);
+    }
+  }
+
+  std::string lower_host;
+  lower_host.reserve(ep.host.size());
+  for (const char ch : ep.host) {
+    lower_host.push_back(
+        static_cast<char>(std::tolower(static_cast<unsigned char>(ch))));
+  }
+  ep.is_loopback = is_loopback_host(lower_host);
+
+  if (const auto qpos = path.find('?'); qpos != std::string::npos) {
+    path.resize(qpos);
+  }
+  while (!path.empty() && path.back() == '/') {
+    path.pop_back();
+  }
+  if (std::string_view(path).ends_with("/v1")) {
+    path.resize(path.size() - 3);
+  }
+  while (!path.empty() && path.back() == '/') {
+    path.pop_back();
+  }
+  ep.base_path = std::move(path);
+  return ep;
+}
+
+struct OllamaRequestResult {
+  bool ok{false};
+  std::uint64_t elapsed_ms{0};
+  std::string note;
+};
+
+[[nodiscard]] OllamaRequestResult send_ollama_keep_alive(
+    const std::string& base_url, const std::string& model, bool is_unload) {
+  const auto start_time = std::chrono::steady_clock::now();
+  const auto elapsed = [&]() -> std::uint64_t {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - start_time)
+            .count());
+  };
+
+  const auto endpoint = parse_loopback_url(base_url);
+  if (!endpoint.is_loopback) {
+    return OllamaRequestResult{
+        false, elapsed(), "endpoint is not a loopback address (skipped)"};
+  }
+
+  const std::string request_path = endpoint.base_path + "/api/generate";
+  nlohmann::json payload;
+  payload["model"] = model;
+  if (is_unload) {
+    payload["keep_alive"] = 0;
+  } else {
+    payload["keep_alive"] = "30m";
+  }
+  const std::string json_body = payload.dump();
+
+  const std::wstring wide_host(endpoint.host.begin(), endpoint.host.end());
+  const std::wstring wide_path(request_path.begin(), request_path.end());
+
+  ScopedWinHttpHandle session(
+      WinHttpOpen(L"dvo-ollama-hot-switch/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                  WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0));
+  if (!session) {
+    return OllamaRequestResult{false, elapsed(),
+                               "failed to initialize WinHTTP session"};
+  }
+
+  WinHttpSetTimeouts(session.get(), 200, 300, 300, 500);
+
+  ScopedWinHttpHandle connect(
+      WinHttpConnect(session.get(), wide_host.c_str(), endpoint.port, 0));
+  if (!connect) {
+    return OllamaRequestResult{false, elapsed(),
+                               "local Ollama endpoint not reachable"};
+  }
+
+  const DWORD flags = endpoint.secure ? WINHTTP_FLAG_SECURE : 0;
+  HINTERNET req_raw = WinHttpOpenRequest(
+      connect.get(), L"POST", wide_path.c_str(), nullptr, WINHTTP_NO_REFERER,
+      WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+  if (!req_raw) {
+    return OllamaRequestResult{false, elapsed(),
+                               "failed to open WinHTTP request"};
+  }
+
+  std::mutex req_mutex;
+  std::condition_variable cv;
+  bool done = false;
+  bool timed_out = false;
+  HINTERNET active_req = req_raw;
+
+  std::jthread watchdog([&]() {
+    std::unique_lock lock(req_mutex);
+    if (!cv.wait_until(lock, start_time + std::chrono::milliseconds(800),
+                       [&] { return done; })) {
+      timed_out = true;
+      if (HINTERNET to_close = std::exchange(active_req, nullptr)) {
+        lock.unlock();
+        WinHttpCloseHandle(to_close);
+      }
+    }
+  });
+
+  const std::wstring headers =
+      L"Content-Type: application/json; charset=utf-8\r\n";
+  const BOOL sent = WinHttpSendRequest(
+      req_raw, headers.c_str(), static_cast<DWORD>(headers.size()),
+      const_cast<char*>(json_body.data()),
+      static_cast<DWORD>(json_body.size()),
+      static_cast<DWORD>(json_body.size()), 0);
+
+  BOOL recvd = FALSE;
+  if (sent) {
+    recvd = WinHttpReceiveResponse(req_raw, nullptr);
+  }
+
+  {
+    std::scoped_lock lock(req_mutex);
+    done = true;
+    active_req = nullptr;
+  }
+  cv.notify_all();
+  if (watchdog.joinable()) {
+    watchdog.join();
+  }
+
+  DWORD status_code = 0;
+  DWORD status_size = sizeof(status_code);
+  if (recvd) {
+    WinHttpQueryHeaders(
+        req_raw, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+        WINHTTP_HEADER_NAME_BY_INDEX, &status_code, &status_size,
+        WINHTTP_NO_HEADER_INDEX);
+  }
+
+  WinHttpCloseHandle(req_raw);
+
+  if (timed_out) {
+    return OllamaRequestResult{false, elapsed(),
+                               "local Ollama request timed out"};
+  }
+  if (!sent || !recvd) {
+    return OllamaRequestResult{false, elapsed(),
+                               "local Ollama endpoint not reachable"};
+  }
+
+  if (status_code >= 200 && status_code < 300) {
+    return OllamaRequestResult{true, elapsed(), "ok"};
+  }
+  return OllamaRequestResult{
+      false, elapsed(), "Ollama HTTP status " + std::to_string(status_code)};
+}
+
+[[nodiscard]] nlohmann::json router_profile_json(const CommandsConfig& cmd) {
+  const bool is_local = (cmd.router_backend == "openai_compatible" &&
+                         parse_loopback_url(cmd.router_base_url).is_loopback);
+  const bool vram_resident = is_local;
+  std::string effective_profile = cmd.router_profile;
+  if (cmd.router_profile == "reading" || is_local) {
+    effective_profile = "reading";
+  } else if (cmd.router_profile == "game" || cmd.router_backend == "none") {
+    effective_profile = "game";
+  } else {
+    effective_profile = "custom";
+  }
+
+  return {{"profile", effective_profile},
+          {"configured_profile", cmd.router_profile},
+          {"vram_resident", vram_resident},
+          {"parser_mode", cmd.parser_mode},
+          {"router_backend", cmd.router_backend},
+          {"router_base_url", cmd.router_base_url},
+          {"router_model", cmd.router_model},
+          {"local_router_base_url", cmd.local_router_base_url},
+          {"local_router_model", cmd.local_router_model},
+          {"game_router_backend", cmd.game_router_backend},
+          {"cloud_router_base_url", cmd.cloud_router_base_url},
+          {"cloud_router_model", cmd.cloud_router_model}};
+}
 
 // The executor retains 4096 terminal action IDs. Keeping at most 512 plans
 // guarantees that all eight actions of every replayable snapshot still fit in
@@ -455,7 +749,13 @@ VoiceFrontendRuntime::VoiceFrontendRuntime(AppConfig config, ConfigStore store)
       recorder_(std::max<std::size_t>(256,
           ((config_.recording.queue_capacity_ms + config_.audio.frame_ms - 1) /
            config_.audio.frame_ms) * 3 + 256)),
-      debug_(8192) {}
+      debug_(8192) {
+  app_catalog_ = std::make_shared<const AppCatalog>(
+      AppCatalog::from_config(config_.apps));
+  command_parser_ = create_command_parser(config_, app_catalog_);
+  command_config_revision_ = config_.revision;
+  commands_enabled_ = config_.commands.enabled;
+}
 
 VoiceFrontendRuntime::~VoiceFrontendRuntime() { stop(); }
 
@@ -2770,6 +3070,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
                                             : latest_replay_announcement_;
     }
     emit_event("config_state", {{"config", config_store_.to_public_json(config_)}});
+    emit_event("router_profile_state", router_profile_json(config_.commands));
     emit_event("sessions", session_list());
     emit_event("recording_state",
                {{"active", recorder_.active()},
@@ -2788,6 +3089,142 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     return {{"ok", true}, {"metrics", metrics_json()},
             {"activation_state", std::move(activation_state)},
             {"latest_announcement", std::move(latest_announcement)}};
+  }
+  if (action == "router.status") {
+    std::scoped_lock config_lock(config_mutex_);
+    return {{"ok", true}, {"router", router_profile_json(config_.commands)}};
+  }
+  if (action == "router.set_profile") {
+    const auto profile = command.value("profile", "");
+    if (profile != "game" && profile != "reading") {
+      return {{"ok", false},
+              {"error", "profile must be 'game' or 'reading'"}};
+    }
+    const bool save = command.value("save", false);
+    const bool preload = command.value("preload", profile == "reading");
+
+    CommandsConfig cmd_snapshot;
+    {
+      std::scoped_lock config_lock(config_mutex_);
+      cmd_snapshot = config_.commands;
+    }
+
+    if (profile == "game") {
+      const auto unload = send_ollama_keep_alive(
+          cmd_snapshot.local_router_base_url,
+          cmd_snapshot.local_router_model,
+          /*is_unload=*/true);
+
+      bool has_env_key = false;
+      if (!cmd_snapshot.router_api_key_env.empty()) {
+        const std::wstring wide_env(cmd_snapshot.router_api_key_env.begin(),
+                                    cmd_snapshot.router_api_key_env.end());
+        const DWORD len = GetEnvironmentVariableW(wide_env.c_str(), nullptr, 0);
+        has_env_key = (len > 0);
+      }
+      const bool cloud_is_loopback =
+          parse_loopback_url(cmd_snapshot.cloud_router_base_url).is_loopback;
+
+      std::string effective_fallback;
+      std::shared_ptr<const CommandParser> new_parser;
+      AppConfig active;
+      {
+        std::scoped_lock config_lock(config_mutex_);
+        if (config_.commands.game_router_backend == "openai_compatible" &&
+            (has_env_key || cloud_is_loopback)) {
+          config_.commands.router_backend = "openai_compatible";
+          config_.commands.router_base_url =
+              config_.commands.cloud_router_base_url;
+          config_.commands.router_model =
+              config_.commands.cloud_router_model;
+          if (config_.commands.parser_mode == "rules") {
+            config_.commands.parser_mode = "hybrid";
+          }
+          effective_fallback = "cloud_router";
+        } else {
+          config_.commands.router_backend = "none";
+          config_.commands.parser_mode = "rules";
+          effective_fallback = "local_rules";
+        }
+        config_.commands.router_profile = "game";
+        config_.revision++;
+        active = config_;
+      }
+
+      new_parser = create_command_parser(active, app_catalog_);
+      {
+        std::scoped_lock command_lock(command_mutex_);
+        command_parser_ = std::move(new_parser);
+        command_config_revision_ = active.revision;
+        commands_enabled_ = active.commands.enabled;
+      }
+      if (save) {
+        config_store_.save_overrides(active);
+      }
+      const auto profile_json = router_profile_json(active.commands);
+      emit_event("router_profile_state", profile_json);
+      emit_event("config_state",
+                 {{"config", config_store_.to_public_json(active)}});
+
+      return {{"ok", true},
+              {"router", profile_json},
+              {"vram_unloaded", unload.ok},
+              {"unload_elapsed_ms", unload.elapsed_ms},
+              {"unload_note", unload.note},
+              {"effective_fallback", effective_fallback}};
+    }
+
+    const auto requested_mode =
+        command.value("parser_mode", std::string("hybrid"));
+    if (requested_mode != "hybrid" && requested_mode != "router") {
+      return {{"ok", false},
+              {"error",
+               "parser_mode must be 'hybrid' or 'router' when switching to "
+               "reading"}};
+    }
+
+    std::shared_ptr<const CommandParser> new_parser;
+    AppConfig active;
+    {
+      std::scoped_lock config_lock(config_mutex_);
+      config_.commands.router_profile = "reading";
+      config_.commands.router_backend = "openai_compatible";
+      config_.commands.router_base_url =
+          config_.commands.local_router_base_url;
+      config_.commands.router_model = config_.commands.local_router_model;
+      config_.commands.parser_mode = requested_mode;
+      config_.revision++;
+      active = config_;
+    }
+
+    OllamaRequestResult preload_res{false, 0, "preload skipped"};
+    if (preload) {
+      preload_res = send_ollama_keep_alive(
+          active.commands.local_router_base_url,
+          active.commands.local_router_model,
+          /*is_unload=*/false);
+    }
+
+    new_parser = create_command_parser(active, app_catalog_);
+    {
+      std::scoped_lock command_lock(command_mutex_);
+      command_parser_ = std::move(new_parser);
+      command_config_revision_ = active.revision;
+      commands_enabled_ = active.commands.enabled;
+    }
+    if (save) {
+      config_store_.save_overrides(active);
+    }
+    const auto profile_json = router_profile_json(active.commands);
+    emit_event("router_profile_state", profile_json);
+    emit_event("config_state",
+               {{"config", config_store_.to_public_json(active)}});
+
+    return {{"ok", true},
+            {"router", profile_json},
+            {"preloaded", preload_res.ok},
+            {"preload_elapsed_ms", preload_res.elapsed_ms},
+            {"preload_note", preload_res.note}};
   }
   if (action == "replay.parse_debug") {
     if (!replay_mode_.load(std::memory_order_acquire)) {
@@ -3022,8 +3459,6 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
       }
       return true;
     };
-    changed(candidate.commands.router_backend != current.commands.router_backend,
-            "commands.router_backend");
     changed(candidate.commands.action_timeout_ms != current.commands.action_timeout_ms,
             "commands.action_timeout_ms");
     changed(candidate.commands.queue_capacity != current.commands.queue_capacity,
@@ -3077,9 +3512,9 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
     active.asr.emit_partials = candidate.asr.emit_partials;
     active.asr.feed_chunk_ms = candidate.asr.feed_chunk_ms;
     active.commands = candidate.commands;
-    // These shape the long-lived Windows backend/executor and are applied on
-    // the next process start. Grammar and enablement remain true hot settings.
-    active.commands.router_backend = current.commands.router_backend;
+    // Action timeout and queue capacity shape the long-lived Windows
+    // executor and are applied on the next process start. Grammar, enablement,
+    // and LLM router profiles/backends remain true zero-restart hot settings.
     active.commands.action_timeout_ms = current.commands.action_timeout_ms;
     active.commands.queue_capacity = current.commands.queue_capacity;
     active.apps = current.apps;
@@ -3133,12 +3568,24 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
         (!active.announcements.enabled || active.announcements.barge_in);
     const bool parser_changed =
         active.commands.parser_mode != current.commands.parser_mode ||
+        active.commands.router_backend != current.commands.router_backend ||
         active.commands.router_base_url != current.commands.router_base_url ||
         active.commands.router_model != current.commands.router_model ||
         active.commands.router_api_key_env != current.commands.router_api_key_env ||
         active.commands.router_timeout_ms != current.commands.router_timeout_ms ||
         active.commands.router_structured_outputs !=
             current.commands.router_structured_outputs ||
+        active.commands.router_profile != current.commands.router_profile ||
+        active.commands.local_router_base_url !=
+            current.commands.local_router_base_url ||
+        active.commands.local_router_model !=
+            current.commands.local_router_model ||
+        active.commands.game_router_backend !=
+            current.commands.game_router_backend ||
+        active.commands.cloud_router_base_url !=
+            current.commands.cloud_router_base_url ||
+        active.commands.cloud_router_model !=
+            current.commands.cloud_router_model ||
         active.commands.default_volume_step_percent !=
             current.commands.default_volume_step_percent ||
         active.commands.max_spoken_volume_step_percent !=
@@ -3264,6 +3711,13 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
                                    {"pipeline_reset", pipeline_changed},
                                    {"command_parser_swapped", parser_changed},
                                    {"saved_config", config_store_.to_public_json(candidate)}});
+    if (active.commands.router_profile != current.commands.router_profile ||
+        active.commands.router_backend != current.commands.router_backend ||
+        active.commands.router_base_url != current.commands.router_base_url ||
+        active.commands.router_model != current.commands.router_model ||
+        active.commands.parser_mode != current.commands.parser_mode) {
+      emit_event("router_profile_state", router_profile_json(active.commands));
+    }
     return {{"ok", true}, {"config", config_store_.to_public_json(active)},
             {"saved", save}, {"restart_required", restart_required}};
   }

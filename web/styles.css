@@ -20,6 +20,13 @@ h1, h2, p { margin: 0; } h1 { font-size: 26px; letter-spacing: -.4px; } h2 { fon
 .pill { padding: 4px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--muted); font: 700 11px Consolas, monospace; }
 .pill.online { color: var(--green); border-color: #285b3c; }.pill.offline { color: var(--red); border-color: #653137; }
 a.pill { text-decoration: none; } a.pill:hover { color: var(--text); border-color: #42566f; } .pill.warn-pill { color: var(--amber); border-color: #6c5025; }
+button.mode-pill { cursor: pointer; background: #111a24; line-height: 1.2; transition: all .2s ease; }
+button.mode-pill:hover:not(:disabled) { border-color: #42566f; background: #192635; }
+button.mode-pill.mode-reading { color: var(--cyan); border-color: #285b54; background: #09201f; }
+button.mode-pill.mode-reading:hover:not(:disabled) { border-color: var(--cyan); background: #0f2c2b; }
+button.mode-pill.mode-game { color: var(--amber); border-color: #6c5025; background: #241a0d; }
+button.mode-pill.mode-game:hover:not(:disabled) { border-color: var(--amber); background: #312312; }
+button.mode-pill:disabled { cursor: not-allowed; opacity: .5; }
 .record-indicator { display:flex; align-items:center; gap:6px; min-width:150px; padding:5px 10px; color:var(--muted); border:1px solid var(--line); border-radius:8px; background:#0b1118; }.record-indicator i { display:inline-block; width:10px; height:10px; flex:0 0 auto; border-radius:50%; background:#3b4654; }.record-indicator strong { color:var(--text); font:700 12px Consolas,monospace; }.record-indicator.active { color:#ffd8db; border-color:#79363d; background:#261217; }.record-indicator.active i { background:var(--red); box-shadow:0 0 12px var(--red); animation:record-pulse 1.2s ease-in-out infinite; }.record-indicator.pending { color:var(--amber); border-color:#6c5025; }.record-indicator.incomplete { color:var(--amber); border-color:#6c5025; }
 @keyframes record-pulse { 50% { opacity:.45; transform:scale(.82); } }
 main { padding: 18px 28px 36px; }.panel { background: linear-gradient(145deg, rgba(18,24,33,.98), rgba(12,17,24,.98)); border: 1px solid #202b39; border-radius: 11px; box-shadow: 0 15px 45px rgba(0,0,0,.18); }
