@@ -41,12 +41,13 @@ training/router/
    - 将 [`colab_m4_router_a100.ipynb`](./colab_m4_router_a100.ipynb) 上传至 Google Colab，并将运行时类型设置为 **A100 GPU**。
    - （可选）在 Colab 左侧 `Secrets` 中配置 `GEMINI_API_KEY` 或 `OPENAI_API_KEY`。若未配置，脚本将自动采用内置离线增强引擎生成数据。
 2. **流水线自动执行**：
-   - **Cell 1**：挂载 Drive 并拉取最新代码，工作路径设立在 NVMe 高速盘 `/content/local_router`。
+   - **内置 ColabJobHook 状态监控与远程抢救**：全程自动向 Google Drive (`colab_runs/m4_router/`) 写入原子 `status.json`、追加 `events.jsonl` 与滚动 `tail.log`。本地执行 `python tools/watch_colab_job.py --watch --job m4_router` 即可享受零 Token 阻塞监控；若遭遇依赖或数据生成异常，Hook 会进入 `waiting_for_fix` 状态，本地修复后发送 `sync_and_retry` 即可原地重试，训练完成后自动断开 A100 运行时。
+   - **Cell 1**：挂载 Drive、体检 GPU，拉取最新代码并初始化本地 NVMe 高速盘 `/content/local_router`。
    - **Cell 2**：配置 Unsloth / TRL / PEFT 及 GGUF 编译环境。
    - **Cell 3**：生成 3,000 条严格校验的 SFT 数据并备份至云盘。
    - **Cell 4**：Zero-Shot 摸底评测。
-   - **Cell 5**：启动 bf16 QLoRA 精调，余弦学习率衰减，完成 Assistant-only 损失训练。
-   - **Cell 6**：微调后效果评测，合并权重并导出 `dvo-qwen3-4b-router-q4_k_m.gguf` 与 `Modelfile.dvo-router`，自动同步至云盘 `desktop-voice-orchestrator-data/router_m4/export/`。
+   - **Cell 5**：启动 bf16 QLoRA 精调（挂载 `make_hf_trainer_callback(hook)` 实时回传损失与步数），余弦学习率衰减，完成 Assistant-only 损失训练。
+   - **Cell 6**：微调后效果评测，合并权重并导出 `dvo-qwen3-4b-router-q4_k_m.gguf` 与 `Modelfile.dvo-router`，自动同步至云盘 `desktop-voice-orchestrator-data/router_m4/export/` 并触发 `hook.finish_job(...)`。
 
 ---
 

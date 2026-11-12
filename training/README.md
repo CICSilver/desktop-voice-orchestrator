@@ -34,6 +34,7 @@ SenseVoiceEncoderSmall → 5 层 Transformer（`ctc_decoder`）→ CTC 输出层
 | `asr/export.py` | 导出 `model.onnx` 与 QUInt8 的 `model.int8.onnx`，写入与上游相同的元数据（支持 `--sherpa-nano-dir` / `--tokens`） |
 | `asr/evaluate.py` | test split 上的字错率（安静/音乐）、新命令子集准确率，以及日常背景里被识别出命令短语的片段数 |
 | `asr/run.sh` | 微调、逐轮导出并评估（WSL） |
+| `colab_telemetry_hook.py` | 纯 Python 标准库 Colab 监控与远程抢救 Hook：原子同步 `status.json`/`events.jsonl`/`tail.log` 到云盘，支持本地无感等待与原地热修复，任务完结自动断开 A100 |
 | `colab_m3_pipeline.ipynb` | Google Colab（L4 / A100）一键运行流水线：试听 25 条克隆小样 → 可选游戏录音双模型打标 → 3,600 条扩词造数 → 微调并导出 `asr-personal-v2` |
 
 ```bash
@@ -42,6 +43,21 @@ bash training/asr/run.sh asr-ft1 --num-epochs 3
 
 替换时把 `export-epoch-N/model.int8.onnx` 和 `tokens.txt` 拷到 `models/` 下，修改 `asr.final_model` 和 `asr.final_tokens`。
 二级唤醒同样使用这个模型。
+
+## 零 Token 监控与远程抢救机制 (Telemetry & Remote Rescue)
+
+在 Colab A100 上运行 `training/colab_m3_pipeline.ipynb` 或 `training/router/colab_m4_router_a100.ipynb` 时，内置的 `ColabJobHook` 将全程负责训练状态原子同步与故障抢救：
+
+1. **零 Token 阻塞监控**：
+   本地通过 `python tools/watch_colab_job.py --watch --job m3_asr`（或 `m4_router`）利用本地阻塞脚本等待，不消耗任何 Agent Token。
+2. **状态契约 (`colab_runs/<job_name>/`)**：
+   - `status.json`：原子写入当前阶段、进度（step、epoch、loss、ETA）、显存与心跳序号。
+   - `events.jsonl`：流式记录关键生命周期事件（阶段开始/完成、收到命令、任务成功/失败、释放算力）。
+   - `tail.log`：滚动保存最近 120 行日志，出差错时本地 watcher 可立即输出原始日志片段。
+3. **原地热修复 (`waiting_for_fix`)**：
+   当某阶段发生异常时，Hook 进入 `waiting_for_fix` 状态并维持心跳。本地修复代码后通过 `python tools/watch_colab_job.py --job <job_name> --send-command sync_and_retry` 即可将热补丁推送到云盘 `repo_sync/`，Colab 端会自动同步并就地重试该阶段（无需重启 Runtime 或重新加载基础模型）。
+4. **算力自动释放保护**：
+   训练成功（或抢救超时退出）后，Hook 自动调用 `google.colab.runtime.unassign()` 释放 A100 实例，防止闲置产生额外计算单元消耗。
 
 ## M3 个人音色克隆扩词与 Colab 训练工具链
 
