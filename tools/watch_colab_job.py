@@ -445,6 +445,11 @@ def do_watch(
             return 0
 
         if curr_state == "waiting_for_fix":
+            cmd_path = run_dir / "command.json"
+            if cmd_path.exists():
+                print("[COLAB_SENTINEL] Rescue command is pending execution on Colab. Waiting for runtime to resume...", flush=True)
+                time.sleep(poll_sec)
+                continue
             print("[COLAB_WAITING_FOR_FIX]", flush=True)
             print_status_summary(status, tail_path, show_full_error=True)
             return 10
@@ -575,8 +580,9 @@ def run_self_tests() -> int:
 
         # -------------------------------------------------------------
         # Scenario 2: running -> waiting_for_fix exits 10 with raw traceback
+        # (also verifies that pending command.json prevents premature exit 10)
         # -------------------------------------------------------------
-        print("\n[Scenario 2] Testing waiting_for_fix exit code 10 and traceback output...")
+        print("\n[Scenario 2] Testing waiting_for_fix exit code 10 and pending command handling...")
         fix_status = {
             "schema_version": 1,
             "job_name": "test_job",
@@ -598,7 +604,11 @@ def run_self_tests() -> int:
         with open(job_dir / "status.json", "w", encoding="utf-8") as f:
             json.dump(fix_status, f)
 
-        proc2 = subprocess.run(
+        # First verify pending command.json keeps watcher waiting
+        cmd_file_test = job_dir / "command.json"
+        cmd_file_test.write_text('{"action": "sync_and_retry"}', encoding="utf-8")
+
+        proc2 = subprocess.Popen(
             [
                 sys.executable,
                 str(this_script),
@@ -608,18 +618,35 @@ def run_self_tests() -> int:
                 "--poll-sec", "0.05",
                 "--stale-timeout-sec", "5.0"
             ],
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True
         )
+
+        time.sleep(0.2)
+        if proc2.poll() is not None:
+            stdout2_early, stderr2_early = proc2.communicate()
+            print("FAILED Scenario 2: Proc exited while command.json was still pending!")
+            print(f"Stdout:\n{stdout2_early}\nStderr:\n{stderr2_early}")
+            return 1
+
+        # Now simulate Colab consuming command.json (file unlinked)
+        cmd_file_test.unlink()
+
+        stdout2, stderr2 = proc2.communicate(timeout=10)
         if proc2.returncode != 10:
-            print(f"FAILED Scenario 2: Expected exit code 10, got {proc2.returncode}")
-            print(f"Stdout:\n{proc2.stdout}\nStderr:\n{proc2.stderr}")
+            print(f"FAILED Scenario 2: Expected exit code 10 after command consumed, got {proc2.returncode}")
+            print(f"Stdout:\n{stdout2}\nStderr:\n{stderr2}")
             return 1
-        if "[COLAB_WAITING_FOR_FIX]" not in proc2.stdout or "CUDA out of memory" not in proc2.stdout:
+        if "[COLAB_WAITING_FOR_FIX]" not in stdout2 or "CUDA out of memory" not in stdout2:
             print("FAILED Scenario 2: Waiting for fix header or traceback missing!")
-            print(f"Stdout:\n{proc2.stdout}")
+            print(f"Stdout:\n{stdout2}")
             return 1
-        print("  -> Scenario 2 PASSED: Exited with code 10 and printed raw traceback.")
+        if "[COLAB_SENTINEL] Rescue command is pending execution" not in stdout2:
+            print("FAILED Scenario 2: Pending command log message missing!")
+            print(f"Stdout:\n{stdout2}")
+            return 1
+        print("  -> Scenario 2 PASSED: Pending command prevented premature exit, unblocked to exit 10 upon consumption.")
 
         # -------------------------------------------------------------
         # Scenario 3: --send-command sync_and_retry syncs repo and writes command.json
