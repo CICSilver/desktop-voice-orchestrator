@@ -213,10 +213,6 @@ struct AnnouncementDispatcher::Impl {
         terminal.status = AnnouncementStatus::playback_cancelled;
         terminal.error_code = "dispatcher_stopped";
         terminal.message = "announcement delivery cancelled while stopping";
-      } else if (!started_published) {
-        // Fallback for custom backends that completed successfully without invoking on_started.
-        started_published = true;
-        publish(started);
       }
     } catch (const std::exception& error) {
       terminal.status = AnnouncementStatus::playback_failed;

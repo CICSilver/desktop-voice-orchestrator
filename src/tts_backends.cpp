@@ -889,7 +889,7 @@ class AutoFallbackAnnouncementBackend final : public IAnnouncementBackend {
     if (kokoro_succeeded) return;
 
     // 3. Fallback to Log backend (safe desktop continuity)
-    log_backend_->deliver(request, stop, guarded_on_started);
+    log_backend_->deliver(request, stop);
   }
 
  private:
@@ -984,7 +984,6 @@ void play_wav_bytes_winmm(std::span<const std::uint8_t> wav_bytes, std::stop_tok
   std::optional<std::stop_callback<std::function<void()>>> stop_cb;
   if (stop.stop_possible()) {
     stop_cb.emplace(stop, [&] {
-      waveOutReset(hwo);
       SetEvent(done_event);
     });
   }
@@ -996,6 +995,8 @@ void play_wav_bytes_winmm(std::span<const std::uint8_t> wav_bytes, std::stop_tok
     }
     WaitForSingleObject(done_event, 50);
   }
+
+  stop_cb.reset();
 
   if (!(header.dwFlags & WHDR_DONE)) {
     waveOutReset(hwo);

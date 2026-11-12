@@ -676,7 +676,7 @@ TEST_CASE("Google TTS synthesis, PCM-to-WAV wrapping, and SHA-256 persistent dis
 TEST_CASE("Dual-tier auto fallback cascades cleanly without duplicate playback_started") {
   ScopedTempDir temp_dir("dvo_auto_fallback_cache");
 
-  SECTION("Falls back to log when API key is missing and kokoro models are absent") {
+  SECTION("Falls back to silent log when API key is missing and kokoro models are absent") {
     std::mutex mutex;
     std::vector<dvo::AnnouncementStatus> events;
     dvo::TtsBackendOptions options;
@@ -695,12 +695,11 @@ TEST_CASE("Dual-tier auto fallback cascades cleanly without duplicate playback_s
     REQUIRE(dispatcher.wait_until_idle(std::chrono::seconds(2)));
 
     std::scoped_lock lock(mutex);
-    REQUIRE(events.size() == 2);
-    CHECK(events[0] == dvo::AnnouncementStatus::playback_started);
-    CHECK(events[1] == dvo::AnnouncementStatus::playback_finished);
+    REQUIRE(events.size() == 1);
+    CHECK(events[0] == dvo::AnnouncementStatus::playback_finished);
   }
 
-  SECTION("Falls back cleanly when HTTP endpoint returns 503") {
+  SECTION("Falls back cleanly to silent log when HTTP endpoint returns 503") {
     ScopedEnvVar env_var(L"DVO_TEST_AUTO_KEY", L"valid-key");
 
     LoopbackHttpServer server([](const RecordedMockRequest&) -> MockHttpResponse {
@@ -730,6 +729,70 @@ TEST_CASE("Dual-tier auto fallback cascades cleanly without duplicate playback_s
     REQUIRE(dispatcher.wait_until_idle(std::chrono::seconds(2)));
 
     CHECK(server.requests().size() == 1);
+    std::scoped_lock lock(mutex);
+    REQUIRE(events.size() == 1);
+    CHECK(events[0] == dvo::AnnouncementStatus::playback_finished);
+  }
+
+  SECTION("Emits playback_started exactly once when auto succeeds via google_tts") {
+    ScopedEnvVar env_var(L"DVO_TEST_AUTO_KEY_2", L"valid-key-2");
+
+    std::vector<std::uint8_t> dummy_pcm(200);
+    for (std::size_t i = 0; i < dummy_pcm.size(); ++i) {
+      dummy_pcm[i] = static_cast<std::uint8_t>(i & 0xFF);
+    }
+    const std::string b64_pcm = base64_encode_bytes(dummy_pcm);
+
+    LoopbackHttpServer server([&](const RecordedMockRequest&) -> MockHttpResponse {
+      nlohmann::json reply_json;
+      reply_json["candidates"] = nlohmann::json::array({
+          {{"content", {
+              {"parts", nlohmann::json::array({
+                  {{"inlineData", {
+                      {"mimeType", "audio/L16;codec=pcm;rate=24000"},
+                      {"data", b64_pcm}
+                  }}}
+              })}
+          }}}
+      });
+
+      MockHttpResponse resp;
+      resp.status = 200;
+      resp.body = reply_json.dump();
+      return resp;
+    });
+
+    std::vector<std::vector<std::uint8_t>> played_wavs;
+    std::mutex played_mutex;
+    auto test_player = [&](std::span<const std::uint8_t> wav_bytes, std::stop_token) {
+      std::scoped_lock lock(played_mutex);
+      played_wavs.emplace_back(wav_bytes.begin(), wav_bytes.end());
+    };
+
+    std::mutex mutex;
+    std::vector<dvo::AnnouncementStatus> events;
+    dvo::TtsBackendOptions options;
+    options.backend = "auto";
+    options.cache_dir = temp_dir.path;
+    options.google_api_key_env = "DVO_TEST_AUTO_KEY_2";
+    options.google_base_url = server.base_url();
+    options.google_timeout_ms = 1000;
+    options.kokoro_model_dir = "models/nonexistent_model_dir_99999";
+
+    auto backend = dvo::create_announcement_backend(options, test_player);
+    dvo::AnnouncementDispatcher dispatcher(backend, {}, [&](const dvo::AnnouncementResult& res) {
+      std::scoped_lock lock(mutex);
+      events.push_back(res.status);
+    });
+
+    REQUIRE(dispatcher.try_submit(request("auto-http-200")).accepted());
+    REQUIRE(dispatcher.wait_until_idle(std::chrono::seconds(2)));
+
+    CHECK(server.requests().size() == 1);
+    {
+      std::scoped_lock lock(played_mutex);
+      CHECK(played_wavs.size() == 1);
+    }
     std::scoped_lock lock(mutex);
     REQUIRE(events.size() == 2);
     CHECK(events[0] == dvo::AnnouncementStatus::playback_started);

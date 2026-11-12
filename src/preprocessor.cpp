@@ -69,7 +69,23 @@ class TimedSampleBuffer {
     }
 
     if (samples_.empty()) {
-      start_ = start;
+      if (last_end_ != std::numeric_limits<std::int64_t>::min() / 4 && start > last_end_) {
+        const auto gap = static_cast<std::size_t>(start - last_end_);
+        result.correction_samples += gap;
+        const float held = last_sample_;
+        const auto held_flags = static_cast<std::uint8_t>(kGapSample);
+        if (gap <= 4) {
+          samples_.insert(samples_.end(), gap, held);
+          sample_flags_.insert(sample_flags_.end(), gap, held_flags);
+        } else {
+          samples_.insert(samples_.end(), gap, 0.0F);
+          sample_flags_.insert(sample_flags_.end(), gap, kGapSample);
+          result.contains_gap = true;
+        }
+        start_ = last_end_;
+      } else {
+        start_ = start;
+      }
     } else {
       if (start < start_) {
         const auto older = std::min(
@@ -138,6 +154,10 @@ class TimedSampleBuffer {
       pop_front(remove);
       result.overflow_samples = remove;
     }
+    if (!samples_.empty()) {
+      last_end_ = end();
+      last_sample_ = samples_.back();
+    }
     return result;
   }
 
@@ -175,6 +195,8 @@ class TimedSampleBuffer {
     sample_flags_.clear();
     start_ = 0;
     floor_ = std::numeric_limits<std::int64_t>::min() / 4;
+    last_end_ = std::numeric_limits<std::int64_t>::min() / 4;
+    last_sample_ = 0.0F;
   }
 
   [[nodiscard]] bool empty() const { return samples_.empty(); }
@@ -198,6 +220,8 @@ class TimedSampleBuffer {
   std::deque<std::uint8_t> sample_flags_;
   std::int64_t start_{};
   std::int64_t floor_{std::numeric_limits<std::int64_t>::min() / 4};
+  std::int64_t last_end_{std::numeric_limits<std::int64_t>::min() / 4};
+  float last_sample_{0.0F};
 };
 
 class ClockRateEstimator {

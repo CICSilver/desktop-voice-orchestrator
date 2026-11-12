@@ -29,6 +29,17 @@
 namespace dvo {
 namespace {
 
+[[nodiscard]] std::wstring utf8_to_wide(std::string_view text) {
+  if (text.empty()) return {};
+  const int required = MultiByteToWideChar(
+      CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
+  if (required <= 0) return {};
+  std::wstring out(static_cast<std::size_t>(required), L'\0');
+  MultiByteToWideChar(
+      CP_UTF8, 0, text.data(), static_cast<int>(text.size()), out.data(), required);
+  return out;
+}
+
 class ScopedWinHttpHandle {
  public:
   ScopedWinHttpHandle() = default;
@@ -192,8 +203,8 @@ struct OllamaRequestResult {
   }
   const std::string json_body = payload.dump();
 
-  const std::wstring wide_host(endpoint.host.begin(), endpoint.host.end());
-  const std::wstring wide_path(request_path.begin(), request_path.end());
+  const std::wstring wide_host = utf8_to_wide(endpoint.host);
+  const std::wstring wide_path = utf8_to_wide(request_path);
 
   ScopedWinHttpHandle session(
       WinHttpOpen(L"dvo-ollama-hot-switch/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
@@ -840,9 +851,34 @@ void VoiceFrontendRuntime::initialize_pipeline() {
     completed_command_snapshots_.clear();
     completed_command_snapshot_order_.clear();
   }
+  TtsBackendOptions tts_options;
+  tts_options.backend = config_.announcements.backend;
+  tts_options.cache_dir = config_.announcements.cache_dir;
+  tts_options.google_model = config_.announcements.google_model;
+  tts_options.google_voice = config_.announcements.google_voice;
+  tts_options.google_api_key_env = config_.announcements.google_api_key_env;
+  tts_options.google_base_url = config_.announcements.google_base_url;
+  tts_options.google_timeout_ms = config_.announcements.google_timeout_ms;
+  tts_options.kokoro_model_dir = config_.announcements.kokoro_model_dir;
+  tts_options.kokoro_speaker_id = config_.announcements.kokoro_speaker_id;
+  tts_options.kokoro_speed = config_.announcements.kokoro_speed;
+  tts_options.kokoro_num_threads = config_.announcements.kokoro_num_threads;
+
+  if (!tts_options.cache_dir.empty() && tts_options.cache_dir.is_relative() &&
+      !config_.project_root.empty()) {
+    tts_options.cache_dir = config_.project_root / tts_options.cache_dir;
+  }
+  if (!tts_options.kokoro_model_dir.empty() &&
+      tts_options.kokoro_model_dir.is_relative() &&
+      !config_.project_root.empty()) {
+    tts_options.kokoro_model_dir = config_.project_root / tts_options.kokoro_model_dir;
+  }
+
+  const bool audible_live_only = (config_.announcements.backend != "log");
   announcement_dispatcher_ = std::make_unique<AnnouncementDispatcher>(
-      std::make_shared<LogAnnouncementBackend>(),
-      AnnouncementDispatcherConfig{config_.announcements.queue_capacity, false},
+      create_announcement_backend(tts_options),
+      AnnouncementDispatcherConfig{config_.announcements.queue_capacity,
+                                   audible_live_only},
       [this](const AnnouncementResult& result) {
         handle_announcement_result(result);
       });
@@ -3117,8 +3153,7 @@ nlohmann::json VoiceFrontendRuntime::handle_command(const nlohmann::json& comman
 
       bool has_env_key = false;
       if (!cmd_snapshot.router_api_key_env.empty()) {
-        const std::wstring wide_env(cmd_snapshot.router_api_key_env.begin(),
-                                    cmd_snapshot.router_api_key_env.end());
+        const std::wstring wide_env = utf8_to_wide(cmd_snapshot.router_api_key_env);
         const DWORD len = GetEnvironmentVariableW(wide_env.c_str(), nullptr, 0);
         has_env_key = (len > 0);
       }
