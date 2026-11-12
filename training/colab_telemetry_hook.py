@@ -493,10 +493,6 @@ class ColabJobHook:
                             cmd_id = cmd.get("cmd_id")
                             if cmd_id:
                                 self._consumed_cmd_ids.add(cmd_id)
-                                try:
-                                    (self.run_dir / "command.json").unlink(missing_ok=True)
-                                except Exception:
-                                    pass
                             self._log_event("command_received", {
                                 "cmd_id": cmd_id,
                                 "action": action,
@@ -512,6 +508,10 @@ class ColabJobHook:
                                     self.state = "running"
                                     self.updated_at_ts = time.time()
                                 self._write_status_atomic()
+                                try:
+                                    (self.run_dir / "command.json").unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                                 rescued = True
                                 break
                             elif action == "git_pull_and_retry":
@@ -523,10 +523,18 @@ class ColabJobHook:
                                     self.state = "running"
                                     self.updated_at_ts = time.time()
                                 self._write_status_atomic()
+                                try:
+                                    (self.run_dir / "command.json").unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                                 rescued = True
                                 break
                             elif action == "abort":
                                 print(f"🛑 Received abort command ({cmd_id})")
+                                try:
+                                    (self.run_dir / "command.json").unlink(missing_ok=True)
+                                except Exception:
+                                    pass
                                 break
                             else:
                                 print(f"⚠️ Unknown command action: {action}")
