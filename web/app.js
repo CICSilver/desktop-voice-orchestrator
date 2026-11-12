@@ -24,6 +24,7 @@ const state = {
     replay: {active: false, status: '未激活'}
   },
   announcement: {live: null, replay: null},
+  routerProfile: null,
   view: {
     frozen: false,
     snapshot: null,
@@ -41,6 +42,27 @@ function showControlMessage(message = '', level = '') {
   const output = $('control-message');
   output.textContent = message;
   output.className = `control-message ${level}`.trim();
+}
+
+function renderRouterProfile() {
+  const btn = $('router-mode-toggle');
+  if (!btn || !state.routerProfile) return;
+  const p = state.routerProfile;
+  const isReading = Boolean(p.vram_resident || p.profile === 'reading');
+  btn.classList.remove('mode-reading', 'mode-game');
+  if (isReading) {
+    btn.classList.add('mode-reading');
+    const model = p.local_router_model || p.router_model || 'qwen3:4b';
+    btn.textContent = `📖 看书模式 · 本地4090 (${model})`;
+    btn.title = '当前：看书/写字桌面模式（本地 4090 常驻）。点击一键释放 4090 显存并切入游戏模式。';
+  } else {
+    btn.classList.add('mode-game');
+    const isCloud = p.router_backend === 'openai_compatible';
+    const model = p.cloud_router_model || p.router_model || 'gpt-4o-mini';
+    const desc = isCloud ? model : '纯规则';
+    btn.textContent = `🎮 游戏模式 · 0显存 (${desc})`;
+    btn.title = '当前：游戏模式（0 显存占用）。点击切入看书/写字桌面模式并预热本地 4090。';
+  }
 }
 
 function sessionName(path = '') {
@@ -400,6 +422,10 @@ function handle(message) {
     if (payload.latest_announcement) {
       hydrateAnnouncement(modeOf(message), payload.latest_announcement);
     }
+    addEvent(message);
+  } else if (type === 'router_profile_state') {
+    state.routerProfile = payload;
+    renderRouterProfile();
     addEvent(message);
   } else if (type === 'recording_state') {
     const active = !!payload.active;
@@ -1064,6 +1090,39 @@ $('view-scrubber').addEventListener('input', () => {
   syncViewControls();
 });
 for (const id of ['waveform', 'aec-band', 'vad', 'kws']) installTimelineDrag($(id));
+
+const routerModeToggle = $('router-mode-toggle');
+if (routerModeToggle) {
+  routerModeToggle.onclick = async () => {
+    const current = state.routerProfile;
+    const isReading = current ? Boolean(current.vram_resident || current.profile === 'reading') : false;
+    const targetProfile = isReading ? 'game' : 'reading';
+    routerModeToggle.disabled = true;
+    showControlMessage(`正在切换至${targetProfile === 'reading' ? '看书模式（预热本地 4090）' : '游戏模式（秒级释放 4090 显存）'}…`);
+    const result = await command('router.set_profile', {
+      profile: targetProfile,
+      preload: targetProfile === 'reading'
+    });
+    routerModeToggle.disabled = false;
+    if (result.ok) {
+      if (result.router) {
+        state.routerProfile = result.router;
+        renderRouterProfile();
+      }
+      if (targetProfile === 'game') {
+        const unloadMsg = result.vram_unloaded
+          ? `显存已释放 (${result.unload_elapsed_ms}ms)`
+          : `显存释放提示: ${result.unload_note || '跳过'}`;
+        showControlMessage(`已切入游戏模式 · ${result.effective_fallback === 'cloud_router' ? '云端路由' : '本地规则'} · ${unloadMsg}`, 'success');
+      } else {
+        const preloadMsg = result.preloaded
+          ? `模型已预热 (${result.preload_elapsed_ms}ms)`
+          : `预热提示: ${result.preload_note || '就绪'}`;
+        showControlMessage(`已切入看书模式 · 本地 4090 · ${preloadMsg}`, 'success');
+      }
+    }
+  };
+}
 
 syncViewControls();
 setActiveMode('live');

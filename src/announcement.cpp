@@ -195,17 +195,28 @@ struct AnnouncementDispatcher::Impl {
     } catch (...) {
       // Endpoint diagnostics cannot turn delivery into an action-path failure.
     }
-    publish(started);
+
+    bool started_published = false;
+    const auto on_started = [&]() {
+      if (stop_token.stop_requested()) return;
+      if (started_published) return;
+      started_published = true;
+      publish(started);
+    };
 
     auto terminal = lifecycle_result(request, AnnouncementStatus::playback_finished,
                                      backend->name());
     terminal.render_endpoint = started.render_endpoint;
     try {
-      backend->deliver(request, stop_token);
+      backend->deliver(request, stop_token, on_started);
       if (stop_token.stop_requested()) {
         terminal.status = AnnouncementStatus::playback_cancelled;
         terminal.error_code = "dispatcher_stopped";
         terminal.message = "announcement delivery cancelled while stopping";
+      } else if (!started_published) {
+        // Fallback for custom backends that completed successfully without invoking on_started.
+        started_published = true;
+        publish(started);
       }
     } catch (const std::exception& error) {
       terminal.status = AnnouncementStatus::playback_failed;

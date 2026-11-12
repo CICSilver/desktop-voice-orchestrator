@@ -137,6 +137,12 @@ struct CommandsConfig {
   std::string router_api_key_env{"OPENAI_API_KEY"};
   std::uint32_t router_timeout_ms{2500};
   bool router_structured_outputs{true};
+  std::string router_profile{"custom"};  // "reading" | "game" | "custom"
+  std::string local_router_base_url{"http://127.0.0.1:11434/v1"};
+  std::string local_router_model{"qwen3:4b"};
+  std::string game_router_backend{"openai_compatible"};  // "openai_compatible" | "none"
+  std::string cloud_router_base_url{"https://api.openai.com/v1"};
+  std::string cloud_router_model{"gpt-4o-mini"};
   std::uint32_t default_volume_step_percent{5};
   std::uint32_t max_spoken_volume_step_percent{20};
   std::uint32_t max_actions_per_utterance{8};
@@ -185,6 +191,16 @@ struct AnnouncementsConfig {
   std::uint32_t queue_capacity{32};
   bool barge_in{false};
   std::uint32_t tail_guard_ms{200};
+  std::filesystem::path cache_dir{"data/tts_cache"};
+  std::string google_model{"gemini-3.8-flash-tts"};
+  std::string google_voice{"Kore"};
+  std::string google_api_key_env{"GEMINI_API_KEY"};
+  std::string google_base_url{"https://generativelanguage.googleapis.com"};
+  std::uint32_t google_timeout_ms{2500};
+  std::filesystem::path kokoro_model_dir{"models/kokoro-int8-multi-lang-v1_1"};
+  std::int32_t kokoro_speaker_id{45};
+  float kokoro_speed{1.0F};
+  std::int32_t kokoro_num_threads{2};
 };
 
 struct WebConfig {

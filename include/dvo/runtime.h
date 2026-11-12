@@ -75,6 +75,7 @@ class VoiceFrontendRuntime {
       const std::filesystem::path& session,
       const std::filesystem::path& processed_dump = {});
   void stop();
+  [[nodiscard]] nlohmann::json handle_command(const nlohmann::json& command);
   [[nodiscard]] bool running() const { return running_.load(std::memory_order_acquire); }
   [[nodiscard]] std::string debug_url() const { return debug_.url(); }
 
@@ -160,7 +161,6 @@ class VoiceFrontendRuntime {
                   std::uint64_t timestamp_sample = 0, std::string source = "live");
   void queue_capture_event(std::string type, std::string message);
   void drain_capture_events();
-  [[nodiscard]] nlohmann::json handle_command(const nlohmann::json& command);
   [[nodiscard]] nlohmann::json session_list() const;
   [[nodiscard]] std::optional<DebugServer::FileResource>
   session_audio_resource(const nlohmann::json& request) const;

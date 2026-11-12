@@ -10,8 +10,11 @@
 #include <memory>
 #include <string>
 #include <thread>
+#include <vector>
 
+#include "dvo/config.h"
 #include "dvo/debug_server.h"
+#include "dvo/runtime.h"
 
 namespace {
 
@@ -256,4 +259,177 @@ TEST_CASE("debug server reports a bind failure during start") {
   CHECK_THROWS_WITH(second.start(config, {}),
                     Catch::Matchers::ContainsSubstring("startup failed"));
   first.stop();
+}
+
+namespace {
+
+struct MockOllamaRecord {
+  std::string target;
+  std::string body;
+};
+
+class MockOllamaServer {
+ public:
+  MockOllamaServer()
+      : acceptor_(io_, tcp::endpoint(asio::ip::make_address("127.0.0.1"), 0)) {
+    port_ = acceptor_.local_endpoint().port();
+    worker_ = std::jthread([this](std::stop_token stop) { serve(stop); });
+  }
+
+  ~MockOllamaServer() { stop(); }
+
+  void stop() {
+    if (stopped_.exchange(true)) return;
+    beast::error_code ec;
+    acceptor_.close(ec);
+    io_.stop();
+    if (worker_.joinable()) {
+      worker_.request_stop();
+      worker_.join();
+    }
+  }
+
+  [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
+  [[nodiscard]] std::string base_url() const {
+    return "http://127.0.0.1:" + std::to_string(port_) + "/v1";
+  }
+
+  [[nodiscard]] std::vector<MockOllamaRecord> requests() const {
+    std::scoped_lock lock(mutex_);
+    return requests_;
+  }
+
+ private:
+  void serve(std::stop_token stop) {
+    acceptor_.non_blocking(true);
+    while (!stop.stop_requested() && !stopped_.load(std::memory_order_acquire)) {
+      tcp::socket socket(io_);
+      beast::error_code ec;
+      acceptor_.accept(socket, ec);
+      if (ec == asio::error::would_block || ec == asio::error::try_again) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        continue;
+      }
+      if (ec) break;
+
+      std::jthread([this, sock = std::move(socket)]() mutable {
+        beast::tcp_stream stream(std::move(sock));
+        stream.expires_after(std::chrono::seconds(2));
+        beast::flat_buffer buffer;
+        http::request<http::string_body> req;
+        beast::error_code read_ec;
+        http::read(stream, buffer, req, read_ec);
+        if (read_ec) return;
+
+        {
+          std::scoped_lock lock(mutex_);
+          requests_.push_back({std::string(req.target()), req.body()});
+        }
+
+        http::response<http::string_body> res{http::status::ok, req.version()};
+        res.set(http::field::content_type, "application/json");
+        res.keep_alive(false);
+        res.body() = R"({"response":"done"})";
+        res.prepare_payload();
+        beast::error_code write_ec;
+        http::write(stream, res, write_ec);
+        stream.socket().shutdown(tcp::socket::shutdown_send, write_ec);
+      }).detach();
+    }
+  }
+
+  asio::io_context io_;
+  tcp::acceptor acceptor_;
+  std::uint16_t port_{};
+  std::atomic<bool> stopped_{false};
+  mutable std::mutex mutex_;
+  std::vector<MockOllamaRecord> requests_;
+  std::jthread worker_;
+};
+
+}  // namespace
+
+TEST_CASE("runtime router profile hot-switch and mock ollama unload/preload") {
+  MockOllamaServer mock_ollama;
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  StaticRoot temp_dir;
+  const auto local_toml = temp_dir.path / "local.toml";
+  dvo::ConfigStore store(root / "config/default.toml", local_toml, root);
+  auto config = store.load();
+
+  config.commands.local_router_base_url = mock_ollama.base_url();
+  config.commands.local_router_model = "test-qwen";
+  config.commands.game_router_backend = "openai_compatible";
+  config.commands.cloud_router_base_url = "https://api.openai.com/v1";
+  config.commands.cloud_router_model = "gpt-4o-mini";
+  config.commands.router_profile = "reading";
+  config.commands.router_backend = "openai_compatible";
+  config.commands.router_base_url = mock_ollama.base_url();
+  config.commands.router_model = "test-qwen";
+  config.commands.parser_mode = "hybrid";
+
+  dvo::VoiceFrontendRuntime runtime(config, store);
+
+  // Initial status check
+  auto status_res = runtime.handle_command({{"action", "router.status"}});
+  REQUIRE(status_res["ok"].get<bool>());
+  CHECK(status_res["router"]["profile"] == "reading");
+  CHECK(status_res["router"]["vram_resident"].get<bool>());
+
+  // 1) Switch to game mode (env key unset -> fallback to local_rules, unload sent < 500ms)
+  (void)_putenv_s("OPENAI_API_KEY", "");
+  auto game_res = runtime.handle_command({
+      {"action", "router.set_profile"},
+      {"profile", "game"}
+  });
+  REQUIRE(game_res["ok"].get<bool>());
+  CHECK(game_res["vram_unloaded"].get<bool>());
+  CHECK(game_res["unload_elapsed_ms"].get<std::uint64_t>() < 500);
+  CHECK(game_res["effective_fallback"] == "local_rules");
+  CHECK(game_res["router"]["profile"] == "game");
+  CHECK_FALSE(game_res["router"]["vram_resident"].get<bool>());
+  CHECK(game_res["router"]["router_backend"] == "none");
+  CHECK(game_res["router"]["parser_mode"] == "rules");
+
+  auto reqs = mock_ollama.requests();
+  REQUIRE(!reqs.empty());
+  CHECK(reqs.back().target == "/api/generate");
+  auto unload_payload = nlohmann::json::parse(reqs.back().body);
+  CHECK(unload_payload["model"] == "test-qwen");
+  CHECK(unload_payload["keep_alive"] == 0);
+
+  // 2) Switch back to reading mode (hybrid mode, preload sent)
+  auto reading_res = runtime.handle_command({
+      {"action", "router.set_profile"},
+      {"profile", "reading"},
+      {"preload", true}
+  });
+  REQUIRE(reading_res["ok"].get<bool>());
+  CHECK(reading_res["preloaded"].get<bool>());
+  CHECK(reading_res["router"]["profile"] == "reading");
+  CHECK(reading_res["router"]["vram_resident"].get<bool>());
+  CHECK(reading_res["router"]["router_backend"] == "openai_compatible");
+  CHECK(reading_res["router"]["router_base_url"] == mock_ollama.base_url());
+  CHECK(reading_res["router"]["parser_mode"] == "hybrid");
+
+  reqs = mock_ollama.requests();
+  REQUIRE(reqs.size() >= 2);
+  CHECK(reqs.back().target == "/api/generate");
+  auto preload_payload = nlohmann::json::parse(reqs.back().body);
+  CHECK(preload_payload["model"] == "test-qwen");
+  CHECK(preload_payload["keep_alive"] == "30m");
+
+  // 3) Switch to game mode with env key set -> effective_fallback is cloud_router
+  REQUIRE(_putenv_s("OPENAI_API_KEY", "test-key-mock") == 0);
+  auto cloud_game_res = runtime.handle_command({
+      {"action", "router.set_profile"},
+      {"profile", "game"}
+  });
+  REQUIRE(cloud_game_res["ok"].get<bool>());
+  CHECK(cloud_game_res["effective_fallback"] == "cloud_router");
+  CHECK(cloud_game_res["router"]["profile"] == "game");
+  CHECK(cloud_game_res["router"]["router_backend"] == "openai_compatible");
+  CHECK(cloud_game_res["router"]["router_base_url"] == "https://api.openai.com/v1");
+  CHECK(cloud_game_res["router"]["router_model"] == "gpt-4o-mini");
+  (void)_putenv_s("OPENAI_API_KEY", "");
 }

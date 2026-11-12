@@ -358,3 +358,115 @@ TEST_CASE("default app presets and OpenAI router configuration validate and pers
   (void)_putenv_s("DVO_TEST_ROUTER_ENV_SECRET", "");
   std::filesystem::remove_all(temp);
 }
+
+TEST_CASE("announcements config supports new TTS fields, validation, and serialization") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  const auto temp = temporary_directory();
+  const auto local = temp / "config/local.toml";
+  dvo::ConfigStore store(root / "config/default.toml", local, root);
+  auto config = store.load();
+
+  CHECK(config.announcements.backend == "log");
+  CHECK(config.announcements.google_model == "gemini-3.8-flash-tts");
+  CHECK(config.announcements.google_voice == "Kore");
+  CHECK(config.announcements.google_api_key_env == "GEMINI_API_KEY");
+  CHECK(config.announcements.google_base_url == "https://generativelanguage.googleapis.com");
+  CHECK(config.announcements.google_timeout_ms == 2500);
+  CHECK(config.announcements.kokoro_speaker_id == 45);
+  CHECK(config.announcements.kokoro_speed == Catch::Approx(1.0F));
+  CHECK(config.announcements.kokoro_num_threads == 2);
+
+  auto patched = config;
+  REQUIRE(store.apply_patch(
+              patched,
+              {{"announcements",
+                {{"backend", "google_tts"},
+                 {"google_timeout_ms", 3000},
+                 {"google_voice", "Puck"},
+                 {"kokoro_speaker_id", 12},
+                 {"kokoro_speed", 1.25},
+                 {"kokoro_num_threads", 4}}}})
+              .ok());
+  CHECK(patched.announcements.backend == "google_tts");
+  CHECK(patched.announcements.google_timeout_ms == 3000);
+  CHECK(patched.announcements.google_voice == "Puck");
+  CHECK(patched.announcements.kokoro_speaker_id == 12);
+  CHECK(patched.announcements.kokoro_speed == Catch::Approx(1.25F));
+  CHECK(patched.announcements.kokoro_num_threads == 4);
+
+  // Validation checks
+  auto bad = config;
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"backend", "unknown_tts"}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"google_timeout_ms", 50}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"google_timeout_ms", 20000}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"kokoro_speaker_id", -1}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"kokoro_speed", 0.1}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"kokoro_speed", 5.0}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"kokoro_num_threads", 0}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"kokoro_num_threads", 20}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"announcements", {{"google_api_key_env", "sk-12345-secret"}}}}).ok());
+
+  // Round-trip save_overrides
+  store.save_overrides(patched);
+  const auto reloaded = store.load();
+  CHECK(reloaded.announcements.backend == "google_tts");
+  CHECK(reloaded.announcements.google_timeout_ms == 3000);
+  CHECK(reloaded.announcements.google_voice == "Puck");
+  CHECK(reloaded.announcements.kokoro_speaker_id == 12);
+  CHECK(reloaded.announcements.kokoro_speed == Catch::Approx(1.25F));
+  CHECK(reloaded.announcements.kokoro_num_threads == 4);
+
+  std::filesystem::remove_all(temp);
+}
+
+TEST_CASE("commands config dual-profile settings, validation, and overrides round-trip") {
+  const auto root = std::filesystem::path(DVO_PROJECT_ROOT);
+  const auto temp = temporary_directory();
+  const auto local = temp / "config/local.toml";
+  dvo::ConfigStore store(root / "config/default.toml", local, root);
+  auto config = store.load();
+
+  CHECK(config.commands.router_profile == "custom");
+  CHECK(config.commands.local_router_base_url == "http://127.0.0.1:11434/v1");
+  CHECK(config.commands.local_router_model == "qwen3:4b");
+  CHECK(config.commands.game_router_backend == "openai_compatible");
+  CHECK(config.commands.cloud_router_base_url == "https://api.openai.com/v1");
+  CHECK(config.commands.cloud_router_model == "gpt-4o-mini");
+
+  auto patched = config;
+  REQUIRE(store.apply_patch(
+              patched,
+              {{"commands",
+                {{"router_profile", "reading"},
+                 {"local_router_base_url", "http://127.0.0.1:8000/v1"},
+                 {"local_router_model", "dvo-router"},
+                 {"game_router_backend", "none"},
+                 {"cloud_router_base_url", "http://127.0.0.1:9000/v1"},
+                 {"cloud_router_model", "gpt-4o-mini-test"}}}})
+              .ok());
+  CHECK(patched.commands.router_profile == "reading");
+  CHECK(patched.commands.local_router_base_url == "http://127.0.0.1:8000/v1");
+  CHECK(patched.commands.local_router_model == "dvo-router");
+  CHECK(patched.commands.game_router_backend == "none");
+  CHECK(patched.commands.cloud_router_base_url == "http://127.0.0.1:9000/v1");
+  CHECK(patched.commands.cloud_router_model == "gpt-4o-mini-test");
+
+  auto bad = config;
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"router_profile", "invalid_profile"}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"game_router_backend", "other_backend"}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"local_router_base_url", "invalid-url"}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"cloud_router_base_url", "invalid-url"}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"local_router_model", ""}}}}).ok());
+  CHECK_FALSE(store.apply_patch(bad, {{"commands", {{"cloud_router_model", ""}}}}).ok());
+
+  store.save_overrides(patched);
+  const auto reloaded = store.load();
+  CHECK(reloaded.commands.router_profile == "reading");
+  CHECK(reloaded.commands.local_router_base_url == "http://127.0.0.1:8000/v1");
+  CHECK(reloaded.commands.local_router_model == "dvo-router");
+  CHECK(reloaded.commands.game_router_backend == "none");
+  CHECK(reloaded.commands.cloud_router_base_url == "http://127.0.0.1:9000/v1");
+  CHECK(reloaded.commands.cloud_router_model == "gpt-4o-mini-test");
+
+  std::filesystem::remove_all(temp);
+}
