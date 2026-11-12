@@ -3,8 +3,10 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
+#include <span>
 #include <stop_token>
 #include <string>
 #include <vector>
@@ -81,6 +83,8 @@ struct AnnouncementSubmitResult {
 
 class IAnnouncementBackend {
  public:
+  using PlaybackStartedCallback = std::function<void()>;
+
   virtual ~IAnnouncementBackend() = default;
   [[nodiscard]] virtual const char* name() const noexcept = 0;
   // Audible backends report the endpoint that is also supplied to the
@@ -88,6 +92,12 @@ class IAnnouncementBackend {
   [[nodiscard]] virtual std::string render_endpoint() const { return {}; }
   virtual void deliver(const AnnouncementRequest& request,
                        std::stop_token stop) = 0;
+  virtual void deliver(const AnnouncementRequest& request,
+                       std::stop_token stop,
+                       const PlaybackStartedCallback& on_playback_started) {
+    if (on_playback_started) on_playback_started();
+    deliver(request, stop);
+  }
 };
 
 // The log backend deliberately performs no I/O. Its dispatcher lifecycle
@@ -140,5 +150,29 @@ class AnnouncementDispatcher {
 [[nodiscard]] const char* to_string(AnnouncementKind kind);
 [[nodiscard]] const char* to_string(AnnouncementStatus status);
 [[nodiscard]] const char* to_string(AnnouncementSubmitStatus status);
+
+using AudioWavePlaybackFn =
+    std::function<void(std::span<const std::uint8_t> wav_bytes, std::stop_token stop)>;
+
+struct TtsBackendOptions {
+  std::string backend{"log"};  // "log" | "google_tts" | "sherpa_kokoro" | "auto"
+  std::filesystem::path cache_dir{"data/tts_cache"};
+  std::string google_model{"gemini-3.8-flash-tts"};
+  std::string google_voice{"Kore"};
+  std::string google_api_key_env{"GEMINI_API_KEY"};
+  std::string google_base_url{"https://generativelanguage.googleapis.com"};
+  std::uint32_t google_timeout_ms{2500};
+  std::filesystem::path kokoro_model_dir{"models/kokoro-int8-multi-lang-v1_1"};
+  std::int32_t kokoro_speaker_id{45};
+  float kokoro_speed{1.0F};
+  std::int32_t kokoro_num_threads{2};
+};
+
+// Default player plays RIFF PCM WAV bytes on default Windows waveOut device and cancels immediately on stop_token.
+void play_wav_bytes_winmm(std::span<const std::uint8_t> wav_bytes, std::stop_token stop);
+
+[[nodiscard]] std::shared_ptr<IAnnouncementBackend> create_announcement_backend(
+    const TtsBackendOptions& options,
+    AudioWavePlaybackFn player = play_wav_bytes_winmm);
 
 }  // namespace dvo

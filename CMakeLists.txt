@@ -25,6 +25,13 @@ add_custom_target(fetch_models
   COMMENT "Download and verify pinned KWS/VAD/ASR models"
 )
 
+add_custom_target(fetch_tts_models
+  COMMAND ${CMAKE_COMMAND}
+          -DDVO_MODEL_DIR=${CMAKE_CURRENT_SOURCE_DIR}/models
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/FetchTtsModels.cmake
+  COMMENT "Download and verify pinned Kokoro TTS models"
+)
+
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 include(Dependencies)
 
@@ -53,6 +60,7 @@ add_library(dvo_core STATIC
   src/evaluation.cpp
   src/wake_probe.cpp
   src/announcement.cpp
+  src/tts_backends.cpp
   src/volume_math.cpp
   src/wav_file.cpp
   src/recorder.cpp
@@ -87,6 +95,8 @@ target_link_libraries(dvo_core
     runtimeobject
     shell32
     user32
+    winmm
+    crypt32
     bcrypt
     winhttp
     # The Windows SDK's system SQLite, used read-only on the NetEase client's database.
