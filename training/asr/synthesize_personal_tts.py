@@ -213,8 +213,22 @@ def _install_torchaudio_soundfile_shim() -> None:
 
     orig_load = torchaudio.load
 
-    def _sf_load(uri, frame_offset: int = 0, num_frames: int = -1, normalize: bool = True, channels_first: bool = True, format: str | None = None, buffer_size: int = 4096):
-        import torch
+    def _sf_load(
+        uri,
+        frame_offset: int = 0,
+        num_frames: int = -1,
+        normalize: bool = True,
+        channels_first: bool = True,
+        format: str | None = None,
+        buffer_size: int = 4096,
+        backend: str | None = None,
+        **kwargs,
+    ):
+        try:
+            import torch
+        except ImportError:
+            torch = None
+
         if isinstance(uri, (str, os.PathLike)) and os.path.exists(str(uri)):
             try:
                 try:
@@ -224,21 +238,37 @@ def _install_torchaudio_soundfile_shim() -> None:
                     data, sr = sf.read(str(uri), frames=frames, start=start, dtype="float32", always_2d=True)
                     # data is (frames, channels)
                     sig = data.T if channels_first else data
-                    return torch.from_numpy(sig.astype(np.float32, copy=False)), sr
+                    if torch is not None:
+                        return torch.from_numpy(sig.astype(np.float32, copy=False)), sr
+                    return sig.astype(np.float32, copy=False), sr
                 except Exception:
                     data, sr = _load_wav_soundfile_tensor(uri, target_sr=None)
-                    if not isinstance(data, torch.Tensor):
+                    if torch is not None and not isinstance(data, torch.Tensor):
                         data = torch.from_numpy(data)
                     return data, sr
             except Exception:
                 pass
 
         try:
-            return orig_load(uri, frame_offset=frame_offset, num_frames=num_frames, normalize=normalize, channels_first=channels_first, format=format, buffer_size=buffer_size)
+            orig_params = inspect.signature(orig_load).parameters
+            call_kw = {
+                "frame_offset": frame_offset,
+                "num_frames": num_frames,
+                "normalize": normalize,
+                "channels_first": channels_first,
+                "format": format,
+                "buffer_size": buffer_size,
+            }
+            if "backend" in orig_params and backend is not None:
+                call_kw["backend"] = backend
+            for k, v in kwargs.items():
+                if k in orig_params:
+                    call_kw[k] = v
+            return orig_load(uri, **call_kw)
         except (RuntimeError, ImportError):
             if isinstance(uri, (str, os.PathLike)) and os.path.exists(str(uri)):
                 data, sr = _load_wav_soundfile_tensor(uri, target_sr=None)
-                if not isinstance(data, torch.Tensor):
+                if torch is not None and not isinstance(data, torch.Tensor):
                     data = torch.from_numpy(data)
                 return data, sr
             raise
@@ -633,12 +663,34 @@ def run_self_test() -> int:
 
         _install_torchaudio_soundfile_shim()
 
+        shim_verified = False
         try:
             import torchaudio
             t_wave, t_sr = torchaudio.load(str(tmp_wav))
             assert t_sr == 24000
             assert t_wave.shape[0] == 1
+            # Verify backend='soundfile' and **kwargs are accepted without TypeError
+            t_wave_sf, t_sr_sf = torchaudio.load(str(tmp_wav), backend="soundfile", extra_test_kw="test")
+            assert t_sr_sf == 24000
+            assert t_wave_sf.shape[0] == 1
+            shim_verified = True
         except ImportError:
+            pass
+
+        if not shim_verified:
+            # In minimal test environment without torchaudio, mock torchaudio module to verify _sf_load contract
+            import types
+            mock_ta = types.ModuleType("torchaudio")
+            mock_ta.load = lambda uri, **kw: (_load_wav_soundfile_tensor(uri, target_sr=None))
+            sys.modules["torchaudio"] = mock_ta
+            try:
+                _install_torchaudio_soundfile_shim()
+                t_wave_sf, t_sr_sf = mock_ta.load(str(tmp_wav), backend="soundfile", extra_test_kw="test")
+                assert t_sr_sf == 24000
+                assert t_wave_sf.shape[0] == 1
+            finally:
+                sys.modules.pop("torchaudio", None)
+
             t_arr, t_sr = _load_wav_soundfile_tensor(tmp_wav, target_sr=None)
             assert t_sr == 24000
             assert t_arr.shape[0] == 1
