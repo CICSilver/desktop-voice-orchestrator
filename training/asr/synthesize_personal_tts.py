@@ -404,6 +404,7 @@ def check_judge_asr_gate(
     info: dict = {
         "judge_text": hyp_norm,
         "char_cer": round(char_cer, 4),
+        "judge_cer": round(char_cer, 4),
         "pinyin_cer": round(pinyin_cer, 4),
     }
 
