@@ -498,20 +498,31 @@ def _ensure_cosyvoice_runtime_deps() -> None:
     # CosyVoice2 Qwen2Encoder.forward_one_step slices masks[:, -1, :] to initial prompt width;
     # transformers >= 4.53 zero/False-pads 2D attention masks to kv_cache len, hiding all generated
     # speech tokens so EOS never fires and generation always hits max_token_text_ratio.
+    # Also pin diffusers<=0.32.2 to stay compatible with huggingface_hub<1.0 required by transformers==4.51.3.
+    need_pin = False
     try:
         tf_ver_str = importlib.metadata.version("transformers")
         if _parse_version_tuple(tf_ver_str) >= (4, 53, 0):
-            print(
-                f"[CosyVoice2Synthesizer] Detected transformers=={tf_ver_str} (>=4.53 breaks CosyVoice2 attention mask); pinning transformers==4.51.3...",
-                flush=True,
-            )
-            subprocess.run(
-                [sys.executable, "-m", "pip", "install", "-q", "transformers==4.51.3"],
-                check=True,
-            )
-            importlib.invalidate_caches()
+            need_pin = True
     except importlib.metadata.PackageNotFoundError:
         pass
+    try:
+        df_ver_str = importlib.metadata.version("diffusers")
+        if _parse_version_tuple(df_ver_str) >= (0, 33, 0):
+            need_pin = True
+    except importlib.metadata.PackageNotFoundError:
+        need_pin = True
+
+    if need_pin:
+        print(
+            "[CosyVoice2Synthesizer] Aligning CosyVoice2 dependencies: transformers==4.51.3, diffusers==0.31.0...",
+            flush=True,
+        )
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", "transformers==4.51.3", "diffusers==0.31.0"],
+            check=True,
+        )
+        importlib.invalidate_caches()
 
     required_modules: list[tuple[str, str]] = [
         ("whisper", "openai-whisper"),
@@ -572,13 +583,20 @@ def _ensure_cosyvoice_runtime_deps() -> None:
 def _extract_missing_module_name(exc: BaseException) -> str | None:
     """Extracts missing top-level module name from ModuleNotFoundError / pydoc.ErrorDuringImport."""
     cur: BaseException | None = exc
-    while cur is not None:
+    seen_ids: set[int] = set()
+    while isinstance(cur, BaseException) and id(cur) not in seen_ids:
+        seen_ids.add(id(cur))
         if isinstance(cur, ModuleNotFoundError) and getattr(cur, "name", None):
             return str(cur.name).split(".")[0]
         m = re.search(r"No module named ['\"]([^'\"]+)['\"]", str(cur))
         if m:
             return m.group(1).split(".")[0]
-        cur = getattr(cur, "exc", None) or cur.__cause__ or cur.__context__
+        next_cur = getattr(cur, "exc", None)
+        if not isinstance(next_cur, BaseException):
+            next_cur = getattr(cur, "__cause__", None)
+        if not isinstance(next_cur, BaseException):
+            next_cur = getattr(cur, "__context__", None)
+        cur = next_cur if isinstance(next_cur, BaseException) else None
     return None
 
 
