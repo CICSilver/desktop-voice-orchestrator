@@ -502,6 +502,15 @@ def _ensure_cosyvoice_runtime_deps() -> None:
         ("tiktoken", "tiktoken"),
         ("gdown", "gdown"),
         ("einops", "einops"),
+        ("wget", "wget"),
+        ("rootutils", "rootutils"),
+        ("unidecode", "Unidecode"),
+        ("rich", "rich"),
+        ("matplotlib", "matplotlib"),
+        ("seaborn", "seaborn"),
+        ("tensorboard", "tensorboard"),
+        ("pyarrow", "pyarrow"),
+        ("phonemizer", "phonemizer"),
     ]
     missing_pkgs: list[str] = []
     for mod_name, pkg_name in required_modules:
@@ -535,6 +544,19 @@ def _ensure_cosyvoice_runtime_deps() -> None:
         importlib.invalidate_caches()
 
 
+def _extract_missing_module_name(exc: BaseException) -> str | None:
+    """Extracts missing top-level module name from ModuleNotFoundError / pydoc.ErrorDuringImport."""
+    cur: BaseException | None = exc
+    while cur is not None:
+        if isinstance(cur, ModuleNotFoundError) and getattr(cur, "name", None):
+            return str(cur.name).split(".")[0]
+        m = re.search(r"No module named ['\"]([^'\"]+)['\"]", str(cur))
+        if m:
+            return m.group(1).split(".")[0]
+        cur = getattr(cur, "exc", None) or cur.__cause__ or cur.__context__
+    return None
+
+
 class CosyVoice2Synthesizer:
     """Wrapper around CosyVoice2-0.5B handling sys.path injection and API version differences."""
 
@@ -549,25 +571,53 @@ class CosyVoice2Synthesizer:
 
         _ensure_cosyvoice_runtime_deps()
         _install_torchaudio_soundfile_shim()
-        from cosyvoice.cli.cosyvoice import CosyVoice2
-        import cosyvoice.utils.file_utils as cosy_file_utils
 
-        # Patch cosyvoice load_wav to bypass torchcodec
-        def _cosy_safe_load_wav(wav_file, target_sr=16000):
-            return _load_wav_soundfile_tensor(wav_file, target_sr=target_sr)
+        pkg_aliases = {
+            "whisper": "openai-whisper",
+            "hydra": "hydra-core",
+            "cv2": "opencv-python-headless",
+            "pyworld": "pyworld-prebuilt",
+            "yaml": "PyYAML",
+            "PIL": "Pillow",
+            "sklearn": "scikit-learn",
+        }
+        import importlib
+        import subprocess
 
-        cosy_file_utils.load_wav = _cosy_safe_load_wav
-        self._load_wav = _cosy_safe_load_wav
+        for attempt in range(4):
+            try:
+                from cosyvoice.cli.cosyvoice import CosyVoice2
+                import cosyvoice.utils.file_utils as cosy_file_utils
 
-        init_sig = inspect.signature(CosyVoice2.__init__)
-        kwargs = {}
-        if "fp16" in init_sig.parameters:
-            kwargs["fp16"] = fp16
-        if "load_jit" in init_sig.parameters:
-            kwargs["load_jit"] = False
-        if "load_trt" in init_sig.parameters:
-            kwargs["load_trt"] = False
-        self.model = CosyVoice2(str(model_dir), **kwargs)
+                # Patch cosyvoice load_wav to bypass torchcodec
+                def _cosy_safe_load_wav(wav_file, target_sr=16000):
+                    return _load_wav_soundfile_tensor(wav_file, target_sr=target_sr)
+
+                cosy_file_utils.load_wav = _cosy_safe_load_wav
+                self._load_wav = _cosy_safe_load_wav
+
+                init_sig = inspect.signature(CosyVoice2.__init__)
+                kwargs = {}
+                if "fp16" in init_sig.parameters:
+                    kwargs["fp16"] = fp16
+                if "load_jit" in init_sig.parameters:
+                    kwargs["load_jit"] = False
+                if "load_trt" in init_sig.parameters:
+                    kwargs["load_trt"] = False
+                self.model = CosyVoice2(str(model_dir), **kwargs)
+                break
+            except Exception as exc:
+                mod_missing = _extract_missing_module_name(exc)
+                if not mod_missing or attempt >= 3:
+                    raise
+                pkg = pkg_aliases.get(mod_missing, mod_missing)
+                print(
+                    f"[CosyVoice2Synthesizer] Auto-installing runtime module '{mod_missing}' -> pip package '{pkg}'...",
+                    flush=True,
+                )
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", pkg], check=True)
+                importlib.invalidate_caches()
+
         self.sample_rate = int(getattr(self.model, "sample_rate", 24000))
         self._prompt_expects_path: bool | None = None
 
