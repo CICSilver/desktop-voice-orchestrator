@@ -459,8 +459,10 @@ class DualAsrVerifier:
         self.sensevoice.decode_stream(stream)
         raw_sv = stream.result.text.strip()
 
+        # Pass 16 kHz mono float32 ndarray directly so faster-whisper skips av.open() decoding
+        audio_f32 = np.asarray(audio_16k, dtype=np.float32).reshape(-1)
         segments, _ = self.whisper.transcribe(
-            str(wav_path),
+            audio_f32,
             language="zh",
             beam_size=5,
             vad_filter=False,
