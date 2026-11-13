@@ -23,14 +23,15 @@ PARAMETER num_predict 256
 PARAMETER stop "<|im_end|>"
 PARAMETER stop "<|endoftext|>"
 
-# Explicitly ban and stop thinking generation to eliminate thinking token latency
-PARAMETER stop "<think>"
-
 TEMPLATE """{{ if .System }}<|im_start|>system
 {{ .System }}<|im_end|>
 {{ end }}{{ if .Prompt }}<|im_start|>user
 {{ .Prompt }}<|im_end|>
 {{ end }}<|im_start|>assistant
+<think>
+
+</think>
+
 {{ .Response }}<|im_end|>"""
 
 # Default system prompt verbatim aligned with C++ src/openai_router.cpp
