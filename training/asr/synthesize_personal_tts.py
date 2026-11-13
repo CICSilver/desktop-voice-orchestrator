@@ -482,11 +482,36 @@ def build_aishell_aux_pool(aishell_root: Path, count: int = 24, seed: int = 42) 
     return aux
 
 
+def _parse_version_tuple(ver_str: str) -> tuple[int, ...]:
+    """Extracts leading numeric version components from a PEP 440 version string."""
+    parts = re.findall(r"\d+", ver_str.split("+", 1)[0])
+    return tuple(int(p) for p in parts[:3])
+
+
 def _ensure_cosyvoice_runtime_deps() -> None:
     """Ensures CosyVoice2/Matcha-TTS third-party Python dependencies are installed before import."""
     import importlib
+    import importlib.metadata
     import importlib.util
     import subprocess
+
+    # CosyVoice2 Qwen2Encoder.forward_one_step slices masks[:, -1, :] to initial prompt width;
+    # transformers >= 4.53 zero/False-pads 2D attention masks to kv_cache len, hiding all generated
+    # speech tokens so EOS never fires and generation always hits max_token_text_ratio.
+    try:
+        tf_ver_str = importlib.metadata.version("transformers")
+        if _parse_version_tuple(tf_ver_str) >= (4, 53, 0):
+            print(
+                f"[CosyVoice2Synthesizer] Detected transformers=={tf_ver_str} (>=4.53 breaks CosyVoice2 attention mask); pinning transformers==4.51.3...",
+                flush=True,
+            )
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "transformers==4.51.3"],
+                check=True,
+            )
+            importlib.invalidate_caches()
+    except importlib.metadata.PackageNotFoundError:
+        pass
 
     required_modules: list[tuple[str, str]] = [
         ("whisper", "openai-whisper"),
