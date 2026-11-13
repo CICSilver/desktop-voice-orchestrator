@@ -482,6 +482,59 @@ def build_aishell_aux_pool(aishell_root: Path, count: int = 24, seed: int = 42) 
     return aux
 
 
+def _ensure_cosyvoice_runtime_deps() -> None:
+    """Ensures CosyVoice2/Matcha-TTS third-party Python dependencies are installed before import."""
+    import importlib
+    import importlib.util
+    import subprocess
+
+    required_modules: list[tuple[str, str]] = [
+        ("whisper", "openai-whisper"),
+        ("onnxruntime", "onnxruntime-gpu"),
+        ("inflect", "inflect"),
+        ("wetext", "wetext"),
+        ("hyperpyyaml", "hyperpyyaml"),
+        ("conformer", "conformer"),
+        ("omegaconf", "omegaconf"),
+        ("hydra", "hydra-core"),
+        ("diffusers", "diffusers"),
+        ("lightning", "lightning"),
+        ("tiktoken", "tiktoken"),
+        ("gdown", "gdown"),
+        ("einops", "einops"),
+    ]
+    missing_pkgs: list[str] = []
+    for mod_name, pkg_name in required_modules:
+        if mod_name == "whisper":
+            need_whisper = importlib.util.find_spec("whisper") is None
+            if not need_whisper:
+                try:
+                    w_mod = importlib.import_module("whisper")
+                    if not hasattr(w_mod, "log_mel_spectrogram"):
+                        subprocess.run(
+                            [sys.executable, "-m", "pip", "uninstall", "-y", "whisper"],
+                            check=False,
+                        )
+                        need_whisper = True
+                except Exception:
+                    need_whisper = True
+            if need_whisper:
+                missing_pkgs.append(pkg_name)
+        elif importlib.util.find_spec(mod_name) is None:
+            missing_pkgs.append(pkg_name)
+
+    if missing_pkgs:
+        print(
+            f"[CosyVoice2Synthesizer] Installing missing runtime dependencies: {missing_pkgs}",
+            flush=True,
+        )
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "-q", *missing_pkgs],
+            check=True,
+        )
+        importlib.invalidate_caches()
+
+
 class CosyVoice2Synthesizer:
     """Wrapper around CosyVoice2-0.5B handling sys.path injection and API version differences."""
 
@@ -494,6 +547,7 @@ class CosyVoice2Synthesizer:
             if str(repo) not in sys.path:
                 sys.path.insert(0, str(repo))
 
+        _ensure_cosyvoice_runtime_deps()
         _install_torchaudio_soundfile_shim()
         from cosyvoice.cli.cosyvoice import CosyVoice2
         import cosyvoice.utils.file_utils as cosy_file_utils
